@@ -139,6 +139,17 @@ Expected in `tmux-tui` mode:
 - sqlite `dispatches` row with `status=running` then terminal status
 - tmux window `r<repo_slug>-i<issue_number>` created (or respawned) under the configured session
 - tmux-tui run watcher monitors session JSONL and sends `Ctrl-C` after first `final_answer` to close the turn promptly
+- auto-reap is skipped while the window is held (`@orchd_hold=1`) or actively focused in an attached tmux client
 - completion in sqlite/comment is keyed off a `final_answer` message found in session JSONL when present
 - stale in-flight rows are lazily healed on the next launch attempt (status set to `failed_runtime`, reason `stale_dispatch_autohealed`) when tmux no longer has a live pane for that issue
 - repo lockfiles under `locks/` are metadata only; dispatch gating is driven by sqlite `dispatches` state
+
+Manual hold controls:
+
+```bash
+# pin window (do not auto-reap after final_answer)
+tmux set-option -w -t codex-orch:rmain-orchd-debug-i2 @orchd_hold 1
+
+# unpin window (allow auto-reap)
+tmux set-option -u -w -t codex-orch:rmain-orchd-debug-i2 @orchd_hold
+```

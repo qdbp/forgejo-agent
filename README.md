@@ -116,6 +116,7 @@ Core behavior:
 - tmux-mode `orchd:` echo comments are posted with the directive role token
 - one active dispatch per issue (duplicates blocked while running)
 - issue-scoped codex session reuse (`resume` in `tmux-tui`, `exec resume` in `tmux-exec`) from latest `codex_session_id`
+- tmux-tui auto-reaps after first `final_answer` unless held (`tmux set-option -w -t <session:window> @orchd_hold 1`) or currently focused
 - periodic heartbeat + reconcile scan logs
 
 Role launch wrapper:

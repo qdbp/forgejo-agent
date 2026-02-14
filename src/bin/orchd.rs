@@ -1342,6 +1342,8 @@ DIRECTIVE={directive}
 ROLE_NAME={role_name}
 TMUX_LOCATOR={tmux_locator}
 TIMEOUT_SEC={timeout_sec}
+WATCHER_FINAL_FILE="$RUN_DIR/watcher-final.marker"
+WATCHER_ACTION_FILE="$RUN_DIR/watcher-action.marker"
 
 cleanup() {{
   rm -f "$LOCK_PATH"
@@ -1349,6 +1351,7 @@ cleanup() {{
 trap cleanup EXIT
 
 touch "$MARKER_FILE"
+rm -f "$WATCHER_FINAL_FILE" "$WATCHER_ACTION_FILE"
 cd "$WORKDIR"
 : > "$CODEX_LOG_FILE"
 
@@ -1425,7 +1428,29 @@ print("FOUND_FINAL_ANSWER=1" if found else "FOUND_FINAL_ANSWER=0")
 PY
 }}
 
-watch_for_first_final_answer() {{
+is_window_held() {{
+  local hold_opt=""
+  hold_opt="$(tmux show-options -w -t "$TMUX_LOCATOR" -v @orchd_hold 2>/dev/null || true)"
+  hold_opt="$(echo "${{hold_opt:-}}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  case "$hold_opt" in
+    1|true|yes|on) return 0 ;;
+  esac
+
+  local session_name="${{TMUX_LOCATOR%%:*}}"
+  local window_name="${{TMUX_LOCATOR#*:}}"
+  local attached=""
+  attached="$(tmux list-sessions -F '#{{session_name}}\t#{{session_attached}}' 2>/dev/null | awk -F '\t' -v s="$session_name" '$1==s {{print $2; exit}}')"
+  if [[ -n "$attached" && "$attached" != "0" ]]; then
+    local active=""
+    active="$(tmux list-windows -t "$session_name" -F '#{{window_name}}\t#{{window_active}}' 2>/dev/null | awk -F '\t' -v w="$window_name" '$1==w {{print $2; exit}}')"
+    if [[ "$active" == "1" ]]; then
+      return 0
+    fi
+  fi
+  return 1
+}}
+
+watch_for_reap_after_final_answer() {{
   local watch_session_id="$ISSUE_SESSION_ID"
   local deadline=$((SECONDS + TIMEOUT_SEC))
   while (( SECONDS < deadline )); do
@@ -1437,8 +1462,15 @@ watch_for_first_final_answer() {{
     if [[ -n "$watch_session_jsonl" && -r "$watch_session_jsonl" ]]; then
       parse_result="$(parse_session_summary "$watch_session_jsonl" "$SUMMARY_FILE" || true)"
       if [[ "$parse_result" == *"FOUND_FINAL_ANSWER=1"* ]]; then
+        printf '1\n' > "$WATCHER_FINAL_FILE"
         printf '%s\n' "$watch_session_jsonl" > "$SESSION_JSONL_FILE"
+        if is_window_held; then
+          printf 'held_waiting\n' > "$WATCHER_ACTION_FILE"
+          sleep 2
+          continue
+        fi
         if [[ -n "${{TMUX_PANE:-}}" ]]; then
+          printf 'auto_reap_sent_ctrl_c\n' > "$WATCHER_ACTION_FILE"
           tmux send-keys -t "$TMUX_PANE" C-c || true
         fi
         break
@@ -1448,7 +1480,7 @@ watch_for_first_final_answer() {{
   done
 }}
 
-watch_for_first_final_answer &
+watch_for_reap_after_final_answer &
 watcher_pid=$!
 
 set +e
@@ -1525,6 +1557,8 @@ sqlite3 "$DB_PATH" "UPDATE dispatches SET status='$status', reason_code='$reason
   echo "session_id=${{session_id:-unknown}}"
   echo "session_jsonl=${{session_jsonl:-unknown}}"
   echo "found_final_answer=$found_final_answer"
+  echo "watcher_final_seen=$(cat "$WATCHER_FINAL_FILE" 2>/dev/null || echo 0)"
+  echo "watcher_action=$(cat "$WATCHER_ACTION_FILE" 2>/dev/null || echo none)"
   echo "exit_code=$exit_code"
 }} > "$CODEX_LOG_FILE"
 
