@@ -127,6 +127,21 @@ cargo run --bin orchd -- \
   --dispatch-config /home/main/forgejo-agent/config/orchd-dispatch.toml
 ```
 
+Run as user service (recommended for easy restart/visibility):
+
+```bash
+/home/main/forgejo-agent/scripts/install.sh
+/home/main/forgejo-agent/scripts/install-orchd-user-service.sh
+```
+
+Then:
+
+```bash
+XDG_RUNTIME_DIR=/run/user/$(id -u) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus systemctl --user status orchd.service --no-pager
+XDG_RUNTIME_DIR=/run/user/$(id -u) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus systemctl --user restart orchd.service
+XDG_RUNTIME_DIR=/run/user/$(id -u) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus journalctl --user -u orchd.service -f
+```
+
 Run (`dry-run`):
 
 ```bash
