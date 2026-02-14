@@ -1151,6 +1151,7 @@ fn tmux_spawn_or_respawn_window(
             let status = Command::new("tmux")
                 .args([
                     "new-window",
+                    "-d",
                     "-t",
                     &format!("{session}:"),
                     "-n",
