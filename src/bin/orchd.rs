@@ -226,6 +226,12 @@ struct DispatchLaunch {
     run_dir: PathBuf,
 }
 
+#[derive(Clone)]
+struct CommentIdentity {
+    forgejoctl_bin: PathBuf,
+    token_file: PathBuf,
+}
+
 struct DispatchInsert {
     decision_id: i64,
     repo_full_name: String,
@@ -565,6 +571,7 @@ async fn process_webhook(
                     }
                 }
                 DispatchMode::TmuxExec | DispatchMode::TmuxTui => {
+                    let comment_identity = dispatch_comment_identity(state, &decision);
                     match dispatch_tmux(state.clone(), decision_id, &record, &decision).await {
                         Ok(launch) => {
                             if state.comment_echo {
@@ -577,14 +584,24 @@ async fn process_webhook(
                                     launch.run_dir.to_string_lossy(),
                                     record.delivery_id,
                                 );
-                                match post_issue_comment(
-                                    state.clone(),
-                                    &record.repo_full_name,
-                                    issue_number,
-                                    comment_body,
-                                )
-                                .await
-                                {
+                                let post_result = if let Some(identity) = comment_identity.clone() {
+                                    post_issue_comment_as_role(
+                                        &record.repo_full_name,
+                                        issue_number,
+                                        comment_body,
+                                        identity,
+                                    )
+                                    .await
+                                } else {
+                                    post_issue_comment(
+                                        state.clone(),
+                                        &record.repo_full_name,
+                                        issue_number,
+                                        comment_body,
+                                    )
+                                    .await
+                                };
+                                match post_result {
                                     Ok(()) => {
                                         comment_posted = true;
                                     }
@@ -602,14 +619,24 @@ async fn process_webhook(
                                     "orchd: dispatch blocked reason={} error={} delivery={}",
                                     reason, msg, record.delivery_id
                                 );
-                                match post_issue_comment(
-                                    state.clone(),
-                                    &record.repo_full_name,
-                                    issue_number,
-                                    comment_body,
-                                )
-                                .await
-                                {
+                                let post_result = if let Some(identity) = comment_identity.clone() {
+                                    post_issue_comment_as_role(
+                                        &record.repo_full_name,
+                                        issue_number,
+                                        comment_body,
+                                        identity,
+                                    )
+                                    .await
+                                } else {
+                                    post_issue_comment(
+                                        state.clone(),
+                                        &record.repo_full_name,
+                                        issue_number,
+                                        comment_body,
+                                    )
+                                    .await
+                                };
+                                match post_result {
                                     Ok(()) => {
                                         comment_posted = true;
                                     }
@@ -672,6 +699,57 @@ async fn post_issue_comment(
     tokio::task::spawn_blocking(move || -> Result<()> {
         let api = ForgejoClient::new(&state.cfg)?;
         api.comment_issue(&state.cfg, &issue, &body)
+    })
+    .await
+    .context("comment task join failure")??;
+    Ok(())
+}
+
+async fn post_issue_comment_as_role(
+    repo_full_name: &str,
+    issue_number: u64,
+    body: String,
+    identity: CommentIdentity,
+) -> Result<()> {
+    let issue_ref = format!("{repo_full_name}#{issue_number}");
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut child = Command::new(&identity.forgejoctl_bin)
+            .args([
+                "--token-file",
+                &identity.token_file.to_string_lossy(),
+                "issue",
+                "comment",
+                &issue_ref,
+                "--body-stdin",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| {
+                format!(
+                    "failed to spawn forgejoctl comment command: {}",
+                    identity.forgejoctl_bin.display()
+                )
+            })?;
+
+        if let Some(stdin) = child.stdin.as_mut() {
+            stdin
+                .write_all(body.as_bytes())
+                .context("failed writing comment body to forgejoctl stdin")?;
+        }
+
+        let output = child
+            .wait_with_output()
+            .context("failed waiting on forgejoctl comment command")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow!(
+                "forgejoctl comment failed for {issue_ref}: {}",
+                stderr.trim()
+            ));
+        }
+        Ok(())
     })
     .await
     .context("comment task join failure")??;
@@ -798,6 +876,19 @@ fn parse_directive_line(line: &str) -> Option<ParsedDirective> {
     }
 
     Some(ParsedDirective { role, directive })
+}
+
+fn dispatch_comment_identity(
+    state: &AppState,
+    decision: &DecisionRecord,
+) -> Option<CommentIdentity> {
+    let dispatch_config = state.dispatch_config.as_ref()?;
+    let role_name = decision.target_role.as_deref()?;
+    let role = dispatch_config.roles.get(role_name)?;
+    Some(CommentIdentity {
+        forgejoctl_bin: dispatch_config.forgejoctl_bin.clone(),
+        token_file: role.token_file.clone(),
+    })
 }
 
 fn is_orchd_echo_comment(text: &str) -> bool {

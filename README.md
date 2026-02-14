@@ -113,6 +113,7 @@ Core behavior:
 - webhook ingest
 - directive parse (`@codex-orch design|impl|poke`, `@codex poke`)
 - sqlite event/decision/dispatch persistence
+- tmux-mode `orchd:` echo comments are posted with the directive role token
 - one active dispatch per issue (duplicates blocked while running)
 - issue-scoped codex session reuse (`resume` in `tmux-tui`, `exec resume` in `tmux-exec`) from latest `codex_session_id`
 - periodic heartbeat + reconcile scan logs
