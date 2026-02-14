@@ -1354,33 +1354,22 @@ cd "$WORKDIR"
 
 bootstrap_prompt="$(cat "$BOOTSTRAP_PROMPT_FILE")"
 
-set +e
-if [[ -n "$ISSUE_SESSION_ID" ]]; then
-  timeout --foreground --preserve-status "$TIMEOUT_SEC" "$CODEX_BIN" "$CODEX_ROLE_ARG" resume "$ISSUE_SESSION_ID" "$bootstrap_prompt"
-  exit_code=$?
-else
-  timeout --foreground --preserve-status "$TIMEOUT_SEC" "$CODEX_BIN" "$CODEX_ROLE_ARG" --cd "$WORKDIR" "$bootstrap_prompt"
-  exit_code=$?
-fi
-set -e
+resolve_session_jsonl() {{
+  local sid="${{1:-}}"
+  local path=""
+  if [[ -n "$sid" ]]; then
+    path="$(find "$HOME/.codex/sessions" -type f -name "*-${{sid}}.jsonl" 2>/dev/null | sort | tail -n 1)"
+  fi
+  if [[ -z "$path" ]]; then
+    path="$(find "$HOME/.codex/sessions" -type f -name '*.jsonl' -newer "$MARKER_FILE" 2>/dev/null | sort | tail -n 1)"
+  fi
+  printf '%s\n' "$path"
+}}
 
-session_id="$ISSUE_SESSION_ID"
-if [[ -z "$session_id" ]]; then
-  session_id="$(find "$HOME/.codex/sessions" -type f -name '*.jsonl' -newer "$MARKER_FILE" 2>/dev/null | sort | tail -n 1 | sed -n 's#.*-\([0-9a-fA-F-]\{{36\}}\)\.jsonl#\1#p')"
-fi
-
-session_jsonl=""
-if [[ -n "$session_id" ]]; then
-  session_jsonl="$(find "$HOME/.codex/sessions" -type f -name "*-${{session_id}}.jsonl" 2>/dev/null | sort | tail -n 1)"
-fi
-if [[ -z "$session_jsonl" ]]; then
-  session_jsonl="$(find "$HOME/.codex/sessions" -type f -name '*.jsonl' -newer "$MARKER_FILE" 2>/dev/null | sort | tail -n 1)"
-fi
-printf '%s\n' "$session_jsonl" > "$SESSION_JSONL_FILE"
-
-found_final_answer="0"
-if [[ -n "$session_jsonl" && -r "$session_jsonl" ]]; then
-  parse_result="$(python3 - "$session_jsonl" "$SUMMARY_FILE" <<'PY'
+parse_session_summary() {{
+  local session_path="$1"
+  local summary_path="$2"
+  python3 - "$session_path" "$summary_path" <<'PY'
 import json
 import sys
 
@@ -1434,7 +1423,60 @@ with open(summary_path, "w", encoding="utf-8") as handle:
 
 print("FOUND_FINAL_ANSWER=1" if found else "FOUND_FINAL_ANSWER=0")
 PY
-)"
+}}
+
+watch_for_first_final_answer() {{
+  local watch_session_id="$ISSUE_SESSION_ID"
+  local deadline=$((SECONDS + TIMEOUT_SEC))
+  while (( SECONDS < deadline )); do
+    if [[ -z "$watch_session_id" ]]; then
+      watch_session_id="$(find "$HOME/.codex/sessions" -type f -name '*.jsonl' -newer "$MARKER_FILE" 2>/dev/null | sort | tail -n 1 | sed -n 's#.*-\([0-9a-fA-F-]\{{36\}}\)\.jsonl#\1#p')"
+    fi
+    local watch_session_jsonl
+    watch_session_jsonl="$(resolve_session_jsonl "$watch_session_id")"
+    if [[ -n "$watch_session_jsonl" && -r "$watch_session_jsonl" ]]; then
+      parse_result="$(parse_session_summary "$watch_session_jsonl" "$SUMMARY_FILE" || true)"
+      if [[ "$parse_result" == *"FOUND_FINAL_ANSWER=1"* ]]; then
+        printf '%s\n' "$watch_session_jsonl" > "$SESSION_JSONL_FILE"
+        if [[ -n "${{TMUX_PANE:-}}" ]]; then
+          tmux send-keys -t "$TMUX_PANE" C-c || true
+        fi
+        break
+      fi
+    fi
+    sleep 1
+  done
+}}
+
+watch_for_first_final_answer &
+watcher_pid=$!
+
+set +e
+if [[ -n "$ISSUE_SESSION_ID" ]]; then
+  timeout --foreground --preserve-status "$TIMEOUT_SEC" "$CODEX_BIN" "$CODEX_ROLE_ARG" resume "$ISSUE_SESSION_ID" "$bootstrap_prompt"
+  exit_code=$?
+else
+  timeout --foreground --preserve-status "$TIMEOUT_SEC" "$CODEX_BIN" "$CODEX_ROLE_ARG" --cd "$WORKDIR" "$bootstrap_prompt"
+  exit_code=$?
+fi
+set -e
+
+if kill -0 "$watcher_pid" 2>/dev/null; then
+  kill "$watcher_pid" 2>/dev/null || true
+fi
+wait "$watcher_pid" 2>/dev/null || true
+
+session_id="$ISSUE_SESSION_ID"
+if [[ -z "$session_id" ]]; then
+  session_id="$(find "$HOME/.codex/sessions" -type f -name '*.jsonl' -newer "$MARKER_FILE" 2>/dev/null | sort | tail -n 1 | sed -n 's#.*-\([0-9a-fA-F-]\{{36\}}\)\.jsonl#\1#p')"
+fi
+
+session_jsonl="$(resolve_session_jsonl "$session_id")"
+printf '%s\n' "$session_jsonl" > "$SESSION_JSONL_FILE"
+
+found_final_answer="0"
+if [[ -n "$session_jsonl" && -r "$session_jsonl" ]]; then
+  parse_result="$(parse_session_summary "$session_jsonl" "$SUMMARY_FILE" || true)"
   if [[ "$parse_result" == *"FOUND_FINAL_ANSWER=1"* ]]; then
     found_final_answer="1"
   fi

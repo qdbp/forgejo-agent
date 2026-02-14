@@ -105,7 +105,7 @@ EOF
 Current mode supports both:
 
 - `dry-run`: parse directives and post intent comments only
-- `tmux-tui` (default): spawn interactive Codex TUI in issue-scoped tmux windows
+- `tmux-tui` (default): spawn Codex TUI in issue-scoped tmux windows and auto-stop on first `final_answer` so completion is echoed back promptly
 - `tmux-exec`: non-interactive dispatch for fully automated runs
 
 Core behavior:

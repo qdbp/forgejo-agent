@@ -5,7 +5,7 @@
 Current implementation supports two dispatch modes:
 
 - `dry-run`: parse directives, persist decisions, comment intent only.
-- `tmux-tui` (default): create a dispatch record and spawn interactive Codex TUI inside tmux.
+- `tmux-tui` (default): create a dispatch record and spawn Codex TUI inside tmux; dispatch auto-stops after first `final_answer` so issue completion comments are not delayed behind long-lived interactive sessions.
 - `tmux-exec`: create a dispatch record and run Codex non-interactively.
 
 Core behavior:
@@ -138,6 +138,7 @@ Expected in `tmux-tui` mode:
 - issue comment: `orchd: dispatch started ...`
 - sqlite `dispatches` row with `status=running` then terminal status
 - tmux window `r<repo_slug>-i<issue_number>` created (or respawned) under the configured session
+- tmux-tui run watcher monitors session JSONL and sends `Ctrl-C` after first `final_answer` to close the turn promptly
 - completion in sqlite/comment is keyed off a `final_answer` message found in session JSONL when present
 - stale in-flight rows are lazily healed on the next launch attempt (status set to `failed_runtime`, reason `stale_dispatch_autohealed`) when tmux no longer has a live pane for that issue
 - repo lockfiles under `locks/` are metadata only; dispatch gating is driven by sqlite `dispatches` state
