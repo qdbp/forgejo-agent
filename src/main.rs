@@ -605,6 +605,25 @@ fn claim_label(agent: &str) -> String {
     format!("claimed/{agent}")
 }
 
+fn collect_conflicting_claims(issue: &ApiIssue, own_claim: &str) -> Vec<String> {
+    let mut claims = issue
+        .claimed_labels()
+        .map(|label| label.name.clone())
+        .filter(|name| name != own_claim)
+        .collect::<Vec<_>>();
+    claims.sort_unstable();
+    claims.dedup();
+    claims
+}
+
+fn find_claim_label_id(issue: &ApiIssue, claim_name: &str) -> Option<u64> {
+    issue
+        .labels
+        .iter()
+        .find(|label| label.name == claim_name)
+        .map(|label| label.id)
+}
+
 fn cmd_issue_claim(api: &ForgejoClient, cfg: &AgentConfig, args: IssueClaimArgs) -> Result<()> {
     let agent = args.agent.unwrap_or_else(|| cfg.agent_name.clone());
     let ttl_min = args.ttl_min.unwrap_or(cfg.lease_minutes);
@@ -612,25 +631,17 @@ fn cmd_issue_claim(api: &ForgejoClient, cfg: &AgentConfig, args: IssueClaimArgs)
 
     policy::assert_claimable(&issue)?;
 
-    let existing_claims = issue
-        .claimed_labels()
-        .map(|label| label.name.clone())
-        .collect::<Vec<_>>();
-    if !existing_claims.is_empty()
-        && !existing_claims
-            .iter()
-            .all(|name| name == &claim_label(&agent))
-    {
+    let claim = claim_label(&agent);
+    let existing_conflicts = collect_conflicting_claims(&issue, &claim);
+    if !existing_conflicts.is_empty() {
         bail!(
             "cannot claim {}; already claimed by {}",
             args.issue,
-            existing_claims.join(",")
+            existing_conflicts.join(",")
         );
     }
 
-    ensure_issue_state(api, cfg, &args.issue, WorkflowState::InProgress)?;
-
-    let claim = claim_label(&agent);
+    let had_own_claim = issue.labels.iter().any(|label| label.name == claim);
     let claim_id = api
         .ensure_label(
             cfg,
@@ -642,9 +653,24 @@ fn cmd_issue_claim(api: &ForgejoClient, cfg: &AgentConfig, args: IssueClaimArgs)
         )?
         .id;
 
-    if !issue.labels.iter().any(|label| label.name == claim) {
+    if !had_own_claim {
         api.add_issue_label_ids(cfg, &args.issue, vec![claim_id])?;
     }
+
+    let claimed_issue = api.get_issue(cfg, &args.issue)?;
+    let post_claim_conflicts = collect_conflicting_claims(&claimed_issue, &claim);
+    if !post_claim_conflicts.is_empty() {
+        if !had_own_claim && let Some(own_claim_id) = find_claim_label_id(&claimed_issue, &claim) {
+            let _ = api.remove_issue_label(cfg, &args.issue, own_claim_id);
+        }
+        bail!(
+            "cannot claim {}; concurrent claim detected with {}",
+            args.issue,
+            post_claim_conflicts.join(",")
+        );
+    }
+
+    ensure_issue_state(api, cfg, &args.issue, WorkflowState::InProgress)?;
 
     let now = Utc::now();
     let until = now + ChronoDuration::minutes(ttl_min);
@@ -903,5 +929,48 @@ fn cmd_worker_run(api: &ForgejoClient, cfg: &AgentConfig, args: WorkerRunArgs) -
         }
 
         thread::sleep(Duration::from_secs(args.interval_sec));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{ApiLabel, OpenState};
+
+    fn issue_with_labels(labels: &[(&str, u64)]) -> ApiIssue {
+        ApiIssue {
+            number: 7,
+            state: OpenState::Open,
+            title: "claim test".to_string(),
+            body: None,
+            html_url: "http://localhost/issue/7".to_string(),
+            labels: labels
+                .iter()
+                .map(|(name, id)| ApiLabel {
+                    id: *id,
+                    name: (*name).to_string(),
+                })
+                .collect(),
+            pull_request: None,
+            repository: None,
+        }
+    }
+
+    #[test]
+    fn conflicting_claims_exclude_own_claim() {
+        let issue = issue_with_labels(&[
+            ("claimed/codex-a", 1),
+            ("claimed/codex-b", 2),
+            ("state/ready", 3),
+        ]);
+        let conflicts = collect_conflicting_claims(&issue, "claimed/codex-a");
+        assert_eq!(conflicts, vec!["claimed/codex-b".to_string()]);
+    }
+
+    #[test]
+    fn find_claim_label_id_returns_matching_label() {
+        let issue = issue_with_labels(&[("claimed/codex-a", 42), ("state/ready", 3)]);
+        assert_eq!(find_claim_label_id(&issue, "claimed/codex-a"), Some(42));
+        assert_eq!(find_claim_label_id(&issue, "claimed/codex-b"), None);
     }
 }

@@ -27,7 +27,7 @@ use axum::{Json, Router};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use clap::{Parser, ValueEnum};
 use hmac::{Hmac, Mac};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -225,6 +225,11 @@ struct DispatchLaunch {
     run_dir: PathBuf,
 }
 
+enum DispatchReservation {
+    Started(i64),
+    InFlight(i64),
+}
+
 #[derive(Clone)]
 struct CommentIdentity {
     forgejoctl_bin: PathBuf,
@@ -333,7 +338,6 @@ struct EventRecord {
 #[derive(Debug, Clone)]
 struct EventContext {
     repo_full_name: String,
-    repo_owner: String,
     issue_number: Option<u64>,
     actor_login: Option<String>,
     text: Option<String>,
@@ -767,9 +771,6 @@ async fn post_issue_comment_as_role(
 
 fn extract_event_context(event_type: &str, payload: &WebhookPayload) -> Option<EventContext> {
     let repo_full_name = payload.repository.as_ref()?.full_name.clone();
-    let repo_owner = repo_full_name
-        .split_once('/')
-        .map_or_else(|| "<unknown>".to_string(), |(owner, _)| owner.to_string());
     let issue_number = payload.issue.as_ref().map(|issue| issue.number);
 
     let actor_login = payload
@@ -791,7 +792,6 @@ fn extract_event_context(event_type: &str, payload: &WebhookPayload) -> Option<E
 
     Some(EventContext {
         repo_full_name,
-        repo_owner,
         issue_number,
         actor_login,
         text,
@@ -831,18 +831,6 @@ fn decide(event_type: &str, context: Option<&EventContext>) -> DecisionRecord {
         };
     }
 
-    if event_type == "issue_comment"
-        && context.actor_login.as_deref() == Some(context.repo_owner.as_str())
-    {
-        return DecisionRecord {
-            decision: "accepted".to_string(),
-            reason_code: "owner_default_poke".to_string(),
-            directive: Some("poke".to_string()),
-            target_role: Some("codex-orch".to_string()),
-            would_dispatch: true,
-        };
-    }
-
     DecisionRecord {
         decision: "ignored".to_string(),
         reason_code: "no_directive".to_string(),
@@ -873,7 +861,7 @@ fn parse_directive_line(line: &str) -> Option<ParsedDirective> {
         .to_ascii_lowercase();
 
     let role = if role_token == "codex" {
-        "codex-dev".to_string()
+        "codex-orch".to_string()
     } else if role_token.starts_with("codex-") {
         role_token
     } else {
@@ -1593,7 +1581,7 @@ async fn dispatch_tmux(
     let issue = fetch_issue(state.clone(), issue_ref.clone()).await?;
 
     let now = Utc::now().to_rfc3339();
-    let dispatch_id = insert_dispatch_starting(
+    let dispatch_id = match reserve_dispatch_starting(
         &state.db_path,
         &DispatchInsert {
             decision_id,
@@ -1605,7 +1593,18 @@ async fn dispatch_tmux(
             started_at: now,
         },
     )
-    .map_err(|err| DispatchError::Db(err.to_string()))?;
+    .map_err(|err| DispatchError::Db(err.to_string()))?
+    {
+        DispatchReservation::Started(dispatch_id) => dispatch_id,
+        DispatchReservation::InFlight(dispatch_id) => {
+            let _ = fs::remove_file(&lock_path);
+            return Err(DispatchError::IssueDispatchInFlight {
+                repo_full_name: record.repo_full_name.clone(),
+                issue_number,
+                dispatch_id,
+            });
+        }
+    };
 
     let tmux_window = issue_tmux_window_name(&record.repo_full_name, issue_number);
     let run_dir = run_root(&state.db_path)?.join(format!("dispatch-{dispatch_id}"));
@@ -1965,9 +1964,35 @@ fn update_decision_comment_status(
     Ok(())
 }
 
-fn insert_dispatch_starting(db_path: &Path, dispatch: &DispatchInsert) -> Result<i64> {
-    let conn = open_db(db_path)?;
-    conn.execute(
+fn reserve_dispatch_starting(
+    db_path: &Path,
+    dispatch: &DispatchInsert,
+) -> Result<DispatchReservation> {
+    let mut conn = open_db(db_path)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let issue_number = i64::try_from(dispatch.issue_number)?;
+
+    let inflight_id = tx
+        .query_row(
+            r"
+            SELECT id
+            FROM dispatches
+            WHERE repo_full_name = ?1
+              AND issue_number = ?2
+              AND status IN ('starting', 'running')
+            ORDER BY id DESC
+            LIMIT 1
+            ",
+            params![dispatch.repo_full_name.as_str(), issue_number],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    if let Some(dispatch_id) = inflight_id {
+        tx.commit()?;
+        return Ok(DispatchReservation::InFlight(dispatch_id));
+    }
+
+    tx.execute(
         r"
         INSERT INTO dispatches
         (decision_id, repo_full_name, issue_number, actor_login, directive, target_role, status, started_at, tmux_session)
@@ -1976,14 +2001,16 @@ fn insert_dispatch_starting(db_path: &Path, dispatch: &DispatchInsert) -> Result
         params![
             dispatch.decision_id,
             dispatch.repo_full_name.as_str(),
-            i64::try_from(dispatch.issue_number)?,
+            issue_number,
             dispatch.actor_login.as_deref(),
             dispatch.directive.as_str(),
             dispatch.target_role.as_str(),
             dispatch.started_at.as_str(),
         ],
     )?;
-    Ok(conn.last_insert_rowid())
+    let dispatch_id = tx.last_insert_rowid();
+    tx.commit()?;
+    Ok(DispatchReservation::Started(dispatch_id))
 }
 
 fn update_dispatch_running(
@@ -2385,5 +2412,133 @@ mod tests {
         .to_rfc3339();
         let dispatch = inflight_dispatch("starting", started_at, None);
         assert!(is_stale_starting_dispatch(&dispatch, "main/orchd-debug", 1));
+    }
+
+    fn temp_db_path(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock drift")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "forgejo-agent-{label}-{}-{nanos}.sqlite",
+            std::process::id()
+        ))
+    }
+
+    fn sample_dispatch(decision_id: i64, issue_number: u64) -> DispatchInsert {
+        DispatchInsert {
+            decision_id,
+            repo_full_name: "main/orchd-debug".to_string(),
+            issue_number,
+            actor_login: Some("main".to_string()),
+            directive: "poke".to_string(),
+            target_role: "codex-orch".to_string(),
+            started_at: Utc::now().to_rfc3339(),
+        }
+    }
+
+    fn seed_decision_id(db_path: &Path) -> i64 {
+        let conn = open_db(db_path).expect("open db");
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            r"
+            INSERT INTO events (delivery_id, event_type, repo_full_name, issue_number, action, actor_login, raw_json, received_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            ",
+            params![
+                format!("test-delivery-{}", Utc::now().timestamp_nanos_opt().unwrap_or(0)),
+                "issue_comment",
+                "main/orchd-debug",
+                7_i64,
+                "created",
+                "main",
+                "{}",
+                now
+            ],
+        )
+        .expect("insert event");
+        let event_id = conn.last_insert_rowid();
+        conn.execute(
+            r"
+            INSERT INTO decisions
+            (event_id, repo_full_name, issue_number, actor_login, directive, target_role, decision, reason_code, would_dispatch, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            ",
+            params![
+                event_id,
+                "main/orchd-debug",
+                7_i64,
+                "main",
+                "poke",
+                "codex-orch",
+                "accepted",
+                "explicit_directive",
+                1_i64,
+                Utc::now().to_rfc3339(),
+            ],
+        )
+        .expect("insert decision");
+        conn.last_insert_rowid()
+    }
+
+    #[test]
+    fn reserve_dispatch_blocks_second_inflight_for_issue() {
+        let db_path = temp_db_path("dispatch-reserve");
+        init_db(&db_path).expect("db init");
+        let first_decision_id = seed_decision_id(&db_path);
+        let second_decision_id = seed_decision_id(&db_path);
+
+        let first = reserve_dispatch_starting(&db_path, &sample_dispatch(first_decision_id, 7))
+            .expect("first");
+        let first_id = match first {
+            DispatchReservation::Started(id) => id,
+            DispatchReservation::InFlight(_) => panic!("expected first reservation to start"),
+        };
+
+        let second = reserve_dispatch_starting(&db_path, &sample_dispatch(second_decision_id, 7))
+            .expect("second");
+        match second {
+            DispatchReservation::InFlight(id) => assert_eq!(id, first_id),
+            DispatchReservation::Started(_) => panic!("expected second reservation to be blocked"),
+        }
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn owner_comment_without_directive_is_ignored() {
+        let context = EventContext {
+            repo_full_name: "main/orchd-debug".to_string(),
+            issue_number: Some(1),
+            actor_login: Some("main".to_string()),
+            text: Some("just checking in".to_string()),
+        };
+        let decision = decide("issue_comment", Some(&context));
+        assert_eq!(decision.decision, "ignored");
+        assert_eq!(decision.reason_code, "no_directive");
+        assert!(!decision.would_dispatch);
+    }
+
+    #[test]
+    fn explicit_directive_is_still_accepted() {
+        let context = EventContext {
+            repo_full_name: "main/orchd-debug".to_string(),
+            issue_number: Some(1),
+            actor_login: Some("main".to_string()),
+            text: Some("@codex-orch poke".to_string()),
+        };
+        let decision = decide("issue_comment", Some(&context));
+        assert_eq!(decision.decision, "accepted");
+        assert_eq!(decision.reason_code, "explicit_directive");
+        assert_eq!(decision.directive.as_deref(), Some("poke"));
+        assert_eq!(decision.target_role.as_deref(), Some("codex-orch"));
+        assert!(decision.would_dispatch);
+    }
+
+    #[test]
+    fn codex_alias_maps_to_orch_role() {
+        let parsed = parse_directive("@codex poke").expect("directive should parse");
+        assert_eq!(parsed.role, "codex-orch");
+        assert_eq!(parsed.directive, "poke");
     }
 }
