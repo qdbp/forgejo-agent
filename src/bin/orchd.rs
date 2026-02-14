@@ -348,7 +348,11 @@ struct WebhookIssue {
 
 #[derive(Debug, Deserialize)]
 struct WebhookComment {
+    #[serde(default)]
+    id: Option<u64>,
     body: String,
+    #[serde(default)]
+    created_at: Option<String>,
     #[serde(default)]
     user: Option<WebhookUser>,
 }
@@ -366,6 +370,9 @@ struct EventRecord {
     issue_number: Option<u64>,
     action: Option<String>,
     actor_login: Option<String>,
+    event_text: Option<String>,
+    source_comment_id: Option<u64>,
+    source_created_at: Option<String>,
     raw_json: String,
 }
 
@@ -375,6 +382,8 @@ struct EventContext {
     issue_number: Option<u64>,
     actor_login: Option<String>,
     text: Option<String>,
+    source_comment_id: Option<u64>,
+    source_created_at: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -400,6 +409,15 @@ struct WebhookOutcome {
     decision: String,
     reason_code: String,
     duplicate: bool,
+}
+
+#[derive(Debug)]
+struct IssueEventDeltaRow {
+    event_type: String,
+    actor_login: Option<String>,
+    event_text: Option<String>,
+    received_at: String,
+    source_created_at: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -569,6 +587,11 @@ async fn process_webhook(
         issue_number: context.as_ref().and_then(|ctx| ctx.issue_number),
         action: payload.action.clone(),
         actor_login: context.as_ref().and_then(|ctx| ctx.actor_login.clone()),
+        event_text: context.as_ref().and_then(|ctx| ctx.text.clone()),
+        source_comment_id: context.as_ref().and_then(|ctx| ctx.source_comment_id),
+        source_created_at: context
+            .as_ref()
+            .and_then(|ctx| ctx.source_created_at.clone()),
         raw_json: String::from_utf8_lossy(body).to_string(),
     };
 
@@ -632,7 +655,9 @@ async fn process_webhook(
                     }
                 }
                 DispatchMode::TmuxExec | DispatchMode::TmuxTui => {
-                    match dispatch_tmux(state.clone(), decision_id, &record, &decision).await {
+                    match dispatch_tmux(state.clone(), decision_id, event_id, &record, &decision)
+                        .await
+                    {
                         Ok(()) => {
                             if let Err(err) = project_issue_runtime_state(
                                 state.clone(),
@@ -648,6 +673,20 @@ async fn process_webhook(
                                 }
                             } else {
                                 status_projected = true;
+                            }
+                            if let Some(role_name) = decision.target_role.as_deref()
+                                && let Err(err) = upsert_issue_role_cursor_event_id(
+                                    &state.db_path,
+                                    &record.repo_full_name,
+                                    issue_number,
+                                    role_name,
+                                    event_id,
+                                )
+                                && status_error.is_none()
+                            {
+                                status_error = Some(format!(
+                                    "failed updating issue cursor for role {role_name}: {err}"
+                                ));
                             }
                         }
                         Err(err) => {
@@ -889,12 +928,19 @@ fn extract_event_context(event_type: &str, payload: &WebhookPayload) -> Option<E
         "issues" => payload.issue.as_ref().and_then(|issue| issue.body.clone()),
         _ => None,
     };
+    let source_comment_id = payload.comment.as_ref().and_then(|comment| comment.id);
+    let source_created_at = payload
+        .comment
+        .as_ref()
+        .and_then(|comment| comment.created_at.clone());
 
     Some(EventContext {
         repo_full_name,
         issue_number,
         actor_login,
         text,
+        source_comment_id,
+        source_created_at,
     })
 }
 
@@ -1718,6 +1764,7 @@ sqlite3 "$DB_PATH" "UPDATE dispatches SET status='$status', reason_code='$reason
 async fn dispatch_tmux(
     state: AppState,
     decision_id: i64,
+    current_event_id: i64,
     record: &EventRecord,
     decision: &DecisionRecord,
 ) -> Result<(), DispatchError> {
@@ -1780,6 +1827,22 @@ async fn dispatch_tmux(
         number: issue_number,
     };
     let issue = fetch_issue(state.clone(), issue_ref.clone()).await?;
+    let previous_event_cursor = issue_role_cursor_event_id(
+        &state.db_path,
+        &record.repo_full_name,
+        issue_number,
+        &directive.role,
+    )
+    .map_err(|err| DispatchError::Db(err.to_string()))?;
+    let delta_rows = issue_delta_rows(
+        &state.db_path,
+        &record.repo_full_name,
+        issue_number,
+        previous_event_cursor,
+        current_event_id,
+    )
+    .map_err(|err| DispatchError::Db(err.to_string()))?;
+    let issue_delta_summary = summarize_issue_delta(&delta_rows);
 
     let now = Utc::now().to_rfc3339();
     let dispatch_id = match reserve_dispatch_starting(
@@ -1841,8 +1904,7 @@ async fn dispatch_tmux(
         (
             "followup",
             &dispatch_config.prompt_envelopes.followup_envelope_file,
-            "(delta tracking not yet implemented; review latest issue thread updates before acting)"
-                .to_string(),
+            issue_delta_summary,
         )
     } else {
         (
@@ -2050,6 +2112,9 @@ fn init_db(db_path: &Path) -> Result<()> {
             issue_number INTEGER,
             action TEXT,
             actor_login TEXT,
+            event_text TEXT,
+            source_comment_id INTEGER,
+            source_created_at TEXT,
             raw_json TEXT NOT NULL,
             received_at TEXT NOT NULL,
             UNIQUE(delivery_id, event_type)
@@ -2111,8 +2176,39 @@ fn init_db(db_path: &Path) -> Result<()> {
             ON dispatches (repo_full_name, status);
         CREATE INDEX IF NOT EXISTS idx_dispatches_repo_issue
             ON dispatches (repo_full_name, issue_number, id DESC);
+        CREATE TABLE IF NOT EXISTS issue_role_cursors (
+            repo_full_name TEXT NOT NULL,
+            issue_number INTEGER NOT NULL,
+            role_name TEXT NOT NULL,
+            last_event_id INTEGER NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (repo_full_name, issue_number, role_name)
+        );
         ",
     )?;
+    ensure_column_exists(&conn, "events", "event_text", "TEXT")?;
+    ensure_column_exists(&conn, "events", "source_comment_id", "INTEGER")?;
+    ensure_column_exists(&conn, "events", "source_created_at", "TEXT")?;
+    Ok(())
+}
+
+fn ensure_column_exists(
+    conn: &Connection,
+    table_name: &str,
+    column_name: &str,
+    column_type: &str,
+) -> Result<()> {
+    let pragma = format!("PRAGMA table_info({table_name})");
+    let mut stmt = conn.prepare(&pragma)?;
+    let column_names = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if column_names.iter().any(|name| name == column_name) {
+        return Ok(());
+    }
+
+    let alter = format!("ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}");
+    conn.execute(&alter, [])?;
     Ok(())
 }
 
@@ -2129,8 +2225,8 @@ fn insert_event(db_path: &Path, event: &EventRecord) -> Result<Option<i64>> {
     let now = Utc::now().to_rfc3339();
     let inserted = conn.execute(
         r"
-        INSERT INTO events (delivery_id, event_type, repo_full_name, issue_number, action, actor_login, raw_json, received_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        INSERT INTO events (delivery_id, event_type, repo_full_name, issue_number, action, actor_login, event_text, source_comment_id, source_created_at, raw_json, received_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
         ",
         params![
             event.delivery_id,
@@ -2139,6 +2235,9 @@ fn insert_event(db_path: &Path, event: &EventRecord) -> Result<Option<i64>> {
             event.issue_number,
             event.action,
             event.actor_login,
+            event.event_text,
+            event.source_comment_id,
+            event.source_created_at,
             event.raw_json,
             now,
         ],
@@ -2203,6 +2302,128 @@ fn update_decision_comment_status(
         params![decision_id, i64::from(comment_posted), comment_error],
     )?;
     Ok(())
+}
+
+fn issue_role_cursor_event_id(
+    db_path: &Path,
+    repo_full_name: &str,
+    issue_number: u64,
+    role_name: &str,
+) -> Result<Option<i64>> {
+    let conn = open_db(db_path)?;
+    let issue_number = i64::try_from(issue_number)?;
+    conn.query_row(
+        r"
+        SELECT last_event_id
+        FROM issue_role_cursors
+        WHERE repo_full_name = ?1
+          AND issue_number = ?2
+          AND role_name = ?3
+        ",
+        params![repo_full_name, issue_number, role_name],
+        |row| row.get::<_, i64>(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn upsert_issue_role_cursor_event_id(
+    db_path: &Path,
+    repo_full_name: &str,
+    issue_number: u64,
+    role_name: &str,
+    last_event_id: i64,
+) -> Result<()> {
+    let conn = open_db(db_path)?;
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        r"
+        INSERT INTO issue_role_cursors (repo_full_name, issue_number, role_name, last_event_id, updated_at)
+        VALUES (?1, ?2, ?3, ?4, ?5)
+        ON CONFLICT(repo_full_name, issue_number, role_name)
+        DO UPDATE SET
+            last_event_id = excluded.last_event_id,
+            updated_at = excluded.updated_at
+        ",
+        params![
+            repo_full_name,
+            i64::try_from(issue_number)?,
+            role_name,
+            last_event_id,
+            now
+        ],
+    )?;
+    Ok(())
+}
+
+fn issue_delta_rows(
+    db_path: &Path,
+    repo_full_name: &str,
+    issue_number: u64,
+    after_event_id: Option<i64>,
+    up_to_event_id: i64,
+) -> Result<Vec<IssueEventDeltaRow>> {
+    let conn = open_db(db_path)?;
+    let start_event_id = after_event_id.unwrap_or(0_i64);
+    let issue_number = i64::try_from(issue_number)?;
+    let mut stmt = conn.prepare(
+        r"
+        SELECT event_type, actor_login, event_text, received_at, source_created_at
+        FROM events
+        WHERE repo_full_name = ?1
+          AND issue_number = ?2
+          AND id > ?3
+          AND id <= ?4
+          AND event_type IN ('issue_comment', 'issues')
+          AND event_text IS NOT NULL
+          AND event_text != ''
+        ORDER BY id ASC
+        LIMIT 200
+        ",
+    )?;
+    let rows = stmt
+        .query_map(
+            params![repo_full_name, issue_number, start_event_id, up_to_event_id],
+            |row| {
+                Ok(IssueEventDeltaRow {
+                    event_type: row.get(0)?,
+                    actor_login: row.get(1)?,
+                    event_text: row.get(2)?,
+                    received_at: row.get(3)?,
+                    source_created_at: row.get(4)?,
+                })
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn summarize_issue_delta(rows: &[IssueEventDeltaRow]) -> String {
+    if rows.is_empty() {
+        return "(no new issue events since last handled dispatch)".to_string();
+    }
+
+    rows.iter()
+        .map(|row| {
+            let timestamp = row
+                .source_created_at
+                .as_deref()
+                .filter(|text| !text.trim().is_empty())
+                .unwrap_or(row.received_at.as_str());
+            let actor = row
+                .actor_login
+                .as_deref()
+                .filter(|text| !text.trim().is_empty())
+                .unwrap_or("unknown");
+            let mut text = row.event_text.as_deref().unwrap_or("").replace('\n', " ");
+            text = text.trim().to_string();
+            if text.chars().count() > 220 {
+                text = format!("{}...", text.chars().take(220).collect::<String>());
+            }
+            format!("- [{}] {} {}: {}", timestamp, actor, row.event_type, text)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn reserve_dispatch_starting(
@@ -2753,6 +2974,8 @@ mod tests {
             issue_number: Some(1),
             actor_login: Some("main".to_string()),
             text: Some("just checking in".to_string()),
+            source_comment_id: None,
+            source_created_at: None,
         };
         let decision = decide("issue_comment", Some(&context));
         assert_eq!(decision.decision, "ignored");
@@ -2767,6 +2990,8 @@ mod tests {
             issue_number: Some(1),
             actor_login: Some("main".to_string()),
             text: Some("@codex-orch poke".to_string()),
+            source_comment_id: None,
+            source_created_at: None,
         };
         let decision = decide("issue_comment", Some(&context));
         assert_eq!(decision.decision, "accepted");

@@ -91,6 +91,13 @@ sqlite3 ~/.local/state/orchd-dev/orchd.sqlite \
   "SELECT id,repo_full_name,issue_number,actor_login,directive,target_role,status,reason_code,tmux_session,tmux_window,codex_session_id,exit_code,started_at,ended_at FROM dispatches ORDER BY id DESC LIMIT 20;"
 ```
 
+Inspect role cursors used for follow-up deltas:
+
+```bash
+sqlite3 ~/.local/state/orchd-dev/orchd.sqlite \
+  "SELECT repo_full_name,issue_number,role_name,last_event_id,updated_at FROM issue_role_cursors ORDER BY updated_at DESC LIMIT 20;"
+```
+
 Inspect issue-scoped tmux windows:
 
 ```bash
@@ -144,6 +151,7 @@ Expected in `tmux-tui` mode:
 - completion status is projected to `orchd/state/completed` on success or `orchd/state/failed` otherwise
 - completion in sqlite/comment is keyed off a `final_answer` message found in session JSONL when present
 - generated run artifacts include `prompt.md` and `prompt_mode.txt` (`fresh` or `followup`)
+- follow-up prompts include an issue delta block derived from events newer than the role cursor
 - stale in-flight rows are lazily healed on the next launch attempt (status set to `failed_runtime`, reason `stale_dispatch_autohealed`) when tmux no longer has a live pane for that issue
 - repo lockfiles under `locks/` are metadata only; dispatch gating is driven by sqlite `dispatches` state
 
