@@ -27,3 +27,7 @@ When CLI surface changes (commands/flags/state names):
 3. update this skill’s command/reference guidance
 4. update `docs/skill-sync/checklist.md`
 5. run `python3 /home/main/forgejo-agent/scripts/check.py`
+
+## Delivery Policy
+
+- For major features/refactors, finish by committing and pushing to `origin` in the same execution loop unless explicitly told not to.

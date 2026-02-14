@@ -5,11 +5,13 @@ This is the operator view of dispatched Codex runs.
 ## Mental model
 
 - `orchd` uses one named tmux session (from `config/orchd-dispatch.toml`).
-- Each dispatch becomes a tmux window in that session.
+- Windows are issue-scoped (`i<issue_number>`), not dispatch-scoped.
+- New dispatches for the same issue respawn that issue window.
 - Dispatch metadata lives in sqlite (`dispatches` table), while the terminal view
   lives in tmux.
 - Run artifacts are written under:
   `~/.local/state/orchd-dev/dispatch-runs/dispatch-<id>/`.
+- `codex_session_id` is reused per issue when available (`codex exec resume`).
 
 ## Fast path: "what is running right now?"
 
@@ -46,7 +48,7 @@ written to `dispatch-<id>/codex.log`.
 
 ## Inspect finished runs
 
-If `remain_on_exit` is enabled, exited windows stay visible. For any dispatch:
+If `remain_on_exit` is enabled, issue windows stay visible after completion. For any dispatch:
 
 ```bash
 id=1

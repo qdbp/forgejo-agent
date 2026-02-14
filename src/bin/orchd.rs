@@ -177,6 +177,14 @@ enum DispatchError {
     DirectiveNotConfigured(String),
     #[error("role not configured: {0}")]
     RoleNotConfigured(String),
+    #[error(
+        "issue dispatch already in flight for {repo_full_name}#{issue_number} (dispatch {dispatch_id})"
+    )]
+    IssueDispatchInFlight {
+        repo_full_name: String,
+        issue_number: u64,
+        dispatch_id: i64,
+    },
     #[error("repo lock held at {0}")]
     RepoLocked(PathBuf),
     #[error("invalid issue ref: {0}")]
@@ -198,6 +206,7 @@ impl DispatchError {
             Self::ActorNotAllowed(_) => "actor_not_allowed",
             Self::DirectiveNotConfigured(_) => "directive_not_configured",
             Self::RoleNotConfigured(_) => "role_not_configured",
+            Self::IssueDispatchInFlight { .. } => "issue_dispatch_in_flight",
             Self::RepoLocked(_) => "repo_locked",
             Self::InvalidIssueRef(_) => "invalid_issue_ref",
             Self::Io(_) => "io_failure",
@@ -949,7 +958,22 @@ fn tmux_set_remain_on_exit(session: &str, enabled: bool) -> Result<(), DispatchE
     Ok(())
 }
 
-fn tmux_spawn_window(
+fn tmux_has_window(session: &str, window: &str) -> Result<bool, DispatchError> {
+    let output = Command::new("tmux")
+        .args(["list-windows", "-t", session, "-F", "#{window_name}"])
+        .output()
+        .map_err(|err| DispatchError::Tmux(format!("failed listing tmux windows: {err}")))?;
+    if !output.status.success() {
+        return Err(DispatchError::Tmux(format!(
+            "tmux list-windows failed for session {session}"
+        )));
+    }
+    let target = window.trim();
+    let windows = String::from_utf8_lossy(&output.stdout);
+    Ok(windows.lines().any(|name| name.trim() == target))
+}
+
+fn tmux_spawn_or_respawn_window(
     session: &str,
     window: &str,
     script_path: &Path,
@@ -957,21 +981,43 @@ fn tmux_spawn_window(
 ) -> Result<(), DispatchError> {
     let cmd = format!("bash {}", shell_quote(&script_path.to_string_lossy()));
     if tmux_has_session(session)? {
-        let status = Command::new("tmux")
-            .args([
-                "new-window",
-                "-t",
-                &format!("{session}:"),
-                "-n",
-                window,
-                &cmd,
-            ])
-            .status()
-            .map_err(|err| DispatchError::Tmux(format!("failed creating tmux window: {err}")))?;
-        if !status.success() {
-            return Err(DispatchError::Tmux(format!(
-                "tmux new-window failed for {session}:{window}"
-            )));
+        if tmux_has_window(session, window)? {
+            let status = Command::new("tmux")
+                .args([
+                    "respawn-window",
+                    "-k",
+                    "-t",
+                    &format!("{session}:{window}"),
+                    &cmd,
+                ])
+                .status()
+                .map_err(|err| {
+                    DispatchError::Tmux(format!("failed respawning tmux window: {err}"))
+                })?;
+            if !status.success() {
+                return Err(DispatchError::Tmux(format!(
+                    "tmux respawn-window failed for {session}:{window}"
+                )));
+            }
+        } else {
+            let status = Command::new("tmux")
+                .args([
+                    "new-window",
+                    "-t",
+                    &format!("{session}:"),
+                    "-n",
+                    window,
+                    &cmd,
+                ])
+                .status()
+                .map_err(|err| {
+                    DispatchError::Tmux(format!("failed creating tmux window: {err}"))
+                })?;
+            if !status.success() {
+                return Err(DispatchError::Tmux(format!(
+                    "tmux new-window failed for {session}:{window}"
+                )));
+            }
         }
     } else {
         let status = Command::new("tmux")
@@ -1024,11 +1070,25 @@ async fn dispatch_tmux(
         .get(&directive.role)
         .ok_or_else(|| DispatchError::RoleNotConfigured(directive.role.clone()))?;
 
-    let lock_path = acquire_repo_lock(&state.db_path, &record.repo_full_name)?;
-
     let issue_number = record
         .issue_number
         .ok_or_else(|| DispatchError::InvalidIssueRef(record.repo_full_name.clone()))?;
+    if let Some(dispatch_id) =
+        find_issue_inflight_dispatch(&state.db_path, &record.repo_full_name, issue_number)
+            .map_err(|err| DispatchError::Db(err.to_string()))?
+    {
+        return Err(DispatchError::IssueDispatchInFlight {
+            repo_full_name: record.repo_full_name.clone(),
+            issue_number,
+            dispatch_id,
+        });
+    }
+    let issue_session_id =
+        latest_issue_codex_session_id(&state.db_path, &record.repo_full_name, issue_number)
+            .map_err(|err| DispatchError::Db(err.to_string()))?;
+
+    let lock_path = acquire_repo_lock(&state.db_path, &record.repo_full_name)?;
+
     let repo = RepoRef::parse(&record.repo_full_name)
         .map_err(|_| DispatchError::InvalidIssueRef(record.repo_full_name.clone()))?;
     let issue_ref = IssueRef {
@@ -1052,12 +1112,7 @@ async fn dispatch_tmux(
     )
     .map_err(|err| DispatchError::Db(err.to_string()))?;
 
-    let tmux_window = format!(
-        "d{}-i{}-{}",
-        dispatch_id,
-        issue_number,
-        directive_name.chars().take(16).collect::<String>()
-    );
+    let tmux_window = format!("i{issue_number}");
     let run_dir = run_root(&state.db_path)?.join(format!("dispatch-{dispatch_id}"));
     fs::create_dir_all(&run_dir)
         .map_err(|err| DispatchError::Io(format!("failed to create run dir: {err}")))?;
@@ -1119,6 +1174,7 @@ TOKEN_FILE={token_file}
 WORKDIR={workdir}
 CODEX_BIN={codex_bin}
 CODEX_ROLE_ARG={codex_role_arg}
+ISSUE_SESSION_ID={issue_session_id}
 DIRECTIVE={directive}
 ROLE_NAME={role_name}
 TMUX_LOCATOR={tmux_locator}
@@ -1130,12 +1186,30 @@ cleanup() {{
 trap cleanup EXIT
 
 touch "$MARKER_FILE"
+cd "$WORKDIR"
+: > "$CODEX_LOG_FILE"
+
+run_codex_fresh() {{
+  cat "$PROMPT_FILE" \
+    | timeout --preserve-status "$TIMEOUT_SEC" "$CODEX_BIN" "$CODEX_ROLE_ARG" --no-alt-screen exec --skip-git-repo-check -o "$LAST_MESSAGE_FILE" - \
+      2>&1 | tee -a "$CODEX_LOG_FILE"
+}}
 
 set +e
-cat "$PROMPT_FILE" \
-  | timeout --preserve-status "$TIMEOUT_SEC" "$CODEX_BIN" "$CODEX_ROLE_ARG" --no-alt-screen exec --skip-git-repo-check --cd "$WORKDIR" -o "$LAST_MESSAGE_FILE" - \
-    2>&1 | tee "$CODEX_LOG_FILE"
-exit_code=$?
+if [[ -n "$ISSUE_SESSION_ID" ]]; then
+  cat "$PROMPT_FILE" \
+    | timeout --preserve-status "$TIMEOUT_SEC" "$CODEX_BIN" "$CODEX_ROLE_ARG" --no-alt-screen exec -o "$LAST_MESSAGE_FILE" resume --skip-git-repo-check "$ISSUE_SESSION_ID" - \
+      2>&1 | tee -a "$CODEX_LOG_FILE"
+  exit_code=$?
+  if [[ "$exit_code" -ne 0 && "$exit_code" -ne 124 ]]; then
+    echo "orchd: resume failed for issue session $ISSUE_SESSION_ID, falling back to fresh exec" | tee -a "$CODEX_LOG_FILE"
+    run_codex_fresh
+    exit_code=$?
+  fi
+else
+  run_codex_fresh
+  exit_code=$?
+fi
 set -e
 
 session_id="$(sed -n 's/^session id: //p' "$CODEX_LOG_FILE" | tail -n 1)"
@@ -1199,6 +1273,7 @@ sqlite3 "$DB_PATH" "UPDATE dispatches SET status='$status', reason_code='$reason
         workdir = shell_quote(&role.workdir.to_string_lossy()),
         codex_bin = shell_quote(&role.codex_bin.to_string_lossy()),
         codex_role_arg = shell_quote(&role.codex_role_arg),
+        issue_session_id = shell_quote(issue_session_id.as_deref().unwrap_or("")),
         directive = shell_quote(directive_name),
         role_name = shell_quote(&directive.role),
         tmux_locator = shell_quote(&tmux_locator),
@@ -1208,7 +1283,7 @@ sqlite3 "$DB_PATH" "UPDATE dispatches SET status='$status', reason_code='$reason
     fs::write(&script_path, script)
         .map_err(|err| DispatchError::Io(format!("failed writing run script: {err}")))?;
 
-    let spawn_result = tmux_spawn_window(
+    let spawn_result = tmux_spawn_or_respawn_window(
         &dispatch_config.tmux.session,
         &tmux_window,
         &script_path,
@@ -1382,6 +1457,8 @@ fn init_db(db_path: &Path) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_dispatches_repo_status
             ON dispatches (repo_full_name, status);
+        CREATE INDEX IF NOT EXISTS idx_dispatches_repo_issue
+            ON dispatches (repo_full_name, issue_number, id DESC);
         ",
     )?;
     Ok(())
@@ -1547,6 +1624,55 @@ fn update_dispatch_failed_start(
         params![dispatch_id, reason_code, error_text, now],
     )?;
     Ok(())
+}
+
+fn find_issue_inflight_dispatch(
+    db_path: &Path,
+    repo_full_name: &str,
+    issue_number: u64,
+) -> Result<Option<i64>> {
+    let conn = open_db(db_path)?;
+    let dispatch_id = conn
+        .query_row(
+            r"
+            SELECT id
+            FROM dispatches
+            WHERE repo_full_name = ?1
+              AND issue_number = ?2
+              AND status IN ('starting', 'running')
+            ORDER BY id DESC
+            LIMIT 1
+            ",
+            params![repo_full_name, i64::try_from(issue_number)?],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    Ok(dispatch_id)
+}
+
+fn latest_issue_codex_session_id(
+    db_path: &Path,
+    repo_full_name: &str,
+    issue_number: u64,
+) -> Result<Option<String>> {
+    let conn = open_db(db_path)?;
+    let session_id = conn
+        .query_row(
+            r"
+            SELECT codex_session_id
+            FROM dispatches
+            WHERE repo_full_name = ?1
+              AND issue_number = ?2
+              AND codex_session_id IS NOT NULL
+              AND codex_session_id != ''
+            ORDER BY id DESC
+            LIMIT 1
+            ",
+            params![repo_full_name, i64::try_from(issue_number)?],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(session_id)
 }
 
 async fn run_heartbeat_loop(state: AppState, interval_sec: u64) {

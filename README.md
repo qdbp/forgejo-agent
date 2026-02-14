@@ -105,13 +105,15 @@ EOF
 Current mode supports both:
 
 - `dry-run`: parse directives and post intent comments only
-- `tmux-exec`: create a tracked dispatch run and spawn Codex in a tmux window
+- `tmux-exec`: create a tracked dispatch run and spawn Codex in issue-scoped tmux windows
 
 Core behavior:
 
 - webhook ingest
 - directive parse (`@codex-orch design|impl|poke`, `@codex poke`)
 - sqlite event/decision/dispatch persistence
+- one active dispatch per issue (duplicates blocked while running)
+- issue-scoped codex session reuse (`exec resume`) from latest `codex_session_id`
 - periodic heartbeat + reconcile scan logs
 
 Run (`tmux-exec`):

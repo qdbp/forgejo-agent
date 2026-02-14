@@ -77,7 +77,7 @@ sqlite3 ~/.local/state/orchd-dev/orchd.sqlite \
   "SELECT id,repo_full_name,issue_number,actor_login,directive,target_role,status,reason_code,tmux_session,tmux_window,codex_session_id,exit_code,started_at,ended_at FROM dispatches ORDER BY id DESC LIMIT 20;"
 ```
 
-Inspect tmux windows created by dispatch:
+Inspect issue-scoped tmux windows:
 
 ```bash
 tmux list-sessions
@@ -124,4 +124,4 @@ Expected in `tmux-exec` mode:
 - response: `decision=accepted`, `reason_code=explicit_directive`
 - issue comment: `orchd: dispatch started ...`
 - sqlite `dispatches` row with `status=running` then terminal status
-- tmux window created under the configured session
+- tmux window `i<issue_number>` created (or respawned) under the configured session
