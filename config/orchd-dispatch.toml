@@ -1,0 +1,28 @@
+version = 1
+allowed_actors = ["main"]
+forgejoctl_bin = "/home/main/.local/bin/forgejoctl"
+
+[tmux]
+session = "codex-orch"
+remain_on_exit = true
+
+[roles.codex-orch]
+codex_bin = "/home/main/bin/codex"
+codex_role_arg = "orch"
+token_file = "/home/main/.config/forgejo-agent/creds/codex-orch.token"
+workdir = "/home/main/forgejo-agent"
+
+[directives.design]
+role = "codex-orch"
+prompt_file = "../prompts/orchd-design.md"
+timeout_sec = 1800
+
+[directives.impl]
+role = "codex-orch"
+prompt_file = "../prompts/orchd-impl.md"
+timeout_sec = 7200
+
+[directives.poke]
+role = "codex-orch"
+prompt_file = "../prompts/orchd-poke.md"
+timeout_sec = 1200

@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ctl="${FORGEJOCTL_BIN:-$HOME/.local/bin/forgejoctl}"
+repo="${1:-}"
+if [[ -n "$repo" ]]; then
+  exec "$ctl" repo ensure "$repo"
+fi
+exec "$ctl" repo ensure

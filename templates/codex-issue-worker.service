@@ -1,0 +1,15 @@
+[Unit]
+Description=Codex Forgejo Issue Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/main/.local/bin/forgejoctl worker run --repo main/backlog --workdir /home/main/programming/projects/REPLACE_ME --execute --interval-sec 45 --agent codex-main
+Restart=always
+RestartSec=5
+WorkingDirectory=/home/main
+Environment=HOME=/home/main
+
+[Install]
+WantedBy=default.target

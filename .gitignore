@@ -1,0 +1,33 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Editor / shell noise
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Local runtime state
+*.log
+*.pid
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+dispatch-runs/
+state/
+tmp/
+
+# Local env and credentials
+.env
+.env.*
+*.token
+*.secret
+creds/
+secrets/
+config/*.local.toml

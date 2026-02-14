@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cfg_dir="${XDG_CONFIG_HOME:-$HOME/.config}/forgejo-agent"
+cfg_file="$cfg_dir/config.env"
+token_file="$cfg_dir/token"
+
+mkdir -p "$cfg_dir"
+chmod 700 "$cfg_dir"
+
+if [[ ! -f "$cfg_file" ]]; then
+  cat > "$cfg_file" <<CFG
+# Forgejo endpoint. Keep localhost-only unless you explicitly need remote access.
+FORGEJO_BASE_URL=http://127.0.0.1:3000
+
+# Default issue namespace used by scripts if no repo is passed.
+FORGEJO_DEFAULT_OWNER=main
+FORGEJO_DEFAULT_REPO=backlog
+
+# Agent workflow defaults.
+FORGEJO_AGENT_NAME=codex
+FORGEJO_LEASE_MINUTES=90
+FORGEJO_BLOCKED_LABEL=state/blocked
+FORGEJO_READY_LABEL=state/ready
+
+# Token is read from this file (do not commit it).
+FORGEJO_TOKEN_FILE=$token_file
+CFG
+  chmod 600 "$cfg_file"
+  printf 'wrote %s\n' "$cfg_file"
+else
+  printf 'kept existing %s\n' "$cfg_file"
+fi
+
+if [[ $# -ge 1 ]]; then
+  printf '%s\n' "$1" > "$token_file"
+  chmod 600 "$token_file"
+  printf 'wrote token to %s\n' "$token_file"
+elif [[ ! -f "$token_file" ]]; then
+  printf 'token file missing: %s\n' "$token_file"
+  printf 'create it with: printf "<TOKEN>" > %s && chmod 600 %s\n' "$token_file" "$token_file"
+else
+  printf 'kept existing %s\n' "$token_file"
+fi
+
+printf 'next: run %s issue list\n' "$HOME/.local/bin/forgejoctl"

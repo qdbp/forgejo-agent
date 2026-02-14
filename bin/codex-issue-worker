@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ctl="${FORGEJOCTL_BIN:-$HOME/.local/bin/forgejoctl}"
+exec "$ctl" worker run "$@"

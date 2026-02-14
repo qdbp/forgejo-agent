@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cfg_file="${FORGEJO_AGENT_CONFIG_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/forgejo-agent/config.env}"
+[[ -f "$cfg_file" ]] || {
+  printf 'error: missing Forgejo agent config: %s\n' "$cfg_file" >&2
+  exit 1
+}
+
+# shellcheck disable=SC1090
+source "$cfg_file"
+
+: "${FORGEJO_BASE_URL:=http://127.0.0.1:3000}"
+token_file="${FORGEJO_TOKEN_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/forgejo-agent/token}"
+if [[ "$token_file" == ~/* ]]; then
+  token_file="$HOME/${token_file#~/}"
+fi
+
+[[ -f "$token_file" ]] || {
+  printf 'error: missing token file: %s\n' "$token_file" >&2
+  exit 1
+}
+
+token="$(tr -d '\r\n' < "$token_file")"
+[[ -n "$token" ]] || {
+  printf 'error: token file is empty: %s\n' "$token_file" >&2
+  exit 1
+}
+
+if [[ -n "${FORGEJO_MCP_BIN:-}" ]]; then
+  mcp_bin="$FORGEJO_MCP_BIN"
+  if [[ "$mcp_bin" == ~/* ]]; then
+    mcp_bin="$HOME/${mcp_bin#~/}"
+  fi
+elif mcp_bin="$(command -v forgejo-mcp 2>/dev/null)"; then
+  :
+elif [[ -x "$HOME/.local/bin/forgejo-mcp" ]]; then
+  mcp_bin="$HOME/.local/bin/forgejo-mcp"
+elif [[ -x "$HOME/go/bin/forgejo-mcp" ]]; then
+  # Legacy fallback for older installs.
+  mcp_bin="$HOME/go/bin/forgejo-mcp"
+else
+  printf 'error: forgejo-mcp binary not found\n' >&2
+  printf 'hint: install forgejo-mcp on PATH (for example ~/.local/bin/forgejo-mcp)\n' >&2
+  printf 'hint: or set FORGEJO_MCP_BIN=/absolute/path/to/forgejo-mcp in %s\n' "$cfg_file" >&2
+  exit 1
+fi
+
+[[ -x "$mcp_bin" ]] || {
+  printf 'error: forgejo-mcp binary is not executable: %s\n' "$mcp_bin" >&2
+  exit 1
+}
+
+export FORGEJOMCP_SERVER="$FORGEJO_BASE_URL"
+export FORGEJOMCP_TOKEN="$token"
+
+exec "$mcp_bin" stdio

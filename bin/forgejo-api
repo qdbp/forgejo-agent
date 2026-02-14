@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+
+need_cmd curl
+need_cmd jq
+load_config
+
+usage() {
+  cat <<USAGE
+usage: forgejo-api <METHOD> <PATH> [JSON_PAYLOAD]
+
+examples:
+  forgejo-api GET /api/v1/user
+  forgejo-api GET /api/v1/repos/main/backlog/issues?state=open
+  forgejo-api POST /api/v1/repos/main/backlog/issues '{"title":"x","body":"y"}'
+USAGE
+}
+
+method="${1-}"
+path="${2-}"
+payload="${3-}"
+
+[[ -n "$method" && -n "$path" ]] || { usage; exit 1; }
+
+out="$(forgejo_api "$method" "$path" "$payload")"
+if printf '%s' "$out" | jq . >/dev/null 2>&1; then
+  printf '%s\n' "$out" | jq .
+else
+  printf '%s\n' "$out"
+fi
