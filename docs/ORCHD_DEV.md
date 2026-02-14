@@ -149,6 +149,7 @@ Expected in `tmux-tui` mode:
 - tmux-tui run watcher monitors session JSONL and sends `Ctrl-C` after first `final_answer` to close the turn promptly
 - auto-reap is skipped while the window is held (`@orchd_hold=1`) or actively focused in an attached tmux client
 - completion status is projected to `orchd/state/completed` on success or `orchd/state/failed` otherwise
+- for `impl` directive runs, orchd applies work-plane transitions (`state/review` on success, `state/blocked` on non-success) via `forgejoctl issue transition --force`
 - completion in sqlite/comment is keyed off a `final_answer` message found in session JSONL when present
 - generated run artifacts include `prompt.md` and `prompt_mode.txt` (`fresh` or `followup`)
 - follow-up prompts include an issue delta block derived from events newer than the role cursor

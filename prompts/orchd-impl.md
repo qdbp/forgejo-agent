@@ -14,6 +14,7 @@ Issue body:
 Implementation mode:
 - execute the work end-to-end where possible
 - continue autonomously until completion; stop only for material underspecification, material ambiguity, or clear churn/confusion
-- if blocked, state the exact blocker and why
-- include verification evidence in the final response
+- if blocked, explain exactly what decision/input is needed to unblock
+- include commit refs, verification summary, and residual risk in the final response
+- keep issue workflow current (`review` on success, `blocked` when stopped by blockers)
 - keep issue comments terse and natural-language (no rigid field templates)

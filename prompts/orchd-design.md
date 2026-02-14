@@ -18,6 +18,10 @@ Required output:
 2. Propose concrete next steps.
 3. Call out blockers/unknowns explicitly.
 
+Design contract:
+- read-only: do not edit repository files, do not create commits
+- respond in the issue thread with design guidance only
+
 Issue comment style:
 - use terse natural language
 - avoid rigid mechanical templates

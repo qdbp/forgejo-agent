@@ -1426,6 +1426,16 @@ else
   runtime_state="failed"
 fi
 
+work_state_target=""
+if [[ "$DIRECTIVE" == "impl" ]]; then
+  if [[ "$status" == "completed" ]]; then
+    work_state_target="review"
+  else
+    work_state_target="blocked"
+  fi
+  "$FORGEJOCTL_BIN" --token-file "$TOKEN_FILE" issue transition "$ISSUE_REF" --to "$work_state_target" --force || true
+fi
+
 if [[ -n "$session_id" ]]; then
   session_sql="'${{session_id//\'/\'\'}}'"
 else
@@ -1440,6 +1450,7 @@ sqlite3 "$DB_PATH" "UPDATE dispatches SET status='$status', reason_code='$reason
   echo "directive=$DIRECTIVE role=$ROLE_NAME"
   echo "tmux=$TMUX_LOCATOR"
   echo "codex_session_id=${{session_id:-unknown}}"
+  echo "work_state_target=${{work_state_target:-unchanged}}"
   echo "run_dir=$RUN_DIR"
   echo "log=$CODEX_LOG_FILE"
   echo
@@ -1700,6 +1711,16 @@ else
   runtime_state="failed"
 fi
 
+work_state_target=""
+if [[ "$DIRECTIVE" == "impl" ]]; then
+  if [[ "$status" == "completed" ]]; then
+    work_state_target="review"
+  else
+    work_state_target="blocked"
+  fi
+  "$FORGEJOCTL_BIN" --token-file "$TOKEN_FILE" issue transition "$ISSUE_REF" --to "$work_state_target" --force || true
+fi
+
 if [[ -n "$session_id" ]]; then
   session_sql="'${{session_id//\'/\'\'}}'"
 else
@@ -1715,6 +1736,7 @@ sqlite3 "$DB_PATH" "UPDATE dispatches SET status='$status', reason_code='$reason
   echo "tmux=$TMUX_LOCATOR"
   echo "codex_session_id=${{session_id:-unknown}}"
   echo "session_jsonl=${{session_jsonl:-unknown}}"
+  echo "work_state_target=${{work_state_target:-unchanged}}"
   echo "run_dir=$RUN_DIR"
   echo "log=$CODEX_LOG_FILE"
   echo
