@@ -24,7 +24,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use chrono::Utc;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use clap::{Parser, ValueEnum};
 use hmac::{Hmac, Mac};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -169,6 +169,8 @@ const fn default_timeout_sec() -> u64 {
     3600
 }
 
+const STARTING_DISPATCH_STALE_AFTER_SEC: i64 = 120;
+
 #[derive(Debug, thiserror::Error)]
 enum DispatchError {
     #[error("dispatch config not loaded")]
@@ -240,6 +242,16 @@ struct DispatchInsert {
     directive: String,
     target_role: String,
     started_at: String,
+}
+
+#[derive(Debug)]
+struct InflightDispatch {
+    id: i64,
+    status: String,
+    started_at: String,
+    tmux_session: Option<String>,
+    tmux_window: Option<String>,
+    lock_path: Option<String>,
 }
 
 struct TmuxRunScriptInputs<'a> {
@@ -1114,6 +1126,19 @@ fn tmux_has_window(session: &str, window: &str) -> Result<bool, DispatchError> {
     Ok(windows.lines().any(|name| name.trim() == target))
 }
 
+fn tmux_window_has_live_pane(session: &str, window: &str) -> Result<bool, DispatchError> {
+    let target = format!("{session}:{window}");
+    let output = Command::new("tmux")
+        .args(["list-panes", "-t", &target, "-F", "#{pane_dead}"])
+        .output()
+        .map_err(|err| DispatchError::Tmux(format!("failed listing tmux panes: {err}")))?;
+    if !output.status.success() {
+        return Ok(false);
+    }
+    let pane_states = String::from_utf8_lossy(&output.stdout);
+    Ok(pane_states.lines().any(|line| line.trim() == "0"))
+}
+
 fn tmux_spawn_or_respawn_window(
     session: &str,
     window: &str,
@@ -1546,9 +1571,12 @@ async fn dispatch_tmux(
     let issue_number = record
         .issue_number
         .ok_or_else(|| DispatchError::InvalidIssueRef(record.repo_full_name.clone()))?;
-    if let Some(dispatch_id) =
-        find_issue_inflight_dispatch(&state.db_path, &record.repo_full_name, issue_number)
-            .map_err(|err| DispatchError::Db(err.to_string()))?
+    if let Some(dispatch_id) = find_issue_inflight_dispatch_with_healing(
+        &state.db_path,
+        &record.repo_full_name,
+        issue_number,
+    )
+    .map_err(|err| DispatchError::Db(err.to_string()))?
     {
         return Err(DispatchError::IssueDispatchInFlight {
             repo_full_name: record.repo_full_name.clone(),
@@ -2016,16 +2044,16 @@ fn update_dispatch_failed_start(
     Ok(())
 }
 
-fn find_issue_inflight_dispatch(
+fn latest_issue_inflight_dispatch(
     db_path: &Path,
     repo_full_name: &str,
     issue_number: u64,
-) -> Result<Option<i64>> {
+) -> Result<Option<InflightDispatch>> {
     let conn = open_db(db_path)?;
-    let dispatch_id = conn
+    let dispatch = conn
         .query_row(
             r"
-            SELECT id
+            SELECT id, status, started_at, tmux_session, tmux_window, lock_path
             FROM dispatches
             WHERE repo_full_name = ?1
               AND issue_number = ?2
@@ -2034,10 +2062,149 @@ fn find_issue_inflight_dispatch(
             LIMIT 1
             ",
             params![repo_full_name, i64::try_from(issue_number)?],
-            |row| row.get::<_, i64>(0),
+            |row| {
+                Ok(InflightDispatch {
+                    id: row.get(0)?,
+                    status: row.get(1)?,
+                    started_at: row.get(2)?,
+                    tmux_session: row.get(3)?,
+                    tmux_window: row.get(4)?,
+                    lock_path: row.get(5)?,
+                })
+            },
         )
         .optional()?;
-    Ok(dispatch_id)
+    Ok(dispatch)
+}
+
+fn is_stale_starting_dispatch(
+    dispatch: &InflightDispatch,
+    repo_full_name: &str,
+    issue_number: u64,
+) -> bool {
+    let Ok(started_at) = DateTime::parse_from_rfc3339(&dispatch.started_at) else {
+        return true;
+    };
+    let age = Utc::now() - started_at.with_timezone(&Utc);
+    if age < ChronoDuration::seconds(STARTING_DISPATCH_STALE_AFTER_SEC) {
+        return false;
+    }
+    let Some(session) = dispatch.tmux_session.as_deref() else {
+        return true;
+    };
+    let window = dispatch
+        .tmux_window
+        .clone()
+        .unwrap_or_else(|| issue_tmux_window_name(repo_full_name, issue_number));
+    match tmux_window_has_live_pane(session, &window) {
+        Ok(has_live_pane) => !has_live_pane,
+        Err(err) => {
+            log_line(
+                "dispatch_heal_probe_failed",
+                json!({
+                    "dispatch_id": dispatch.id,
+                    "status": dispatch.status,
+                    "repo": repo_full_name,
+                    "issue_number": issue_number,
+                    "error": err.to_string(),
+                }),
+            );
+            false
+        }
+    }
+}
+
+fn should_heal_dispatch_stale(
+    dispatch: &InflightDispatch,
+    repo_full_name: &str,
+    issue_number: u64,
+) -> bool {
+    match dispatch.status.as_str() {
+        "running" => {
+            let Some(session) = dispatch.tmux_session.as_deref() else {
+                return true;
+            };
+            let Some(window) = dispatch.tmux_window.as_deref() else {
+                return true;
+            };
+            match tmux_window_has_live_pane(session, window) {
+                Ok(has_live_pane) => !has_live_pane,
+                Err(err) => {
+                    log_line(
+                        "dispatch_heal_probe_failed",
+                        json!({
+                            "dispatch_id": dispatch.id,
+                            "status": dispatch.status,
+                            "repo": repo_full_name,
+                            "issue_number": issue_number,
+                            "error": err.to_string(),
+                        }),
+                    );
+                    false
+                }
+            }
+        }
+        "starting" => is_stale_starting_dispatch(dispatch, repo_full_name, issue_number),
+        _ => false,
+    }
+}
+
+fn mark_dispatch_failed_runtime(
+    db_path: &Path,
+    dispatch_id: i64,
+    reason_code: &str,
+    error_text: &str,
+) -> Result<()> {
+    let conn = open_db(db_path)?;
+    let ended_at = Utc::now().to_rfc3339();
+    conn.execute(
+        r"
+        UPDATE dispatches
+        SET status = 'failed_runtime',
+            reason_code = ?2,
+            error_text = ?3,
+            ended_at = ?4
+        WHERE id = ?1
+          AND status IN ('starting', 'running')
+        ",
+        params![dispatch_id, reason_code, error_text, ended_at],
+    )?;
+    Ok(())
+}
+
+fn find_issue_inflight_dispatch_with_healing(
+    db_path: &Path,
+    repo_full_name: &str,
+    issue_number: u64,
+) -> Result<Option<i64>> {
+    loop {
+        let Some(dispatch) = latest_issue_inflight_dispatch(db_path, repo_full_name, issue_number)?
+        else {
+            return Ok(None);
+        };
+        if !should_heal_dispatch_stale(&dispatch, repo_full_name, issue_number) {
+            return Ok(Some(dispatch.id));
+        }
+        mark_dispatch_failed_runtime(
+            db_path,
+            dispatch.id,
+            "stale_dispatch_autohealed",
+            "auto-healed stale in-flight dispatch before launch",
+        )?;
+        if let Some(lock_path) = dispatch.lock_path.as_deref() {
+            let _ = fs::remove_file(lock_path);
+        }
+        log_line(
+            "dispatch_autohealed",
+            json!({
+                "dispatch_id": dispatch.id,
+                "repo": repo_full_name,
+                "issue_number": issue_number,
+                "status": dispatch.status,
+                "reason_code": "stale_dispatch_autohealed",
+            }),
+        );
+    }
 }
 
 fn latest_issue_codex_session_id(
@@ -2179,4 +2346,50 @@ fn log_line(event: &str, payload: serde_json::Value) {
         "data": payload,
     });
     println!("{line}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn inflight_dispatch(
+        status: &str,
+        started_at: String,
+        tmux_session: Option<&str>,
+    ) -> InflightDispatch {
+        InflightDispatch {
+            id: 1,
+            status: status.to_string(),
+            started_at,
+            tmux_session: tmux_session.map(str::to_string),
+            tmux_window: None,
+            lock_path: None,
+        }
+    }
+
+    #[test]
+    fn starting_dispatch_is_not_stale_within_grace_period() {
+        let started_at = (Utc::now() - ChronoDuration::seconds(5)).to_rfc3339();
+        let dispatch = inflight_dispatch("starting", started_at, None);
+        assert!(!is_stale_starting_dispatch(
+            &dispatch,
+            "main/orchd-debug",
+            1
+        ));
+    }
+
+    #[test]
+    fn starting_dispatch_with_invalid_timestamp_is_stale() {
+        let dispatch = inflight_dispatch("starting", "invalid-timestamp".to_string(), None);
+        assert!(is_stale_starting_dispatch(&dispatch, "main/orchd-debug", 1));
+    }
+
+    #[test]
+    fn starting_dispatch_without_tmux_session_is_stale_after_grace_period() {
+        let started_at = (Utc::now()
+            - ChronoDuration::seconds(STARTING_DISPATCH_STALE_AFTER_SEC + 5))
+        .to_rfc3339();
+        let dispatch = inflight_dispatch("starting", started_at, None);
+        assert!(is_stale_starting_dispatch(&dispatch, "main/orchd-debug", 1));
+    }
 }
