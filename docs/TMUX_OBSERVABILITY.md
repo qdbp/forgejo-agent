@@ -11,7 +11,7 @@ This is the operator view of dispatched Codex runs.
   lives in tmux.
 - Run artifacts are written under:
   `~/.local/state/orchd-dev/dispatch-runs/dispatch-<id>/`.
-- `codex_session_id` is reused per issue when available (`codex exec resume`).
+- `codex_session_id` is reused per issue when available (`codex resume` in `tmux-tui`, `codex exec resume` in `tmux-exec`).
 
 ## Fast path: "what is running right now?"
 
@@ -43,8 +43,10 @@ Attach read-only (safe observer mode):
 tmux attach -r -t codex-orch
 ```
 
-Expected behavior: dispatched Codex output streams live in the pane and is also
-written to `dispatch-<id>/codex.log`.
+Expected behavior:
+
+- `tmux-tui`: Codex output streams live in the pane (native interactive TUI).
+- `tmux-exec`: Codex output streams live in the pane and is mirrored to `dispatch-<id>/codex.log`.
 
 ## Inspect finished runs
 
@@ -56,6 +58,7 @@ run_dir="$HOME/.local/state/orchd-dev/dispatch-runs/dispatch-$id"
 ls -la "$run_dir"
 tail -n 80 "$run_dir/codex.log"
 cat "$run_dir/last_message.md" 2>/dev/null || true
+cat "$run_dir/session.jsonl.path" 2>/dev/null || true
 ```
 
 Cross-check sqlite status:
@@ -74,11 +77,9 @@ tmux capture-pane -pt codex-orch:0 | tail -n 120
 
 ## Troubleshooting
 
-Black pane until exit:
+Unexpected non-interactive-looking pane:
 
-- Cause: older `orchd` generated run scripts that redirected all output to file.
-- Fix: restart `orchd` on the latest build, then dispatch again.
-- Verify: new `dispatch-<id>/run.sh` contains `| tee "$CODEX_LOG_FILE"`.
+- Verify dispatch mode. `tmux-tui` should show a native Codex interface; `tmux-exec` is line-oriented.
 
 ## Session lifecycle patterns
 

@@ -58,7 +58,7 @@ struct Cli {
     reconcile_sec: u64,
     #[arg(long)]
     reconcile_repo: Option<RepoRef>,
-    #[arg(long, value_enum, default_value_t = DispatchMode::DryRun)]
+    #[arg(long, value_enum, default_value_t = DispatchMode::TmuxTui)]
     dispatch_mode: DispatchMode,
     #[arg(long, default_value = "config/orchd-dispatch.toml")]
     dispatch_config: String,
@@ -70,6 +70,7 @@ struct Cli {
 enum DispatchMode {
     DryRun,
     TmuxExec,
+    TmuxTui,
 }
 
 impl DispatchMode {
@@ -77,6 +78,7 @@ impl DispatchMode {
         match self {
             Self::DryRun => "dry-run",
             Self::TmuxExec => "tmux-exec",
+            Self::TmuxTui => "tmux-tui",
         }
     }
 }
@@ -234,6 +236,30 @@ struct DispatchInsert {
     started_at: String,
 }
 
+struct TmuxRunScriptInputs<'a> {
+    dispatch_id: i64,
+    db_path: &'a Path,
+    lock_path: &'a Path,
+    run_dir: &'a Path,
+    prompt_path: &'a Path,
+    summary_path: &'a Path,
+    completion_path: &'a Path,
+    last_message_path: &'a Path,
+    codex_log_path: &'a Path,
+    marker_path: &'a Path,
+    issue_ref_text: &'a str,
+    forgejoctl_bin: &'a Path,
+    token_file: &'a Path,
+    workdir: &'a Path,
+    codex_bin: &'a Path,
+    codex_role_arg: &'a str,
+    issue_session_id: Option<&'a str>,
+    directive_name: &'a str,
+    role_name: &'a str,
+    tmux_locator: &'a str,
+    timeout_sec: u64,
+}
+
 #[derive(Clone)]
 struct AppState {
     db_path: PathBuf,
@@ -354,7 +380,9 @@ async fn run() -> Result<()> {
     let dispatch_config_path = expand_tilde_path(&cli.dispatch_config)?;
     let dispatch_config = match cli.dispatch_mode {
         DispatchMode::DryRun => None,
-        DispatchMode::TmuxExec => Some(load_dispatch_config(&dispatch_config_path)?),
+        DispatchMode::TmuxExec | DispatchMode::TmuxTui => {
+            Some(load_dispatch_config(&dispatch_config_path)?)
+        }
     };
 
     let db_path = expand_tilde_path(&cli.db_path)?;
@@ -536,7 +564,7 @@ async fn process_webhook(
                         }
                     }
                 }
-                DispatchMode::TmuxExec => {
+                DispatchMode::TmuxExec | DispatchMode::TmuxTui => {
                     match dispatch_tmux(state.clone(), decision_id, &record, &decision).await {
                         Ok(launch) => {
                             if state.comment_echo {
@@ -1056,6 +1084,338 @@ fn tmux_spawn_or_respawn_window(
     Ok(())
 }
 
+fn build_tmux_exec_run_script(inputs: &TmuxRunScriptInputs<'_>) -> String {
+    format!(
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+
+DISPATCH_ID={dispatch_id}
+DB_PATH={db_path}
+LOCK_PATH={lock_path}
+RUN_DIR={run_dir}
+PROMPT_FILE={prompt_file}
+SUMMARY_FILE={summary_file}
+COMPLETION_FILE={completion_file}
+LAST_MESSAGE_FILE={last_message_file}
+CODEX_LOG_FILE={codex_log_file}
+MARKER_FILE={marker_file}
+ISSUE_REF={issue_ref}
+FORGEJOCTL_BIN={forgejoctl_bin}
+TOKEN_FILE={token_file}
+WORKDIR={workdir}
+CODEX_BIN={codex_bin}
+CODEX_ROLE_ARG={codex_role_arg}
+ISSUE_SESSION_ID={issue_session_id}
+DIRECTIVE={directive}
+ROLE_NAME={role_name}
+TMUX_LOCATOR={tmux_locator}
+TIMEOUT_SEC={timeout_sec}
+
+cleanup() {{
+  rm -f "$LOCK_PATH"
+}}
+trap cleanup EXIT
+
+touch "$MARKER_FILE"
+cd "$WORKDIR"
+: > "$CODEX_LOG_FILE"
+
+run_codex_fresh() {{
+  cat "$PROMPT_FILE" \
+    | timeout --preserve-status "$TIMEOUT_SEC" "$CODEX_BIN" "$CODEX_ROLE_ARG" --no-alt-screen exec --skip-git-repo-check -o "$LAST_MESSAGE_FILE" - \
+      2>&1 | tee -a "$CODEX_LOG_FILE"
+}}
+
+set +e
+if [[ -n "$ISSUE_SESSION_ID" ]]; then
+  cat "$PROMPT_FILE" \
+    | timeout --preserve-status "$TIMEOUT_SEC" "$CODEX_BIN" "$CODEX_ROLE_ARG" --no-alt-screen exec -o "$LAST_MESSAGE_FILE" resume --skip-git-repo-check "$ISSUE_SESSION_ID" - \
+      2>&1 | tee -a "$CODEX_LOG_FILE"
+  exit_code=$?
+  if [[ "$exit_code" -ne 0 && "$exit_code" -ne 124 ]]; then
+    echo "orchd: resume failed for issue session $ISSUE_SESSION_ID, falling back to fresh exec" | tee -a "$CODEX_LOG_FILE"
+    run_codex_fresh
+    exit_code=$?
+  fi
+else
+  run_codex_fresh
+  exit_code=$?
+fi
+set -e
+
+session_id="$(sed -n 's/^session id: //p' "$CODEX_LOG_FILE" | tail -n 1)"
+if [[ -z "$session_id" ]]; then
+  session_id="$(find "$HOME/.codex/sessions" -type f -name '*.jsonl' -newer "$MARKER_FILE" 2>/dev/null | sort | tail -n 1 | sed -n 's#.*-\([0-9a-fA-F-]\{{36\}}\)\.jsonl#\1#p')"
+fi
+
+if [[ -s "$LAST_MESSAGE_FILE" ]]; then
+  head -n 120 "$LAST_MESSAGE_FILE" > "$SUMMARY_FILE"
+else
+  echo "(no final assistant message)" > "$SUMMARY_FILE"
+fi
+
+if [[ "$exit_code" -eq 0 ]]; then
+  status="completed"
+  reason_code="completed"
+elif [[ "$exit_code" -eq 124 ]]; then
+  status="timed_out"
+  reason_code="timeout"
+else
+  status="failed_runtime"
+  reason_code="codex_exit_nonzero"
+fi
+
+if [[ -n "$session_id" ]]; then
+  session_sql="'${{session_id//\'/\'\'}}'"
+else
+  session_sql="NULL"
+fi
+ended_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+sqlite3 "$DB_PATH" "UPDATE dispatches SET status='$status', reason_code='$reason_code', codex_session_id=$session_sql, exit_code=$exit_code, ended_at='$ended_at' WHERE id=$DISPATCH_ID;"
+
+{{
+  echo "orchd: dispatch completed id=$DISPATCH_ID status=$status reason=$reason_code"
+  echo "directive=$DIRECTIVE role=$ROLE_NAME"
+  echo "tmux=$TMUX_LOCATOR"
+  echo "codex_session_id=${{session_id:-unknown}}"
+  echo "run_dir=$RUN_DIR"
+  echo "log=$CODEX_LOG_FILE"
+  echo
+  echo '```markdown'
+  cat "$SUMMARY_FILE"
+  echo '```'
+}} > "$COMPLETION_FILE"
+
+"$FORGEJOCTL_BIN" --token-file "$TOKEN_FILE" issue comment "$ISSUE_REF" --body-file "$COMPLETION_FILE" || true
+"#,
+        dispatch_id = inputs.dispatch_id,
+        db_path = shell_quote(&inputs.db_path.to_string_lossy()),
+        lock_path = shell_quote(&inputs.lock_path.to_string_lossy()),
+        run_dir = shell_quote(&inputs.run_dir.to_string_lossy()),
+        prompt_file = shell_quote(&inputs.prompt_path.to_string_lossy()),
+        summary_file = shell_quote(&inputs.summary_path.to_string_lossy()),
+        completion_file = shell_quote(&inputs.completion_path.to_string_lossy()),
+        last_message_file = shell_quote(&inputs.last_message_path.to_string_lossy()),
+        codex_log_file = shell_quote(&inputs.codex_log_path.to_string_lossy()),
+        marker_file = shell_quote(&inputs.marker_path.to_string_lossy()),
+        issue_ref = shell_quote(inputs.issue_ref_text),
+        forgejoctl_bin = shell_quote(&inputs.forgejoctl_bin.to_string_lossy()),
+        token_file = shell_quote(&inputs.token_file.to_string_lossy()),
+        workdir = shell_quote(&inputs.workdir.to_string_lossy()),
+        codex_bin = shell_quote(&inputs.codex_bin.to_string_lossy()),
+        codex_role_arg = shell_quote(inputs.codex_role_arg),
+        issue_session_id = shell_quote(inputs.issue_session_id.unwrap_or("")),
+        directive = shell_quote(inputs.directive_name),
+        role_name = shell_quote(inputs.role_name),
+        tmux_locator = shell_quote(inputs.tmux_locator),
+        timeout_sec = inputs.timeout_sec,
+    )
+}
+
+fn build_tmux_tui_run_script(
+    inputs: &TmuxRunScriptInputs<'_>,
+    bootstrap_prompt_path: &Path,
+    session_jsonl_path: &Path,
+) -> String {
+    format!(
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+
+DISPATCH_ID={dispatch_id}
+DB_PATH={db_path}
+LOCK_PATH={lock_path}
+RUN_DIR={run_dir}
+PROMPT_FILE={prompt_file}
+BOOTSTRAP_PROMPT_FILE={bootstrap_prompt_file}
+SESSION_JSONL_FILE={session_jsonl_file}
+SUMMARY_FILE={summary_file}
+COMPLETION_FILE={completion_file}
+LAST_MESSAGE_FILE={last_message_file}
+CODEX_LOG_FILE={codex_log_file}
+MARKER_FILE={marker_file}
+ISSUE_REF={issue_ref}
+FORGEJOCTL_BIN={forgejoctl_bin}
+TOKEN_FILE={token_file}
+WORKDIR={workdir}
+CODEX_BIN={codex_bin}
+CODEX_ROLE_ARG={codex_role_arg}
+ISSUE_SESSION_ID={issue_session_id}
+DIRECTIVE={directive}
+ROLE_NAME={role_name}
+TMUX_LOCATOR={tmux_locator}
+TIMEOUT_SEC={timeout_sec}
+
+cleanup() {{
+  rm -f "$LOCK_PATH"
+}}
+trap cleanup EXIT
+
+touch "$MARKER_FILE"
+cd "$WORKDIR"
+: > "$CODEX_LOG_FILE"
+
+bootstrap_prompt="$(cat "$BOOTSTRAP_PROMPT_FILE")"
+
+set +e
+if [[ -n "$ISSUE_SESSION_ID" ]]; then
+  timeout --preserve-status "$TIMEOUT_SEC" "$CODEX_BIN" "$CODEX_ROLE_ARG" resume "$ISSUE_SESSION_ID" "$bootstrap_prompt"
+  exit_code=$?
+else
+  timeout --preserve-status "$TIMEOUT_SEC" "$CODEX_BIN" "$CODEX_ROLE_ARG" --cd "$WORKDIR" "$bootstrap_prompt"
+  exit_code=$?
+fi
+set -e
+
+session_id="$ISSUE_SESSION_ID"
+if [[ -z "$session_id" ]]; then
+  session_id="$(find "$HOME/.codex/sessions" -type f -name '*.jsonl' -newer "$MARKER_FILE" 2>/dev/null | sort | tail -n 1 | sed -n 's#.*-\([0-9a-fA-F-]\{{36\}}\)\.jsonl#\1#p')"
+fi
+
+session_jsonl=""
+if [[ -n "$session_id" ]]; then
+  session_jsonl="$(find "$HOME/.codex/sessions" -type f -name "*-${{session_id}}.jsonl" 2>/dev/null | sort | tail -n 1)"
+fi
+if [[ -z "$session_jsonl" ]]; then
+  session_jsonl="$(find "$HOME/.codex/sessions" -type f -name '*.jsonl' -newer "$MARKER_FILE" 2>/dev/null | sort | tail -n 1)"
+fi
+printf '%s\n' "$session_jsonl" > "$SESSION_JSONL_FILE"
+
+found_final_answer="0"
+if [[ -n "$session_jsonl" && -r "$session_jsonl" ]]; then
+  parse_result="$(python3 - "$session_jsonl" "$SUMMARY_FILE" <<'PY'
+import json
+import sys
+
+session_path = sys.argv[1]
+summary_path = sys.argv[2]
+found = False
+last_text = None
+
+with open(session_path, "r", encoding="utf-8", errors="replace") as handle:
+    for raw_line in handle:
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except Exception:
+            continue
+        if entry.get("type") != "response_item":
+            continue
+        payload = entry.get("payload") or {{}}
+        if payload.get("type") != "message":
+            continue
+        if payload.get("role") != "assistant":
+            continue
+        if payload.get("phase") != "final_answer":
+            continue
+        found = True
+        text_parts = []
+        for item in payload.get("content") or []:
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text")
+            if isinstance(text, str) and text.strip():
+                text_parts.append(text.strip())
+        if text_parts:
+            last_text = "\n\n".join(text_parts)
+
+if found and last_text is None:
+    summary = "(final_answer detected, but output_text extraction was empty)"
+elif found:
+    summary = last_text
+else:
+    summary = "(no final_answer event found in session jsonl)"
+
+lines = summary.splitlines()
+with open(summary_path, "w", encoding="utf-8") as handle:
+    if lines:
+        handle.write("\n".join(lines[:120]) + "\n")
+    else:
+        handle.write("\n")
+
+print("FOUND_FINAL_ANSWER=1" if found else "FOUND_FINAL_ANSWER=0")
+PY
+)"
+  if [[ "$parse_result" == *"FOUND_FINAL_ANSWER=1"* ]]; then
+    found_final_answer="1"
+  fi
+else
+  echo "(session jsonl not found)" > "$SUMMARY_FILE"
+fi
+
+if [[ "$found_final_answer" == "1" ]]; then
+  status="completed"
+  reason_code="completed_final_answer"
+elif [[ "$exit_code" -eq 124 ]]; then
+  status="timed_out"
+  reason_code="timeout"
+elif [[ "$exit_code" -eq 0 ]]; then
+  status="stopped_no_final_answer"
+  reason_code="no_final_answer"
+else
+  status="failed_runtime"
+  reason_code="codex_exit_nonzero"
+fi
+
+if [[ -n "$session_id" ]]; then
+  session_sql="'${{session_id//\'/\'\'}}'"
+else
+  session_sql="NULL"
+fi
+ended_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+sqlite3 "$DB_PATH" "UPDATE dispatches SET status='$status', reason_code='$reason_code', codex_session_id=$session_sql, exit_code=$exit_code, ended_at='$ended_at' WHERE id=$DISPATCH_ID;"
+
+{{
+  echo "orchd: dispatch completed id=$DISPATCH_ID status=$status reason=$reason_code"
+  echo "directive=$DIRECTIVE role=$ROLE_NAME"
+  echo "tmux=$TMUX_LOCATOR"
+  echo "codex_session_id=${{session_id:-unknown}}"
+  echo "session_jsonl=${{session_jsonl:-unknown}}"
+  echo "run_dir=$RUN_DIR"
+  echo "log=$CODEX_LOG_FILE"
+  echo
+  echo '```markdown'
+  cat "$SUMMARY_FILE"
+  echo '```'
+}} > "$COMPLETION_FILE"
+
+{{
+  echo "mode=tmux-tui"
+  echo "session_id=${{session_id:-unknown}}"
+  echo "session_jsonl=${{session_jsonl:-unknown}}"
+  echo "found_final_answer=$found_final_answer"
+  echo "exit_code=$exit_code"
+}} > "$CODEX_LOG_FILE"
+
+"$FORGEJOCTL_BIN" --token-file "$TOKEN_FILE" issue comment "$ISSUE_REF" --body-file "$COMPLETION_FILE" || true
+"#,
+        dispatch_id = inputs.dispatch_id,
+        db_path = shell_quote(&inputs.db_path.to_string_lossy()),
+        lock_path = shell_quote(&inputs.lock_path.to_string_lossy()),
+        run_dir = shell_quote(&inputs.run_dir.to_string_lossy()),
+        prompt_file = shell_quote(&inputs.prompt_path.to_string_lossy()),
+        bootstrap_prompt_file = shell_quote(&bootstrap_prompt_path.to_string_lossy()),
+        session_jsonl_file = shell_quote(&session_jsonl_path.to_string_lossy()),
+        summary_file = shell_quote(&inputs.summary_path.to_string_lossy()),
+        completion_file = shell_quote(&inputs.completion_path.to_string_lossy()),
+        last_message_file = shell_quote(&inputs.last_message_path.to_string_lossy()),
+        codex_log_file = shell_quote(&inputs.codex_log_path.to_string_lossy()),
+        marker_file = shell_quote(&inputs.marker_path.to_string_lossy()),
+        issue_ref = shell_quote(inputs.issue_ref_text),
+        forgejoctl_bin = shell_quote(&inputs.forgejoctl_bin.to_string_lossy()),
+        token_file = shell_quote(&inputs.token_file.to_string_lossy()),
+        workdir = shell_quote(&inputs.workdir.to_string_lossy()),
+        codex_bin = shell_quote(&inputs.codex_bin.to_string_lossy()),
+        codex_role_arg = shell_quote(inputs.codex_role_arg),
+        issue_session_id = shell_quote(inputs.issue_session_id.unwrap_or("")),
+        directive = shell_quote(inputs.directive_name),
+        role_name = shell_quote(inputs.role_name),
+        tmux_locator = shell_quote(inputs.tmux_locator),
+        timeout_sec = inputs.timeout_sec,
+    )
+}
+
 async fn dispatch_tmux(
     state: AppState,
     decision_id: i64,
@@ -1176,131 +1536,48 @@ async fn dispatch_tmux(
     let issue_ref_text = format!("{}#{}", record.repo_full_name, issue_number);
     let tmux_locator = format!("{}:{}", dispatch_config.tmux.session, tmux_window);
 
-    let script = format!(
-        r#"#!/usr/bin/env bash
-set -euo pipefail
+    let script_inputs = TmuxRunScriptInputs {
+        dispatch_id,
+        db_path: &state.db_path,
+        lock_path: &lock_path,
+        run_dir: &run_dir,
+        prompt_path: &prompt_path,
+        summary_path: &summary_path,
+        completion_path: &completion_path,
+        last_message_path: &last_message_path,
+        codex_log_path: &codex_log_path,
+        marker_path: &marker_path,
+        issue_ref_text: &issue_ref_text,
+        forgejoctl_bin: &dispatch_config.forgejoctl_bin,
+        token_file: &role.token_file,
+        workdir: &role.workdir,
+        codex_bin: &role.codex_bin,
+        codex_role_arg: &role.codex_role_arg,
+        issue_session_id: issue_session_id.as_deref(),
+        directive_name,
+        role_name: &directive.role,
+        tmux_locator: &tmux_locator,
+        timeout_sec: directive.timeout_sec,
+    };
 
-DISPATCH_ID={dispatch_id}
-DB_PATH={db_path}
-LOCK_PATH={lock_path}
-RUN_DIR={run_dir}
-PROMPT_FILE={prompt_file}
-SUMMARY_FILE={summary_file}
-COMPLETION_FILE={completion_file}
-LAST_MESSAGE_FILE={last_message_file}
-CODEX_LOG_FILE={codex_log_file}
-MARKER_FILE={marker_file}
-ISSUE_REF={issue_ref}
-FORGEJOCTL_BIN={forgejoctl_bin}
-TOKEN_FILE={token_file}
-WORKDIR={workdir}
-CODEX_BIN={codex_bin}
-CODEX_ROLE_ARG={codex_role_arg}
-ISSUE_SESSION_ID={issue_session_id}
-DIRECTIVE={directive}
-ROLE_NAME={role_name}
-TMUX_LOCATOR={tmux_locator}
-TIMEOUT_SEC={timeout_sec}
-
-cleanup() {{
-  rm -f "$LOCK_PATH"
-}}
-trap cleanup EXIT
-
-touch "$MARKER_FILE"
-cd "$WORKDIR"
-: > "$CODEX_LOG_FILE"
-
-run_codex_fresh() {{
-  cat "$PROMPT_FILE" \
-    | timeout --preserve-status "$TIMEOUT_SEC" "$CODEX_BIN" "$CODEX_ROLE_ARG" --no-alt-screen exec --skip-git-repo-check -o "$LAST_MESSAGE_FILE" - \
-      2>&1 | tee -a "$CODEX_LOG_FILE"
-}}
-
-set +e
-if [[ -n "$ISSUE_SESSION_ID" ]]; then
-  cat "$PROMPT_FILE" \
-    | timeout --preserve-status "$TIMEOUT_SEC" "$CODEX_BIN" "$CODEX_ROLE_ARG" --no-alt-screen exec -o "$LAST_MESSAGE_FILE" resume --skip-git-repo-check "$ISSUE_SESSION_ID" - \
-      2>&1 | tee -a "$CODEX_LOG_FILE"
-  exit_code=$?
-  if [[ "$exit_code" -ne 0 && "$exit_code" -ne 124 ]]; then
-    echo "orchd: resume failed for issue session $ISSUE_SESSION_ID, falling back to fresh exec" | tee -a "$CODEX_LOG_FILE"
-    run_codex_fresh
-    exit_code=$?
-  fi
-else
-  run_codex_fresh
-  exit_code=$?
-fi
-set -e
-
-session_id="$(sed -n 's/^session id: //p' "$CODEX_LOG_FILE" | tail -n 1)"
-if [[ -z "$session_id" ]]; then
-  session_id="$(find "$HOME/.codex/sessions" -type f -name '*.jsonl' -newer "$MARKER_FILE" 2>/dev/null | sort | tail -n 1 | sed -n 's#.*-\([0-9a-fA-F-]\{{36\}}\)\.jsonl#\1#p')"
-fi
-
-if [[ -s "$LAST_MESSAGE_FILE" ]]; then
-  head -n 120 "$LAST_MESSAGE_FILE" > "$SUMMARY_FILE"
-else
-  echo "(no final assistant message)" > "$SUMMARY_FILE"
-fi
-
-if [[ "$exit_code" -eq 0 ]]; then
-  status="completed"
-  reason_code="completed"
-elif [[ "$exit_code" -eq 124 ]]; then
-  status="timed_out"
-  reason_code="timeout"
-else
-  status="failed_runtime"
-  reason_code="codex_exit_nonzero"
-fi
-
-if [[ -n "$session_id" ]]; then
-  session_sql="'${{session_id//\'/\'\'}}'"
-else
-  session_sql="NULL"
-fi
-ended_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-sqlite3 "$DB_PATH" "UPDATE dispatches SET status='$status', reason_code='$reason_code', codex_session_id=$session_sql, exit_code=$exit_code, ended_at='$ended_at' WHERE id=$DISPATCH_ID;"
-
-{{
-  echo "orchd: dispatch completed id=$DISPATCH_ID status=$status reason=$reason_code"
-  echo "directive=$DIRECTIVE role=$ROLE_NAME"
-  echo "tmux=$TMUX_LOCATOR"
-  echo "codex_session_id=${{session_id:-unknown}}"
-  echo "run_dir=$RUN_DIR"
-  echo "log=$CODEX_LOG_FILE"
-  echo
-  echo '```markdown'
-  cat "$SUMMARY_FILE"
-  echo '```'
-}} > "$COMPLETION_FILE"
-
-"$FORGEJOCTL_BIN" --token-file "$TOKEN_FILE" issue comment "$ISSUE_REF" --body-file "$COMPLETION_FILE" || true
-"#,
-        dispatch_id = dispatch_id,
-        db_path = shell_quote(&state.db_path.to_string_lossy()),
-        lock_path = shell_quote(&lock_path.to_string_lossy()),
-        run_dir = shell_quote(&run_dir.to_string_lossy()),
-        prompt_file = shell_quote(&prompt_path.to_string_lossy()),
-        summary_file = shell_quote(&summary_path.to_string_lossy()),
-        completion_file = shell_quote(&completion_path.to_string_lossy()),
-        last_message_file = shell_quote(&last_message_path.to_string_lossy()),
-        codex_log_file = shell_quote(&codex_log_path.to_string_lossy()),
-        marker_file = shell_quote(&marker_path.to_string_lossy()),
-        issue_ref = shell_quote(&issue_ref_text),
-        forgejoctl_bin = shell_quote(&dispatch_config.forgejoctl_bin.to_string_lossy()),
-        token_file = shell_quote(&role.token_file.to_string_lossy()),
-        workdir = shell_quote(&role.workdir.to_string_lossy()),
-        codex_bin = shell_quote(&role.codex_bin.to_string_lossy()),
-        codex_role_arg = shell_quote(&role.codex_role_arg),
-        issue_session_id = shell_quote(issue_session_id.as_deref().unwrap_or("")),
-        directive = shell_quote(directive_name),
-        role_name = shell_quote(&directive.role),
-        tmux_locator = shell_quote(&tmux_locator),
-        timeout_sec = directive.timeout_sec,
-    );
+    let script = match state.dispatch_mode {
+        DispatchMode::TmuxExec => build_tmux_exec_run_script(&script_inputs),
+        DispatchMode::TmuxTui => {
+            let bootstrap_prompt_path = run_dir.join("bootstrap_prompt.md");
+            let bootstrap_prompt = format!(
+                "You are codex-orch running under orchd dispatch.\n\nBefore taking any action, read and follow the full task instructions in this file:\n{}\n\nTreat that file as canonical for this dispatch.",
+                prompt_path.display()
+            );
+            fs::write(&bootstrap_prompt_path, bootstrap_prompt).map_err(|err| {
+                DispatchError::Io(format!("failed writing bootstrap prompt: {err}"))
+            })?;
+            let session_jsonl_path = run_dir.join("session.jsonl.path");
+            build_tmux_tui_run_script(&script_inputs, &bootstrap_prompt_path, &session_jsonl_path)
+        }
+        DispatchMode::DryRun => {
+            return Err(DispatchError::ConfigNotLoaded);
+        }
+    };
 
     fs::write(&script_path, script)
         .map_err(|err| DispatchError::Io(format!("failed writing run script: {err}")))?;

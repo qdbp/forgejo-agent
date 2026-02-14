@@ -5,7 +5,8 @@
 Current implementation supports two dispatch modes:
 
 - `dry-run`: parse directives, persist decisions, comment intent only.
-- `tmux-exec`: create a dispatch record and spawn a Codex run inside tmux.
+- `tmux-tui` (default): create a dispatch record and spawn interactive Codex TUI inside tmux.
+- `tmux-exec`: create a dispatch record and run Codex non-interactively.
 
 Core behavior:
 
@@ -23,6 +24,18 @@ Dispatch behavior is configured in `config/orchd-dispatch.toml`:
 - tmux session naming and remain-on-exit policy
 
 ## Run
+
+`tmux-tui` mode (default):
+
+```bash
+cargo run --bin orchd -- \
+  --listen 127.0.0.1:7878 \
+  --db-path ~/.local/state/orchd-dev/orchd.sqlite \
+  --reconcile-repo main/orchd-debug \
+  --heartbeat-sec 15 \
+  --reconcile-sec 45 \
+  --dispatch-config /home/main/forgejo-agent/config/orchd-dispatch.toml
+```
 
 `tmux-exec` mode:
 
@@ -119,9 +132,10 @@ curl -fsS -X POST http://127.0.0.1:7878/webhook \
   --data "$body" | jq .
 ```
 
-Expected in `tmux-exec` mode:
+Expected in `tmux-tui` mode:
 
 - response: `decision=accepted`, `reason_code=explicit_directive`
 - issue comment: `orchd: dispatch started ...`
 - sqlite `dispatches` row with `status=running` then terminal status
 - tmux window `r<repo_slug>-i<issue_number>` created (or respawned) under the configured session
+- completion in sqlite/comment is keyed off a `final_answer` message found in session JSONL when present

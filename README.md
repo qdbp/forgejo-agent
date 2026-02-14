@@ -105,7 +105,8 @@ EOF
 Current mode supports both:
 
 - `dry-run`: parse directives and post intent comments only
-- `tmux-exec`: create a tracked dispatch run and spawn Codex in issue-scoped tmux windows
+- `tmux-tui` (default): spawn interactive Codex TUI in issue-scoped tmux windows
+- `tmux-exec`: non-interactive dispatch for fully automated runs
 
 Core behavior:
 
@@ -113,12 +114,24 @@ Core behavior:
 - directive parse (`@codex-orch design|impl|poke`, `@codex poke`)
 - sqlite event/decision/dispatch persistence
 - one active dispatch per issue (duplicates blocked while running)
-- issue-scoped codex session reuse (`exec resume`) from latest `codex_session_id`
+- issue-scoped codex session reuse (`resume` in `tmux-tui`, `exec resume` in `tmux-exec`) from latest `codex_session_id`
 - periodic heartbeat + reconcile scan logs
 
 Role launch wrapper:
 
 - `orchd` dispatches Codex through the repo-managed wrapper `bin/codex-role` (configured in `config/orchd-dispatch.toml`), not by clobbering `/usr/bin/codex`.
+
+Run (`tmux-tui`, default):
+
+```bash
+cargo run --bin orchd -- \
+  --listen 127.0.0.1:7878 \
+  --db-path ~/.local/state/orchd-dev/orchd.sqlite \
+  --reconcile-repo main/orchd-debug \
+  --heartbeat-sec 15 \
+  --reconcile-sec 45 \
+  --dispatch-config /home/main/forgejo-agent/config/orchd-dispatch.toml
+```
 
 Run (`tmux-exec`):
 
