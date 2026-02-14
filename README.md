@@ -153,6 +153,19 @@ For Rust changes in this repo, run:
 python3 /home/main/forgejo-agent/scripts/check.py
 ```
 
+## Git Hooks
+
+Install repo-managed hooks:
+
+```bash
+/home/main/forgejo-agent/scripts/install-git-hooks.sh
+```
+
+Installed hooks:
+
+- `pre-commit`: runs `scripts/check.py`
+- `pre-push`: runs `scripts/check.py`
+
 `check.py` includes a skill/API sync enforcement hook:
 
 - verifies `forgejoctl` CLI surface snapshot/hash
