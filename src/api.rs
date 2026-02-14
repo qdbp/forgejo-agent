@@ -307,6 +307,20 @@ impl ForgejoClient {
         self.send_json(cfg, &Method::POST, &path, Some(&payload))
     }
 
+    pub fn replace_issue_label_ids(
+        &self,
+        cfg: &AgentConfig,
+        issue: &IssueRef,
+        label_ids: Vec<u64>,
+    ) -> Result<Vec<ApiLabel>> {
+        let path = format!(
+            "/api/v1/repos/{}/{}/issues/{}/labels",
+            issue.repo.owner, issue.repo.repo, issue.number
+        );
+        let payload = AddLabelIdsBody { labels: label_ids };
+        self.send_json(cfg, &Method::PUT, &path, Some(&payload))
+    }
+
     pub fn remove_issue_label(
         &self,
         cfg: &AgentConfig,

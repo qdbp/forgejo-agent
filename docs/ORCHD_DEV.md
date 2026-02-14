@@ -135,11 +135,12 @@ curl -fsS -X POST http://127.0.0.1:7878/webhook \
 Expected in `tmux-tui` mode:
 
 - response: `decision=accepted`, `reason_code=explicit_directive`
-- issue comment: `orchd: dispatch started ...`
+- issue runtime labels: `orchd/state/queued` then `orchd/state/running`
 - sqlite `dispatches` row with `status=running` then terminal status
 - tmux window `r<repo_slug>-i<issue_number>` created (or respawned) under the configured session
 - tmux-tui run watcher monitors session JSONL and sends `Ctrl-C` after first `final_answer` to close the turn promptly
 - auto-reap is skipped while the window is held (`@orchd_hold=1`) or actively focused in an attached tmux client
+- completion status is projected to `orchd/state/completed` on success or `orchd/state/failed` otherwise
 - completion in sqlite/comment is keyed off a `final_answer` message found in session JSONL when present
 - stale in-flight rows are lazily healed on the next launch attempt (status set to `failed_runtime`, reason `stale_dispatch_autohealed`) when tmux no longer has a live pane for that issue
 - repo lockfiles under `locks/` are metadata only; dispatch gating is driven by sqlite `dispatches` state

@@ -18,8 +18,8 @@ use clap::{Args, Parser, Subcommand};
 
 use api::ForgejoClient;
 use config::AgentConfig;
-use policy::{OTHER_LABELS, STATE_LABEL_COLOR};
-use types::{ApiIssue, IssueRef, ListState, OpenState, RepoRef, WorkflowState};
+use policy::{ORCHD_CONTROL_LABELS, ORCHD_STATE_LABELS, OTHER_LABELS, STATE_LABEL_COLOR};
+use types::{ApiIssue, IssueRef, ListState, OpenState, OrchdRuntimeState, RepoRef, WorkflowState};
 
 #[derive(Parser, Debug)]
 #[command(name = "forgejo-agent")]
@@ -70,6 +70,7 @@ enum IssueCommand {
     Create(IssueCreateArgs),
     Edit(IssueEditArgs),
     Comment(IssueCommentArgs),
+    OrchdState(IssueOrchdStateArgs),
     Transition(IssueTransitionArgs),
     Claim(IssueClaimArgs),
     Release(IssueReleaseArgs),
@@ -150,6 +151,13 @@ struct IssueTransitionArgs {
     to: WorkflowState,
     #[arg(long)]
     force: bool,
+}
+
+#[derive(Args, Debug)]
+struct IssueOrchdStateArgs {
+    issue: IssueRef,
+    #[arg(long)]
+    to: OrchdRuntimeState,
 }
 
 #[derive(Args, Debug)]
@@ -253,6 +261,7 @@ fn run() -> Result<()> {
             IssueCommand::Create(args) => cmd_issue_create(&api, &cfg, args)?,
             IssueCommand::Edit(args) => cmd_issue_edit(&api, &cfg, args)?,
             IssueCommand::Comment(args) => cmd_issue_comment(&api, &cfg, args)?,
+            IssueCommand::OrchdState(args) => cmd_issue_orchd_state(&api, &cfg, args)?,
             IssueCommand::Transition(args) => cmd_issue_transition(&api, &cfg, args)?,
             IssueCommand::Claim(args) => cmd_issue_claim(&api, &cfg, args)?,
             IssueCommand::Release(args) => cmd_issue_release(&api, &cfg, args)?,
@@ -279,6 +288,12 @@ fn ensure_policy_labels(api: &ForgejoClient, cfg: &AgentConfig, repo: &RepoRef) 
     for (name, color, description, exclusive) in OTHER_LABELS {
         api.ensure_label(cfg, repo, name, color, description, exclusive)?;
     }
+    for (name, color, description, exclusive) in ORCHD_STATE_LABELS {
+        api.ensure_label(cfg, repo, name, color, description, exclusive)?;
+    }
+    for (name, color, description, exclusive) in ORCHD_CONTROL_LABELS {
+        api.ensure_label(cfg, repo, name, color, description, exclusive)?;
+    }
     Ok(())
 }
 
@@ -292,6 +307,10 @@ fn cmd_repo_ensure(api: &ForgejoClient, cfg: &AgentConfig, args: RepoEnsureArgs)
 
 fn is_workflow_label(name: &str) -> bool {
     WorkflowState::from_label(name).is_some()
+}
+
+fn is_orchd_state_label(name: &str) -> bool {
+    OrchdRuntimeState::from_label(name).is_some()
 }
 
 fn ensure_issue_state(
@@ -332,6 +351,59 @@ fn ensure_issue_state(
         api.add_issue_label_ids(cfg, issue_ref, vec![target_id])?;
     }
     Ok(())
+}
+
+fn orchd_state_label_meta(state: OrchdRuntimeState) -> (&'static str, &'static str, bool) {
+    ORCHD_STATE_LABELS
+        .iter()
+        .find_map(|(name, color, description, exclusive)| {
+            if *name == state.label() {
+                Some((*color, *description, *exclusive))
+            } else {
+                None
+            }
+        })
+        .unwrap_or(("5319e7", "orchd runtime state", true))
+}
+
+fn set_issue_orchd_state(
+    api: &ForgejoClient,
+    cfg: &AgentConfig,
+    issue_ref: &IssueRef,
+    target: OrchdRuntimeState,
+) -> Result<Option<OrchdRuntimeState>> {
+    ensure_policy_labels(api, cfg, &issue_ref.repo)?;
+    let issue = api.get_issue(cfg, issue_ref)?;
+
+    let previous = issue
+        .labels
+        .iter()
+        .find_map(|label| OrchdRuntimeState::from_label(&label.name));
+
+    let (color, description, exclusive) = orchd_state_label_meta(target);
+    let target_id = api
+        .ensure_label(
+            cfg,
+            &issue_ref.repo,
+            target.label(),
+            color,
+            description,
+            exclusive,
+        )?
+        .id;
+
+    let mut replacement_ids = issue
+        .labels
+        .iter()
+        .filter(|label| !is_orchd_state_label(&label.name))
+        .map(|label| label.id)
+        .collect::<Vec<_>>();
+    replacement_ids.push(target_id);
+    replacement_ids.sort_unstable();
+    replacement_ids.dedup();
+
+    api.replace_issue_label_ids(cfg, issue_ref, replacement_ids)?;
+    Ok(previous)
 }
 
 fn ensure_labels_exist(
@@ -583,6 +655,19 @@ fn cmd_issue_comment(api: &ForgejoClient, cfg: &AgentConfig, args: IssueCommentA
     let body = issue_body_from_args(args.body, args.body_file, args.body_stdin, true)?;
     api.comment_issue(cfg, &args.issue, &body)?;
     println!("commented: {}", args.issue);
+    Ok(())
+}
+
+fn cmd_issue_orchd_state(
+    api: &ForgejoClient,
+    cfg: &AgentConfig,
+    args: IssueOrchdStateArgs,
+) -> Result<()> {
+    let from = set_issue_orchd_state(api, cfg, &args.issue, args.to)?;
+    let from = from
+        .map(|state| state.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    println!("orchd-state: {} {} -> {}", args.issue, from, args.to);
     Ok(())
 }
 

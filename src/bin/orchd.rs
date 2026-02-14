@@ -34,7 +34,7 @@ use sha2::{Digest, Sha256};
 
 use api::ForgejoClient;
 use config::AgentConfig;
-use types::{ApiIssue, IssueRef, RepoRef};
+use types::{ApiIssue, IssueRef, OrchdRuntimeState, RepoRef};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -218,11 +218,19 @@ impl DispatchError {
     }
 }
 
-#[derive(Debug)]
-struct DispatchLaunch {
-    dispatch_id: i64,
-    tmux_locator: String,
-    run_dir: PathBuf,
+const fn runtime_state_for_dispatch_error(error: &DispatchError) -> OrchdRuntimeState {
+    match error {
+        DispatchError::IssueDispatchInFlight { .. } => OrchdRuntimeState::Running,
+        DispatchError::ActorNotAllowed(_)
+        | DispatchError::DirectiveNotConfigured(_)
+        | DispatchError::RoleNotConfigured(_)
+        | DispatchError::InvalidIssueRef(_) => OrchdRuntimeState::Blocked,
+        DispatchError::ConfigNotLoaded
+        | DispatchError::Io(_)
+        | DispatchError::Tmux(_)
+        | DispatchError::IssueFetch(_)
+        | DispatchError::Db(_) => OrchdRuntimeState::Failed,
+    }
 }
 
 enum DispatchReservation {
@@ -552,10 +560,24 @@ async fn process_webhook(
     let decision = decide(&event_type, context.as_ref());
     let decision_id = insert_decision(&state.db_path, event_id, &record, &decision)?;
 
-    let mut comment_posted = false;
-    let mut comment_error: Option<String> = None;
+    let mut status_projected = false;
+    let mut status_error: Option<String> = None;
     if decision.decision == "accepted" {
         if let Some(issue_number) = record.issue_number {
+            let dispatch_identity = dispatch_comment_identity(state, &decision);
+            if let Err(err) = project_issue_runtime_state(
+                state.clone(),
+                &record.repo_full_name,
+                issue_number,
+                OrchdRuntimeState::Queued,
+                dispatch_identity.clone(),
+            )
+            .await
+            {
+                status_error = Some(err.to_string());
+            } else {
+                status_projected = true;
+            }
             match state.dispatch_mode {
                 DispatchMode::DryRun => {
                     if state.comment_echo {
@@ -574,103 +596,67 @@ async fn process_webhook(
                         )
                         .await
                         {
-                            Ok(()) => {
-                                comment_posted = true;
-                            }
+                            Ok(()) => {}
                             Err(err) => {
-                                comment_error = Some(err.to_string());
+                                if status_error.is_none() {
+                                    status_error = Some(err.to_string());
+                                }
                             }
                         }
                     }
                 }
                 DispatchMode::TmuxExec | DispatchMode::TmuxTui => {
-                    let comment_identity = dispatch_comment_identity(state, &decision);
                     match dispatch_tmux(state.clone(), decision_id, &record, &decision).await {
-                        Ok(launch) => {
-                            if state.comment_echo {
-                                let comment_body = format!(
-                                    "orchd: dispatch started id={} directive={} role={} tmux={} run_dir={} delivery={}",
-                                    launch.dispatch_id,
-                                    decision.directive.as_deref().unwrap_or("-"),
-                                    decision.target_role.as_deref().unwrap_or("-"),
-                                    launch.tmux_locator,
-                                    launch.run_dir.to_string_lossy(),
-                                    record.delivery_id,
-                                );
-                                let post_result = if let Some(identity) = comment_identity.clone() {
-                                    post_issue_comment_as_role(
-                                        &record.repo_full_name,
-                                        issue_number,
-                                        comment_body,
-                                        identity,
-                                    )
-                                    .await
-                                } else {
-                                    post_issue_comment(
-                                        state.clone(),
-                                        &record.repo_full_name,
-                                        issue_number,
-                                        comment_body,
-                                    )
-                                    .await
-                                };
-                                match post_result {
-                                    Ok(()) => {
-                                        comment_posted = true;
-                                    }
-                                    Err(err) => {
-                                        comment_error = Some(err.to_string());
-                                    }
+                        Ok(()) => {
+                            if let Err(err) = project_issue_runtime_state(
+                                state.clone(),
+                                &record.repo_full_name,
+                                issue_number,
+                                OrchdRuntimeState::Running,
+                                dispatch_identity.clone(),
+                            )
+                            .await
+                            {
+                                if status_error.is_none() {
+                                    status_error = Some(err.to_string());
                                 }
+                            } else {
+                                status_projected = true;
                             }
                         }
                         Err(err) => {
-                            let reason = err.reason_code();
-                            let msg = err.to_string();
-                            if state.comment_echo {
-                                let comment_body = format!(
-                                    "orchd: dispatch blocked reason={} error={} delivery={}",
-                                    reason, msg, record.delivery_id
-                                );
-                                let post_result = if let Some(identity) = comment_identity.clone() {
-                                    post_issue_comment_as_role(
-                                        &record.repo_full_name,
-                                        issue_number,
-                                        comment_body,
-                                        identity,
-                                    )
-                                    .await
-                                } else {
-                                    post_issue_comment(
-                                        state.clone(),
-                                        &record.repo_full_name,
-                                        issue_number,
-                                        comment_body,
-                                    )
-                                    .await
-                                };
-                                match post_result {
-                                    Ok(()) => {
-                                        comment_posted = true;
-                                    }
-                                    Err(post_err) => {
-                                        comment_error = Some(post_err.to_string());
+                            let projection = project_issue_runtime_state(
+                                state.clone(),
+                                &record.repo_full_name,
+                                issue_number,
+                                runtime_state_for_dispatch_error(&err),
+                                dispatch_identity.clone(),
+                            )
+                            .await;
+                            match projection {
+                                Ok(()) => {
+                                    status_projected = true;
+                                }
+                                Err(projection_err) => {
+                                    if status_error.is_none() {
+                                        status_error = Some(projection_err.to_string());
                                     }
                                 }
                             }
-                            if comment_error.is_none() {
-                                comment_error = Some(format!("dispatch {reason}: {msg}"));
+                            if status_error.is_none() {
+                                status_error =
+                                    Some(format!("dispatch {}: {}", err.reason_code(), err));
                             }
                         }
                     }
                 }
             }
         } else {
-            comment_error = Some("missing issue number".to_string());
+            status_error = Some("missing issue number".to_string());
         }
     }
 
-    update_decision_comment_status(&state.db_path, decision_id, comment_posted, comment_error)?;
+    update_decision_comment_status(&state.db_path, decision_id, status_projected, status_error)?;
 
     log_line(
         "decision",
@@ -684,7 +670,7 @@ async fn process_webhook(
             "reason_code": decision.reason_code,
             "directive": decision.directive,
             "target_role": decision.target_role,
-            "comment_posted": comment_posted,
+            "status_projected": status_projected,
         }),
     );
 
@@ -718,54 +704,142 @@ async fn post_issue_comment(
     Ok(())
 }
 
-async fn post_issue_comment_as_role(
+const fn orchd_runtime_label_meta(state: OrchdRuntimeState) -> (&'static str, &'static str, bool) {
+    match state {
+        OrchdRuntimeState::Queued => ("d4c5f9", "dispatch accepted and queued", true),
+        OrchdRuntimeState::Running => ("1d76db", "dispatch currently running", true),
+        OrchdRuntimeState::Blocked => (
+            "d73a4a",
+            "dispatch blocked on a dependency or operator decision",
+            true,
+        ),
+        OrchdRuntimeState::Failed => ("b60205", "dispatch failed", true),
+        OrchdRuntimeState::Completed => ("0e8a16", "dispatch completed successfully", true),
+    }
+}
+
+fn is_orchd_state_label(label: &str) -> bool {
+    OrchdRuntimeState::from_label(label).is_some()
+}
+
+async fn project_issue_runtime_state(
+    state: AppState,
     repo_full_name: &str,
     issue_number: u64,
-    body: String,
+    runtime_state: OrchdRuntimeState,
+    identity: Option<CommentIdentity>,
+) -> Result<()> {
+    if let Some(identity) = identity {
+        match project_issue_runtime_state_as_role(
+            repo_full_name,
+            issue_number,
+            runtime_state,
+            identity,
+        )
+        .await
+        {
+            Ok(()) => {
+                return Ok(());
+            }
+            Err(role_err) => {
+                log_line(
+                    "runtime_state_projection_role_fallback",
+                    json!({
+                        "repo": repo_full_name,
+                        "issue_number": issue_number,
+                        "runtime_state": runtime_state.as_str(),
+                        "error": role_err.to_string(),
+                    }),
+                );
+            }
+        }
+    }
+    project_issue_runtime_state_with_api(state, repo_full_name, issue_number, runtime_state).await
+}
+
+async fn project_issue_runtime_state_as_role(
+    repo_full_name: &str,
+    issue_number: u64,
+    runtime_state: OrchdRuntimeState,
     identity: CommentIdentity,
 ) -> Result<()> {
     let issue_ref = format!("{repo_full_name}#{issue_number}");
+    let runtime_state_name = runtime_state.as_str().to_string();
     tokio::task::spawn_blocking(move || -> Result<()> {
-        let mut child = Command::new(&identity.forgejoctl_bin)
+        let output = Command::new(&identity.forgejoctl_bin)
             .args([
                 "--token-file",
                 &identity.token_file.to_string_lossy(),
                 "issue",
-                "comment",
+                "orchd-state",
                 &issue_ref,
-                "--body-stdin",
+                "--to",
+                &runtime_state_name,
             ])
-            .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
-            .spawn()
+            .output()
             .with_context(|| {
                 format!(
-                    "failed to spawn forgejoctl comment command: {}",
+                    "failed to spawn forgejoctl orchd-state command: {}",
                     identity.forgejoctl_bin.display()
                 )
             })?;
-
-        if let Some(stdin) = child.stdin.as_mut() {
-            stdin
-                .write_all(body.as_bytes())
-                .context("failed writing comment body to forgejoctl stdin")?;
-        }
-
-        let output = child
-            .wait_with_output()
-            .context("failed waiting on forgejoctl comment command")?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(anyhow!(
-                "forgejoctl comment failed for {issue_ref}: {}",
+                "forgejoctl orchd-state failed for {issue_ref}: {}",
                 stderr.trim()
             ));
         }
         Ok(())
     })
     .await
-    .context("comment task join failure")??;
+    .context("runtime state task join failure")??;
+    Ok(())
+}
+
+async fn project_issue_runtime_state_with_api(
+    state: AppState,
+    repo_full_name: &str,
+    issue_number: u64,
+    runtime_state: OrchdRuntimeState,
+) -> Result<()> {
+    let repo_full_name = repo_full_name.to_string();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let api = ForgejoClient::new(&state.cfg)?;
+        let repo = RepoRef::parse(&repo_full_name)?;
+        let issue = IssueRef {
+            repo,
+            number: issue_number,
+        };
+        let existing = api.get_issue(&state.cfg, &issue)?;
+        let (color, description, exclusive) = orchd_runtime_label_meta(runtime_state);
+        let target_id = api
+            .ensure_label(
+                &state.cfg,
+                &issue.repo,
+                runtime_state.label(),
+                color,
+                description,
+                exclusive,
+            )?
+            .id;
+
+        let mut replacement_ids = existing
+            .labels
+            .iter()
+            .filter(|label| !is_orchd_state_label(&label.name))
+            .map(|label| label.id)
+            .collect::<Vec<_>>();
+        replacement_ids.push(target_id);
+        replacement_ids.sort_unstable();
+        replacement_ids.dedup();
+        let _ = api.replace_issue_label_ids(&state.cfg, &issue, replacement_ids)?;
+        Ok(())
+    })
+    .await
+    .context("runtime state api task join failure")??;
     Ok(())
 }
 
@@ -1264,6 +1338,12 @@ else
   reason_code="codex_exit_nonzero"
 fi
 
+if [[ "$status" == "completed" ]]; then
+  runtime_state="completed"
+else
+  runtime_state="failed"
+fi
+
 if [[ -n "$session_id" ]]; then
   session_sql="'${{session_id//\'/\'\'}}'"
 else
@@ -1271,6 +1351,7 @@ else
 fi
 ended_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 sqlite3 "$DB_PATH" "UPDATE dispatches SET status='$status', reason_code='$reason_code', codex_session_id=$session_sql, exit_code=$exit_code, ended_at='$ended_at' WHERE id=$DISPATCH_ID;"
+"$FORGEJOCTL_BIN" --token-file "$TOKEN_FILE" issue orchd-state "$ISSUE_REF" --to "$runtime_state" || true
 
 {{
   echo "orchd: dispatch completed id=$DISPATCH_ID status=$status reason=$reason_code"
@@ -1531,6 +1612,12 @@ else
   reason_code="codex_exit_nonzero"
 fi
 
+if [[ "$status" == "completed" ]]; then
+  runtime_state="completed"
+else
+  runtime_state="failed"
+fi
+
 if [[ -n "$session_id" ]]; then
   session_sql="'${{session_id//\'/\'\'}}'"
 else
@@ -1538,6 +1625,7 @@ else
 fi
 ended_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 sqlite3 "$DB_PATH" "UPDATE dispatches SET status='$status', reason_code='$reason_code', codex_session_id=$session_sql, exit_code=$exit_code, ended_at='$ended_at' WHERE id=$DISPATCH_ID;"
+"$FORGEJOCTL_BIN" --token-file "$TOKEN_FILE" issue orchd-state "$ISSUE_REF" --to "$runtime_state" || true
 
 {{
   echo "orchd: dispatch completed id=$DISPATCH_ID status=$status reason=$reason_code"
@@ -1596,7 +1684,7 @@ async fn dispatch_tmux(
     decision_id: i64,
     record: &EventRecord,
     decision: &DecisionRecord,
-) -> Result<DispatchLaunch, DispatchError> {
+) -> Result<(), DispatchError> {
     let dispatch_config = state
         .dispatch_config
         .as_ref()
@@ -1798,11 +1886,7 @@ async fn dispatch_tmux(
     )
     .map_err(|err| DispatchError::Db(err.to_string()))?;
 
-    Ok(DispatchLaunch {
-        dispatch_id,
-        tmux_locator,
-        run_dir,
-    })
+    Ok(())
 }
 
 fn verify_signature(secret: Option<&[u8]>, headers: &HeaderMap, body: &[u8]) -> Result<()> {

@@ -170,6 +170,71 @@ impl WorkflowState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OrchdRuntimeState {
+    Queued,
+    Running,
+    Blocked,
+    Failed,
+    Completed,
+}
+
+impl OrchdRuntimeState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Blocked => "blocked",
+            Self::Failed => "failed",
+            Self::Completed => "completed",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Queued => "orchd/state/queued",
+            Self::Running => "orchd/state/running",
+            Self::Blocked => "orchd/state/blocked",
+            Self::Failed => "orchd/state/failed",
+            Self::Completed => "orchd/state/completed",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "orchd/state/queued" => Some(Self::Queued),
+            "orchd/state/running" => Some(Self::Running),
+            "orchd/state/blocked" => Some(Self::Blocked),
+            "orchd/state/failed" => Some(Self::Failed),
+            "orchd/state/completed" => Some(Self::Completed),
+            _ => None,
+        }
+    }
+}
+
+impl Display for OrchdRuntimeState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for OrchdRuntimeState {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "queued" => Ok(Self::Queued),
+            "running" => Ok(Self::Running),
+            "blocked" => Ok(Self::Blocked),
+            "failed" => Ok(Self::Failed),
+            "completed" => Ok(Self::Completed),
+            _ => bail!(
+                "invalid orchd runtime state: {s} (expected queued|running|blocked|failed|completed)"
+            ),
+        }
+    }
+}
+
 impl Display for WorkflowState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
@@ -241,5 +306,31 @@ impl ApiIssue {
         self.labels
             .iter()
             .filter(|label| label.name.starts_with("claimed/"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OrchdRuntimeState;
+    use anyhow::Result;
+
+    #[test]
+    fn orchd_runtime_state_round_trip_label() {
+        for state in [
+            OrchdRuntimeState::Queued,
+            OrchdRuntimeState::Running,
+            OrchdRuntimeState::Blocked,
+            OrchdRuntimeState::Failed,
+            OrchdRuntimeState::Completed,
+        ] {
+            assert_eq!(OrchdRuntimeState::from_label(state.label()), Some(state));
+        }
+    }
+
+    #[test]
+    fn orchd_runtime_state_parses_known_values() -> Result<()> {
+        let parsed: OrchdRuntimeState = "running".parse()?;
+        assert_eq!(parsed, OrchdRuntimeState::Running);
+        Ok(())
     }
 }

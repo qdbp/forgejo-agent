@@ -28,6 +28,49 @@ pub const OTHER_LABELS: [(&str, &str, &str, bool); 4] = [
     ("pri/low", "c2e0c6", "low priority", false),
 ];
 
+pub const ORCHD_STATE_LABELS: [(&str, &str, &str, bool); 5] = [
+    (
+        "orchd/state/queued",
+        "d4c5f9",
+        "dispatch accepted and queued",
+        true,
+    ),
+    (
+        "orchd/state/running",
+        "1d76db",
+        "dispatch currently running",
+        true,
+    ),
+    (
+        "orchd/state/blocked",
+        "d73a4a",
+        "dispatch blocked on a dependency or operator decision",
+        true,
+    ),
+    ("orchd/state/failed", "b60205", "dispatch failed", true),
+    (
+        "orchd/state/completed",
+        "0e8a16",
+        "dispatch completed successfully",
+        true,
+    ),
+];
+
+pub const ORCHD_CONTROL_LABELS: [(&str, &str, &str, bool); 2] = [
+    (
+        "orchd/control/hold",
+        "5319e7",
+        "hold dispatch lifecycle progression",
+        false,
+    ),
+    (
+        "orchd/control/retry",
+        "fbca04",
+        "request dispatch retry",
+        false,
+    ),
+];
+
 pub const fn can_transition(from: Option<WorkflowState>, to: WorkflowState) -> bool {
     use WorkflowState as S;
     match from {

@@ -48,18 +48,19 @@ Options:
 Usage: forgejo-agent issue <COMMAND>
 
 Commands:
-  list        
-  show        
-  create      
-  edit        
-  comment     
-  transition  
-  claim       
-  release     
-  blocker     
-  close       
-  reopen      
-  help        Print this message or the help of the given subcommand(s)
+  list         
+  show         
+  create       
+  edit         
+  comment      
+  orchd-state  
+  transition   
+  claim        
+  release      
+  blocker      
+  close        
+  reopen       
+  help         Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
