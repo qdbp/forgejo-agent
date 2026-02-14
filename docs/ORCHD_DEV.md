@@ -140,3 +140,4 @@ Expected in `tmux-tui` mode:
 - tmux window `r<repo_slug>-i<issue_number>` created (or respawned) under the configured session
 - completion in sqlite/comment is keyed off a `final_answer` message found in session JSONL when present
 - stale in-flight rows are lazily healed on the next launch attempt (status set to `failed_runtime`, reason `stale_dispatch_autohealed`) when tmux no longer has a live pane for that issue
+- repo lockfiles under `locks/` are metadata only; dispatch gating is driven by sqlite `dispatches` state

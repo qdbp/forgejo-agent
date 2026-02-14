@@ -189,8 +189,6 @@ enum DispatchError {
         issue_number: u64,
         dispatch_id: i64,
     },
-    #[error("repo lock held at {0}")]
-    RepoLocked(PathBuf),
     #[error("invalid issue ref: {0}")]
     InvalidIssueRef(String),
     #[error("io failure: {0}")]
@@ -211,7 +209,6 @@ impl DispatchError {
             Self::DirectiveNotConfigured(_) => "directive_not_configured",
             Self::RoleNotConfigured(_) => "role_not_configured",
             Self::IssueDispatchInFlight { .. } => "issue_dispatch_in_flight",
-            Self::RepoLocked(_) => "repo_locked",
             Self::InvalidIssueRef(_) => "invalid_issue_ref",
             Self::Io(_) => "io_failure",
             Self::Tmux(_) => "tmux_failure",
@@ -1069,17 +1066,14 @@ fn acquire_repo_lock(db_path: &Path, repo_full_name: &str) -> Result<PathBuf, Di
     let lock_path = lock_root(db_path)?.join(format!("{slug}.lock"));
     let mut file = OpenOptions::new()
         .write(true)
-        .create_new(true)
+        .create(true)
+        .truncate(true)
         .open(&lock_path)
         .map_err(|err| {
-            if err.kind() == std::io::ErrorKind::AlreadyExists {
-                DispatchError::RepoLocked(lock_path.clone())
-            } else {
-                DispatchError::Io(format!(
-                    "failed to create lock {}: {err}",
-                    lock_path.display()
-                ))
-            }
+            DispatchError::Io(format!(
+                "failed to create lock {}: {err}",
+                lock_path.display()
+            ))
         })?;
     writeln!(file, "repo={repo_full_name}")
         .and_then(|()| writeln!(file, "created_at={}", Utc::now().to_rfc3339()))
