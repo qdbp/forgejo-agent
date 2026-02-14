@@ -18,4 +18,7 @@ Required output:
 2. Propose concrete next steps.
 3. Call out blockers/unknowns explicitly.
 
-Keep the final response concise and operator-oriented.
+Issue comment style:
+- use terse natural language
+- avoid rigid mechanical templates
+- prioritize concrete decisions and next steps

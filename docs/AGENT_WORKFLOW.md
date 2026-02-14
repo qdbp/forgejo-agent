@@ -3,10 +3,17 @@
 ## Core invariants
 
 - Every work issue must include target local repo path and acceptance checks.
-- If blocked, agent must open blocker issue and link it in parent comments.
+- If blocked, agent must transition the issue to `state/blocked` and post a terse natural-language unblock comment.
 - Agents must claim before editing, then release or close when done.
 - Branches and commits must reference issue ID.
 - Agents should mutate Forgejo state through `forgejoctl`.
+
+## Reply etiquette
+
+- All issue comments should be natural language, not rigid field dumps.
+- Be terse by default.
+- Include concrete facts: what changed, what is blocked, and what decision/action is needed.
+- Avoid filler and repetitive boilerplate.
 
 ## Canonical labels
 
@@ -35,13 +42,18 @@ Release:
 
 ## Blocker spawning
 
+Blocker issues are optional and should be used for long-lived or parallelizable dependencies.
+For short unblock questions to `main`/owner, prefer a single terse blocked comment on the same issue.
+
+Optional blocker creation:
+
 ```bash
 /home/main/.local/bin/forgejoctl issue blocker main/backlog#123 \
   --title "Need upstream API key" \
   --body "Missing credential X; cannot continue implementation."
 ```
 
-This creates a blocker, transitions parent to `state/blocked`, and comments cross-link.
+When used, this creates a blocker, transitions parent to `state/blocked`, and comments cross-link.
 
 ## Suggested issue body schema
 
@@ -57,7 +69,7 @@ Use one of these on its own line in an issue body/comment:
 Current semantics:
 
 - `design`: produce high-level design/spec response and drive state toward `spec`.
-- `impl`: execute implementation loop; claim, implement, verify, and transition toward `review` (or open blocker).
+- `impl`: execute implementation loop; claim, implement, verify, and transition toward `review` (optionally open blocker issue when warranted).
 
 ## Traceability
 

@@ -221,6 +221,7 @@ python3 /home/main/forgejo-agent/scripts/check.py
 - `docs/AGENT_WORKFLOW.md`
 - `docs/WORKER_LOOP.md`
 - `docs/ORCHD_DEV.md`
+- `docs/ORCHD_PROMPT_STATE_PLAN.md`
 - `docs/TMUX_OBSERVABILITY.md`
 - `docs/MCP_SETUP.md`
 - `docs/SECURITY.md`

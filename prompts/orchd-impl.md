@@ -15,3 +15,4 @@ Implementation mode:
 - execute the work end-to-end where possible
 - if blocked, state the exact blocker and why
 - include verification evidence in the final response
+- keep issue comments terse and natural-language (no rigid field templates)
