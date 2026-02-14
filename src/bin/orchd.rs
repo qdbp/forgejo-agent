@@ -1368,10 +1368,10 @@ bootstrap_prompt="$(cat "$BOOTSTRAP_PROMPT_FILE")"
 
 set +e
 if [[ -n "$ISSUE_SESSION_ID" ]]; then
-  timeout --preserve-status "$TIMEOUT_SEC" "$CODEX_BIN" "$CODEX_ROLE_ARG" resume "$ISSUE_SESSION_ID" "$bootstrap_prompt"
+  timeout --foreground --preserve-status "$TIMEOUT_SEC" "$CODEX_BIN" "$CODEX_ROLE_ARG" resume "$ISSUE_SESSION_ID" "$bootstrap_prompt"
   exit_code=$?
 else
-  timeout --preserve-status "$TIMEOUT_SEC" "$CODEX_BIN" "$CODEX_ROLE_ARG" --cd "$WORKDIR" "$bootstrap_prompt"
+  timeout --foreground --preserve-status "$TIMEOUT_SEC" "$CODEX_BIN" "$CODEX_ROLE_ARG" --cd "$WORKDIR" "$bootstrap_prompt"
   exit_code=$?
 fi
 set -e
