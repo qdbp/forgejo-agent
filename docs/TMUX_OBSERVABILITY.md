@@ -5,7 +5,7 @@ This is the operator view of dispatched Codex runs.
 ## Mental model
 
 - `orchd` uses one named tmux session (from `config/orchd-dispatch.toml`).
-- Windows are issue-scoped (`i<issue_number>`), not dispatch-scoped.
+- Windows are issue-scoped (`r<repo_slug>-i<issue_number>`), not dispatch-scoped.
 - New dispatches for the same issue respawn that issue window.
 - Dispatch metadata lives in sqlite (`dispatches` table), while the terminal view
   lives in tmux.

@@ -870,6 +870,28 @@ fn render_prompt(template: &str, values: &[(&str, String)]) -> String {
     text
 }
 
+fn tmux_repo_slug(repo_full_name: &str) -> String {
+    let mut slug = String::with_capacity(repo_full_name.len());
+    let mut last_dash = false;
+    for ch in repo_full_name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            last_dash = false;
+        } else if !last_dash {
+            slug.push('-');
+            last_dash = true;
+        }
+    }
+    let trimmed = slug.trim_matches('-');
+    let normalized = if trimmed.is_empty() { "repo" } else { trimmed };
+    normalized.chars().take(24).collect()
+}
+
+fn issue_tmux_window_name(repo_full_name: &str, issue_number: u64) -> String {
+    let repo_slug = tmux_repo_slug(repo_full_name);
+    format!("r{repo_slug}-i{issue_number}")
+}
+
 async fn fetch_issue(state: AppState, issue: IssueRef) -> Result<ApiIssue, DispatchError> {
     tokio::task::spawn_blocking(move || {
         let api = ForgejoClient::new(&state.cfg)
@@ -1112,7 +1134,7 @@ async fn dispatch_tmux(
     )
     .map_err(|err| DispatchError::Db(err.to_string()))?;
 
-    let tmux_window = format!("i{issue_number}");
+    let tmux_window = issue_tmux_window_name(&record.repo_full_name, issue_number);
     let run_dir = run_root(&state.db_path)?.join(format!("dispatch-{dispatch_id}"));
     fs::create_dir_all(&run_dir)
         .map_err(|err| DispatchError::Io(format!("failed to create run dir: {err}")))?;

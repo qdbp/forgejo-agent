@@ -124,4 +124,4 @@ Expected in `tmux-exec` mode:
 - response: `decision=accepted`, `reason_code=explicit_directive`
 - issue comment: `orchd: dispatch started ...`
 - sqlite `dispatches` row with `status=running` then terminal status
-- tmux window `i<issue_number>` created (or respawned) under the configured session
+- tmux window `r<repo_slug>-i<issue_number>` created (or respawned) under the configured session
