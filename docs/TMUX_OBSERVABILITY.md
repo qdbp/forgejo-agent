@@ -41,6 +41,9 @@ Attach read-only (safe observer mode):
 tmux attach -r -t codex-orch
 ```
 
+Expected behavior: dispatched Codex output streams live in the pane and is also
+written to `dispatch-<id>/codex.log`.
+
 ## Inspect finished runs
 
 If `remain_on_exit` is enabled, exited windows stay visible. For any dispatch:
@@ -66,6 +69,14 @@ sqlite3 ~/.local/state/orchd-dev/orchd.sqlite \
 tmux list-panes -t codex-orch -F '#{session_name}:#{window_name} #{pane_id}'
 tmux capture-pane -pt codex-orch:0 | tail -n 120
 ```
+
+## Troubleshooting
+
+Black pane until exit:
+
+- Cause: older `orchd` generated run scripts that redirected all output to file.
+- Fix: restart `orchd` on the latest build, then dispatch again.
+- Verify: new `dispatch-<id>/run.sh` contains `| tee "$CODEX_LOG_FILE"`.
 
 ## Session lifecycle patterns
 

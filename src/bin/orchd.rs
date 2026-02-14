@@ -1134,7 +1134,7 @@ touch "$MARKER_FILE"
 set +e
 cat "$PROMPT_FILE" \
   | timeout --preserve-status "$TIMEOUT_SEC" "$CODEX_BIN" "$CODEX_ROLE_ARG" --no-alt-screen exec --skip-git-repo-check --cd "$WORKDIR" -o "$LAST_MESSAGE_FILE" - \
-    >"$CODEX_LOG_FILE" 2>&1
+    2>&1 | tee "$CODEX_LOG_FILE"
 exit_code=$?
 set -e
 
