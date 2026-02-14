@@ -21,6 +21,7 @@ Dispatch behavior is configured in `config/orchd-dispatch.toml`:
 - actor allowlist (`allowed_actors`)
 - directive -> role mapping
 - role -> codex binary / token file / workdir mapping
+- prompt envelopes (`prompt_envelopes.fresh_envelope_file`, `prompt_envelopes.followup_envelope_file`)
 - tmux session naming and remain-on-exit policy
 
 ## Run
@@ -142,6 +143,7 @@ Expected in `tmux-tui` mode:
 - auto-reap is skipped while the window is held (`@orchd_hold=1`) or actively focused in an attached tmux client
 - completion status is projected to `orchd/state/completed` on success or `orchd/state/failed` otherwise
 - completion in sqlite/comment is keyed off a `final_answer` message found in session JSONL when present
+- generated run artifacts include `prompt.md` and `prompt_mode.txt` (`fresh` or `followup`)
 - stale in-flight rows are lazily healed on the next launch attempt (status set to `failed_runtime`, reason `stale_dispatch_autohealed`) when tmux no longer has a live pane for that issue
 - repo lockfiles under `locks/` are metadata only; dispatch gating is driven by sqlite `dispatches` state
 

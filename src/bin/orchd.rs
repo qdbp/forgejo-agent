@@ -87,6 +87,7 @@ impl DispatchMode {
 struct DispatchConfig {
     allowed_actors: Vec<String>,
     tmux: DispatchTmuxConfig,
+    prompt_envelopes: DispatchPromptEnvelopeConfig,
     roles: HashMap<String, DispatchRoleConfig>,
     directives: HashMap<String, DispatchDirectiveConfig>,
     forgejoctl_bin: PathBuf,
@@ -96,6 +97,12 @@ struct DispatchConfig {
 struct DispatchTmuxConfig {
     session: String,
     remain_on_exit: bool,
+}
+
+#[derive(Clone, Debug)]
+struct DispatchPromptEnvelopeConfig {
+    fresh_envelope_file: PathBuf,
+    followup_envelope_file: PathBuf,
 }
 
 #[derive(Clone, Debug)]
@@ -120,6 +127,8 @@ struct DispatchConfigFile {
     #[serde(default)]
     allowed_actors: Vec<String>,
     tmux: DispatchTmuxConfigFile,
+    #[serde(default)]
+    prompt_envelopes: DispatchPromptEnvelopeConfigFile,
     roles: HashMap<String, DispatchRoleConfigFile>,
     directives: HashMap<String, DispatchDirectiveConfigFile>,
     #[serde(default = "default_forgejoctl_bin")]
@@ -132,6 +141,15 @@ struct DispatchTmuxConfigFile {
     session: String,
     #[serde(default = "default_tmux_remain_on_exit")]
     remain_on_exit: bool,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct DispatchPromptEnvelopeConfigFile {
+    #[serde(default = "default_fresh_envelope_file")]
+    fresh_envelope_file: String,
+    #[serde(default = "default_followup_envelope_file")]
+    followup_envelope_file: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -163,6 +181,14 @@ fn default_codex_bin() -> String {
 
 fn default_forgejoctl_bin() -> String {
     "/home/main/.local/bin/forgejoctl".to_string()
+}
+
+fn default_fresh_envelope_file() -> String {
+    "../prompts/orchd-envelope-fresh.md".to_string()
+}
+
+fn default_followup_envelope_file() -> String {
+    "../prompts/orchd-envelope-followup.md".to_string()
 }
 
 const fn default_timeout_sec() -> u64 {
@@ -1032,6 +1058,16 @@ fn load_dispatch_config(path: &Path) -> Result<DispatchConfig> {
             session: raw.tmux.session,
             remain_on_exit: raw.tmux.remain_on_exit,
         },
+        prompt_envelopes: DispatchPromptEnvelopeConfig {
+            fresh_envelope_file: resolve_config_path(
+                &base_dir,
+                &raw.prompt_envelopes.fresh_envelope_file,
+            )?,
+            followup_envelope_file: resolve_config_path(
+                &base_dir,
+                &raw.prompt_envelopes.followup_envelope_file,
+            )?,
+        },
         roles,
         directives,
         forgejoctl_bin: resolve_config_path(&base_dir, &raw.forgejoctl_bin)?,
@@ -1776,33 +1812,76 @@ async fn dispatch_tmux(
     fs::create_dir_all(&run_dir)
         .map_err(|err| DispatchError::Io(format!("failed to create run dir: {err}")))?;
 
-    let template = fs::read_to_string(&directive.prompt_file).map_err(|err| {
+    let directive_template = fs::read_to_string(&directive.prompt_file).map_err(|err| {
         DispatchError::Io(format!(
             "failed reading prompt {}: {err}",
             directive.prompt_file.display()
         ))
     })?;
+    let issue_title = issue.title;
     let issue_body = issue.body.unwrap_or_default();
-    let prompt = render_prompt(
-        &template,
+    let issue_url = issue.html_url;
+    let directive_prompt = render_prompt(
+        &directive_template,
         &[
             ("issue_ref", issue_ref.to_string()),
             ("repo", record.repo_full_name.clone()),
             ("issue_number", issue_number.to_string()),
             ("directive", directive_name.to_string()),
             ("target_role", directive.role.clone()),
-            ("actor", actor),
-            ("issue_title", issue.title),
-            ("issue_body", issue_body),
-            ("issue_url", issue.html_url),
+            ("actor", actor.clone()),
+            ("issue_title", issue_title.clone()),
+            ("issue_body", issue_body.clone()),
+            ("issue_url", issue_url.clone()),
             ("event_type", record.event_type.clone()),
             ("delivery_id", record.delivery_id.clone()),
+        ],
+    );
+    let (prompt_mode, envelope_path, issue_delta) = if issue_session_id.is_some() {
+        (
+            "followup",
+            &dispatch_config.prompt_envelopes.followup_envelope_file,
+            "(delta tracking not yet implemented; review latest issue thread updates before acting)"
+                .to_string(),
+        )
+    } else {
+        (
+            "fresh",
+            &dispatch_config.prompt_envelopes.fresh_envelope_file,
+            "(fresh session; no prior issue delta context)".to_string(),
+        )
+    };
+    let envelope_template = fs::read_to_string(envelope_path).map_err(|err| {
+        DispatchError::Io(format!(
+            "failed reading prompt envelope {}: {err}",
+            envelope_path.display()
+        ))
+    })?;
+    let prompt = render_prompt(
+        &envelope_template,
+        &[
+            ("issue_ref", issue_ref.to_string()),
+            ("repo", record.repo_full_name.clone()),
+            ("issue_number", issue_number.to_string()),
+            ("directive", directive_name.to_string()),
+            ("target_role", directive.role.clone()),
+            ("actor", actor.clone()),
+            ("issue_title", issue_title),
+            ("issue_body", issue_body),
+            ("issue_url", issue_url),
+            ("event_type", record.event_type.clone()),
+            ("delivery_id", record.delivery_id.clone()),
+            ("session_mode", prompt_mode.to_string()),
+            ("issue_delta", issue_delta),
+            ("directive_prompt", directive_prompt),
         ],
     );
 
     let prompt_path = run_dir.join("prompt.md");
     fs::write(&prompt_path, prompt)
         .map_err(|err| DispatchError::Io(format!("failed writing prompt: {err}")))?;
+    fs::write(run_dir.join("prompt_mode.txt"), prompt_mode)
+        .map_err(|err| DispatchError::Io(format!("failed writing prompt mode: {err}")))?;
 
     let script_path = run_dir.join("run.sh");
     let summary_path = run_dir.join("summary.md");
@@ -1842,7 +1921,8 @@ async fn dispatch_tmux(
         DispatchMode::TmuxTui => {
             let bootstrap_prompt_path = run_dir.join("bootstrap_prompt.md");
             let bootstrap_prompt = format!(
-                "You are codex-orch running under orchd dispatch.\n\nBefore taking any action, read and follow the full task instructions in this file:\n{}\n\nTreat that file as canonical for this dispatch.",
+                "You are {} running under orchd dispatch.\n\nBefore taking any action, read and follow the full task instructions in this file:\n{}\n\nTreat that file as canonical for this dispatch.",
+                directive.role,
                 prompt_path.display()
             );
             fs::write(&bootstrap_prompt_path, bootstrap_prompt).map_err(|err| {
