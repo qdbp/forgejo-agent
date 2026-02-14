@@ -7,7 +7,7 @@ session = "codex-orch"
 remain_on_exit = true
 
 [roles.codex-orch]
-codex_bin = "/home/main/bin/codex"
+codex_bin = "/home/main/forgejo-agent/bin/codex-role"
 codex_role_arg = "orch"
 token_file = "/home/main/.config/forgejo-agent/creds/codex-orch.token"
 workdir = "/home/main/forgejo-agent"

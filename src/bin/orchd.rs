@@ -156,7 +156,7 @@ const fn default_tmux_remain_on_exit() -> bool {
 }
 
 fn default_codex_bin() -> String {
-    "/home/main/bin/codex".to_string()
+    "/home/main/forgejo-agent/bin/codex-role".to_string()
 }
 
 fn default_forgejoctl_bin() -> String {

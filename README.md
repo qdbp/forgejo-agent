@@ -116,6 +116,10 @@ Core behavior:
 - issue-scoped codex session reuse (`exec resume`) from latest `codex_session_id`
 - periodic heartbeat + reconcile scan logs
 
+Role launch wrapper:
+
+- `orchd` dispatches Codex through the repo-managed wrapper `bin/codex-role` (configured in `config/orchd-dispatch.toml`), not by clobbering `/usr/bin/codex`.
+
 Run (`tmux-exec`):
 
 ```bash
