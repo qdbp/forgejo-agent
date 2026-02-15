@@ -231,6 +231,41 @@ impl ForgejoClient {
         self.send_json(cfg, &Method::POST, "/api/v1/admin/hooks", Some(&payload))
     }
 
+    pub fn list_user_repos(&self, cfg: &AgentConfig, user: &str, limit: u32) -> Result<Vec<Value>> {
+        let path = format!("/api/v1/users/{user}/repos?limit={limit}");
+        self.send_json(cfg, &Method::GET, &path, Option::<&()>::None)
+    }
+
+    pub fn list_repo_hooks(&self, cfg: &AgentConfig, repo: &RepoRef) -> Result<Vec<Value>> {
+        let path = format!(
+            "/api/v1/repos/{}/{}/hooks?limit=1000",
+            repo.owner, repo.repo
+        );
+        self.send_json(cfg, &Method::GET, &path, Option::<&()>::None)
+    }
+
+    pub fn create_repo_hook(
+        &self,
+        cfg: &AgentConfig,
+        repo: &RepoRef,
+        url: &str,
+        secret: Option<&str>,
+        events: &[&str],
+    ) -> Result<Value> {
+        let path = format!("/api/v1/repos/{}/{}/hooks", repo.owner, repo.repo);
+        let payload = CreateHookBody {
+            kind: "forgejo",
+            config: HookConfig {
+                url,
+                content_type: "json",
+                secret,
+            },
+            events: events.to_vec(),
+            active: true,
+        };
+        self.send_json(cfg, &Method::POST, &path, Some(&payload))
+    }
+
     pub fn create_pull_request(
         &self,
         cfg: &AgentConfig,

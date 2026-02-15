@@ -13,7 +13,7 @@ Core behavior:
 - accepts webhook events at `POST /webhook`
 - parses directives (`@codex-orch design`, `@codex-orch impl`, `@codex poke`)
 - persists `events`, `decisions`, and `dispatches` in sqlite
-- ensures a Forgejo admin/system webhook exists pointing to orchd (best-effort)
+- ensures per-repo Forgejo webhooks exist (best-effort) for repos owned by `FORGEJO_DEFAULT_OWNER`
 - ensures per-repo policy labels exist (best-effort) and maintains per-role local checkouts under the orchd state dir
 - emits heartbeat + reconcile logs periodically
 - ignores self-generated `orchd:` comments to avoid echo loops

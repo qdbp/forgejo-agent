@@ -568,6 +568,7 @@ impl DispatchBackendAdapter for LocalBackendAdapter {
 struct AppState {
     db_path: PathBuf,
     webhook_secret: Option<Vec<u8>>,
+    webhook_url: String,
     cfg: AgentConfig,
     forgejo_config_file: Option<PathBuf>,
     reconcile_repo: RepoRef,
@@ -703,6 +704,19 @@ async fn run() -> Result<()> {
     if let Some(command) = cli.command {
         return run_command(command);
     }
+    let listen_addr: SocketAddr = cli
+        .listen
+        .parse()
+        .with_context(|| format!("invalid --listen value: {}", cli.listen))?;
+    let webhook_url = {
+        let ip = listen_addr.ip();
+        let ip = if ip.is_unspecified() {
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        } else {
+            ip
+        };
+        format!("http://{}:{}/webhook", ip, listen_addr.port())
+    };
     let config_override = cli.config.clone();
     let cfg = AgentConfig::load(cli.config, cli.token_file)?;
     let dispatch_config_path = expand_tilde_path(&cli.dispatch_config)?;
@@ -723,6 +737,7 @@ async fn run() -> Result<()> {
     let state = AppState {
         db_path,
         webhook_secret,
+        webhook_url: webhook_url.clone(),
         cfg,
         forgejo_config_file: config_override,
         reconcile_repo,
@@ -754,36 +769,24 @@ async fn run() -> Result<()> {
         .route("/healthz", get(healthz_handler))
         .route("/webhook", post(webhook_handler))
         .with_state(state);
-
-    let listen_addr: SocketAddr = cli
-        .listen
-        .parse()
-        .with_context(|| format!("invalid --listen value: {}", cli.listen))?;
     let listener = tokio::net::TcpListener::bind(listen_addr)
         .await
         .with_context(|| format!("failed to bind {listen_addr}"))?;
-    let webhook_url = {
-        let ip = listen_addr.ip();
-        let ip = if ip.is_unspecified() {
-            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
-        } else {
-            ip
-        };
-        format!("http://{}:{}/webhook", ip, listen_addr.port())
-    };
-    if let Err(err) = ensure_admin_webhook(&ensure_state, &webhook_url).await {
+    if let Err(err) = ensure_repo_webhooks_for_default_owner(&ensure_state).await {
         log_line(
-            "admin_webhook_ensure_failed",
+            "repo_webhooks_ensure_failed",
             json!({
-                "url": webhook_url,
+                "owner": ensure_state.cfg.default_repo.owner,
+                "url": ensure_state.webhook_url,
                 "error": err.to_string(),
             }),
         );
     } else {
         log_line(
-            "admin_webhook_ensured",
+            "repo_webhooks_ensured",
             json!({
-                "url": webhook_url,
+                "owner": ensure_state.cfg.default_repo.owner,
+                "url": ensure_state.webhook_url,
             }),
         );
     }
@@ -828,36 +831,61 @@ async fn healthz_handler() -> Json<HealthEnvelope> {
     Json(HealthEnvelope { status: "ok" })
 }
 
-async fn ensure_admin_webhook(state: &AppState, webhook_url: &str) -> Result<()> {
+fn hook_url(hook: &serde_json::Value) -> Option<&str> {
+    hook.get("config")
+        .and_then(|cfg| cfg.get("url"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| hook.get("url").and_then(serde_json::Value::as_str))
+}
+
+fn hook_is_active(hook: &serde_json::Value) -> bool {
+    hook.get("active")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true)
+}
+
+async fn ensure_repo_webhooks_for_default_owner(state: &AppState) -> Result<()> {
     let cfg = state.cfg.clone();
+    let owner = state.cfg.default_repo.owner.clone();
+    let db_path = state.db_path.clone();
     let secret = state
         .webhook_secret
         .as_ref()
         .map(|bytes| String::from_utf8_lossy(bytes).to_string());
-    let webhook_url = webhook_url.to_string();
+    let webhook_url = state.webhook_url.clone();
     tokio::task::spawn_blocking(move || {
         let api = ForgejoClient::new(&cfg)?;
-        let hooks = api.list_admin_hooks(&cfg)?;
-        let exists = hooks.iter().any(|hook| {
-            hook.get("config")
-                .and_then(serde_json::Value::as_object)
-                .and_then(|cfg| cfg.get("url"))
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|url| url == webhook_url)
-        });
-        if exists {
-            return Ok(());
+        let repos = api.list_user_repos(&cfg, &owner, 1000)?;
+        for repo in repos {
+            let Some(repo_full_name) = repo.get("full_name").and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            let _ = upsert_repo_seen(&db_path, repo_full_name);
+
+            let Ok(repo_ref) = RepoRef::parse(repo_full_name) else {
+                continue;
+            };
+            let hooks = api.list_repo_hooks(&cfg, &repo_ref)?;
+            let exists = hooks.iter().any(|hook| {
+                hook_is_active(hook)
+                    && hook_url(hook).is_some_and(|url| url == webhook_url.as_str())
+            });
+            if exists {
+                continue;
+            }
+            let _ = api.create_repo_hook(
+                &cfg,
+                &repo_ref,
+                &webhook_url,
+                secret.as_deref(),
+                &["issues", "issue_comment"],
+            )?;
         }
-        let _ = api.create_admin_hook(
-            &cfg,
-            &webhook_url,
-            secret.as_deref(),
-            &["issues", "issue_comment"],
-        )?;
         Ok(())
     })
     .await
-    .context("admin hook ensure join failure")?
+    .context("repo webhook ensure join failure")?
 }
 
 async fn webhook_handler(
@@ -4722,6 +4750,16 @@ async fn run_reconcile_loop(state: AppState, interval_sec: u64) {
 }
 
 async fn reconcile_once(state: &AppState) -> Result<()> {
+    if let Err(err) = ensure_repo_webhooks_for_default_owner(state).await {
+        log_line(
+            "repo_webhooks_ensure_error",
+            json!({
+                "owner": state.cfg.default_repo.owner,
+                "url": state.webhook_url,
+                "error": err.to_string(),
+            }),
+        );
+    }
     let cfg = state.cfg.clone();
     let repo = state.reconcile_repo.clone();
 
