@@ -28,6 +28,9 @@ mod projection;
 // Webhook signature verification + directive parsing/decision. Read when changing how comments trigger dispatch.
 mod webhook;
 
+// Canonical tokens for directives/decisions/event-types. Read when adjusting directive grammar or DB literals.
+mod lexicon;
+
 // SQLite schema + queries + dispatch state transitions. Read when changing locking, queues, or persistence.
 mod db;
 

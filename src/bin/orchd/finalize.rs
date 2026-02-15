@@ -14,6 +14,7 @@ use forgejo_agent::types::OrchdRuntimeState;
 use super::cli::FinalizeDispatchArgs;
 use super::db;
 use super::forgejoctl_cmd;
+use super::lexicon::{DIRECTIVE_IMPL, DIRECTIVE_PR, directive_uses_worktree};
 use super::repo;
 use super::telemetry::record_phase_latency_ms;
 
@@ -146,7 +147,7 @@ pub(super) fn finalize_dispatch_command(args: FinalizeDispatchArgs) -> Result<()
     let mut landing_lines: Vec<String> = Vec::new();
     if status_spec.state_literal == DispatchState::Completed {
         match args.directive.as_str() {
-            "impl" => match repo::autoland_to_main(
+            DIRECTIVE_IMPL => match repo::autoland_to_main(
                 &args.db_path,
                 &args.token_file,
                 &args.git_workdir,
@@ -159,7 +160,7 @@ pub(super) fn finalize_dispatch_command(args: FinalizeDispatchArgs) -> Result<()
                     landing_lines.push(format!("autoland failed: {err:#}"));
                 }
             },
-            "pr" => {
+            DIRECTIVE_PR => {
                 if args.git_branch.trim().is_empty() {
                     landing_ok = false;
                     landing_lines.push("missing git branch; cannot create PR".to_string());
@@ -191,7 +192,7 @@ pub(super) fn finalize_dispatch_command(args: FinalizeDispatchArgs) -> Result<()
             }
             _ => {}
         }
-    } else if matches!(args.directive.as_str(), "impl" | "pr") {
+    } else if directive_uses_worktree(args.directive.as_str()) {
         landing_ok = false;
     }
 
@@ -199,16 +200,13 @@ pub(super) fn finalize_dispatch_command(args: FinalizeDispatchArgs) -> Result<()
         eprintln!("finalize-dispatch: failed appending landing info: {err}");
     }
 
-    let work_state_target = match args.directive.as_str() {
-        "impl" | "pr" => Some(
-            if status_spec.state_literal == DispatchState::Completed && landing_ok {
-                "review"
-            } else {
-                "blocked"
-            },
-        ),
-        _ => None,
-    };
+    let work_state_target = directive_uses_worktree(args.directive.as_str()).then_some(
+        if status_spec.state_literal == DispatchState::Completed && landing_ok {
+            "review"
+        } else {
+            "blocked"
+        },
+    );
 
     if let Some(work_state_target) = work_state_target {
         let phase_transition_start = Instant::now();

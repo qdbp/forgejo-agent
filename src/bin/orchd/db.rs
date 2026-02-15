@@ -11,6 +11,9 @@ use forgejo_agent::orchd_dispatch_core::{
     DispatchBackendKind, DispatchEventKind, DispatchState, RunHandle, reduce_dispatch_state,
 };
 
+use super::lexicon::{
+    DIRECTIVE_IMPL, EVENT_ISSUE_COMMENT, EVENT_ISSUES, directive_serializes_repo,
+};
 use super::state::{DecisionRecord, EventRecord, IssueEventDeltaRow};
 
 #[derive(Debug)]
@@ -412,7 +415,7 @@ pub(super) fn issue_delta_rows(
           AND issue_number = ?2
           AND id > ?3
           AND id <= ?4
-          AND event_type IN ('issue_comment', 'issues')
+          AND event_type IN (?5, ?6)
           AND event_text IS NOT NULL
           AND event_text != ''
         ORDER BY id ASC
@@ -421,7 +424,14 @@ pub(super) fn issue_delta_rows(
     )?;
     let rows = stmt
         .query_map(
-            params![repo_full_name, issue_number, start_event_id, up_to_event_id],
+            params![
+                repo_full_name,
+                issue_number,
+                start_event_id,
+                up_to_event_id,
+                EVENT_ISSUE_COMMENT,
+                EVENT_ISSUES
+            ],
             |row| {
                 Ok(IssueEventDeltaRow {
                     event_type: row.get(0)?,
@@ -582,19 +592,24 @@ pub(super) fn reserve_dispatch_starting(
         return Ok(DispatchReservation::InFlightIssue(dispatch_id));
     }
 
-    if insert.directive == "impl" {
+    if directive_serializes_repo(insert.directive) {
         let repo_inflight = tx
             .query_row(
                 r"
                 SELECT id
                 FROM dispatches
                 WHERE repo_full_name = ?1
-                  AND directive = 'impl'
-                  AND status IN (?2, ?3)
+                  AND directive = ?2
+                  AND status IN (?3, ?4)
                 ORDER BY id DESC
                 LIMIT 1
                 ",
-                params![insert.repo_full_name, starting_status, running_status],
+                params![
+                    insert.repo_full_name,
+                    insert.directive,
+                    starting_status,
+                    running_status
+                ],
                 |row| row.get::<_, i64>(0),
             )
             .optional()?;
@@ -894,12 +909,17 @@ pub(super) fn latest_repo_inflight_impl_dispatch_id(
         SELECT id
         FROM dispatches
         WHERE repo_full_name = ?1
-          AND directive = 'impl'
-          AND status IN (?2, ?3)
+          AND directive = ?2
+          AND status IN (?3, ?4)
         ORDER BY id DESC
         LIMIT 1
         ",
-        params![repo_full_name, starting_status, running_status],
+        params![
+            repo_full_name,
+            DIRECTIVE_IMPL,
+            starting_status,
+            running_status
+        ],
         |row| row.get::<_, i64>(0),
     )
     .optional()
@@ -989,9 +1009,8 @@ pub(super) fn queued_impl_decisions(db_path: &Path, limit: u32) -> Result<Vec<Qu
         WITH latest AS (
             SELECT repo_full_name, issue_number, target_role, MAX(id) AS decision_id
             FROM decisions
-            WHERE decision = 'accepted'
-              AND would_dispatch = 1
-              AND directive = 'impl'
+            WHERE would_dispatch = 1
+              AND directive = ?1
               AND issue_number IS NOT NULL
               AND target_role IS NOT NULL
             GROUP BY repo_full_name, issue_number, target_role
@@ -1019,11 +1038,11 @@ pub(super) fn queued_impl_decisions(db_path: &Path, limit: u32) -> Result<Vec<Qu
         JOIN events e ON e.id = d.event_id
         WHERE NOT EXISTS (SELECT 1 FROM dispatches x WHERE x.decision_id = d.id)
         ORDER BY d.id ASC
-        LIMIT ?1
+        LIMIT ?2
         ",
     )?;
     let rows = stmt
-        .query_map(params![i64::from(limit)], |row| {
+        .query_map(params![DIRECTIVE_IMPL, i64::from(limit)], |row| {
             let decision_id: i64 = row.get(0)?;
             let event_id: i64 = row.get(1)?;
             let record = EventRecord {
@@ -1068,6 +1087,10 @@ mod tests {
     use forgejo_agent::orchd_dispatch_core::DispatchState;
     use rusqlite::params;
 
+    use crate::orchd::lexicon::{
+        DECISION_ACCEPTED, DIRECTIVE_IMPL, DIRECTIVE_POKE, EVENT_ISSUE_COMMENT,
+    };
+
     fn temp_db_path(label: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1111,7 +1134,7 @@ mod tests {
             ",
             params![
                 format!("test-delivery-{}", Utc::now().timestamp_nanos_opt().unwrap_or(0)),
-                "issue_comment",
+                EVENT_ISSUE_COMMENT,
                 "main/orchd-debug",
                 7_i64,
                 "created",
@@ -1133,9 +1156,9 @@ mod tests {
                 "main/orchd-debug",
                 7_i64,
                 "main",
-                "poke",
+                DIRECTIVE_POKE,
                 "codex-orch",
-                "accepted",
+                DECISION_ACCEPTED,
                 "explicit_directive",
                 1_i64,
                 Utc::now().to_rfc3339(),
@@ -1165,7 +1188,7 @@ mod tests {
         let first_decision_id = seed_decision_id(&db_path);
         let second_decision_id = seed_decision_id(&db_path);
 
-        let first = reserve_sample_dispatch(&db_path, first_decision_id, 7, "poke");
+        let first = reserve_sample_dispatch(&db_path, first_decision_id, 7, DIRECTIVE_POKE);
         let first_id = match first {
             super::DispatchReservation::Started(id) => id,
             super::DispatchReservation::InFlightIssue(_)
@@ -1178,7 +1201,7 @@ mod tests {
             vec!["mark_starting".to_string()]
         );
 
-        let second = reserve_sample_dispatch(&db_path, second_decision_id, 7, "poke");
+        let second = reserve_sample_dispatch(&db_path, second_decision_id, 7, DIRECTIVE_POKE);
         match second {
             super::DispatchReservation::InFlightIssue(id) => assert_eq!(id, first_id),
             super::DispatchReservation::Started(_) => {
@@ -1199,7 +1222,7 @@ mod tests {
         let first_decision_id = seed_decision_id(&db_path);
         let second_decision_id = seed_decision_id(&db_path);
 
-        let first = reserve_sample_dispatch(&db_path, first_decision_id, 7, "impl");
+        let first = reserve_sample_dispatch(&db_path, first_decision_id, 7, DIRECTIVE_IMPL);
         let first_id = match first {
             super::DispatchReservation::Started(id) => id,
             super::DispatchReservation::InFlightIssue(_)
@@ -1208,7 +1231,7 @@ mod tests {
             }
         };
 
-        let second = reserve_sample_dispatch(&db_path, second_decision_id, 8, "impl");
+        let second = reserve_sample_dispatch(&db_path, second_decision_id, 8, DIRECTIVE_IMPL);
         match second {
             super::DispatchReservation::InFlightRepo(id) => assert_eq!(id, first_id),
             super::DispatchReservation::Started(_) => {
@@ -1227,7 +1250,7 @@ mod tests {
         let db_path = temp_db_path("dispatch-autoheal");
         super::init_db(&db_path).expect("db init");
         let decision_id = seed_decision_id(&db_path);
-        let started_id = match reserve_sample_dispatch(&db_path, decision_id, 9, "poke") {
+        let started_id = match reserve_sample_dispatch(&db_path, decision_id, 9, DIRECTIVE_POKE) {
             super::DispatchReservation::Started(id) => id,
             super::DispatchReservation::InFlightIssue(_)
             | super::DispatchReservation::InFlightRepo(_) => {

@@ -17,10 +17,6 @@ use super::state::AppState;
 pub(super) const DEFAULT_GIT_REMOTE: &str = "origin";
 pub(super) const DEFAULT_GIT_BASE_BRANCH: &str = "main";
 
-pub(super) fn directive_uses_worktree(directive: &str) -> bool {
-    matches!(directive, "impl" | "pr")
-}
-
 fn git_sanitize_token(input: &str, max_len: usize) -> String {
     let mut out = String::with_capacity(input.len());
     let mut last_dash = false;

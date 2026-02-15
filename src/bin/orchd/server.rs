@@ -22,6 +22,7 @@ use super::db;
 use super::dispatch;
 use super::dispatch_config::load_dispatch_config;
 use super::errors::runtime_state_for_dispatch_error;
+use super::lexicon::{DIRECTIVE_IMPL, EVENT_ISSUE_COMMENT, EVENT_ISSUES};
 use super::paths::expand_tilde_path;
 use super::projection;
 use super::state::{
@@ -203,7 +204,7 @@ async fn ensure_repo_webhooks_for_default_owner(state: &AppState) -> Result<()> 
                 &repo_ref,
                 &webhook_url,
                 secret.as_deref(),
-                &["issues", "issue_comment"],
+                &[EVENT_ISSUES, EVENT_ISSUE_COMMENT],
             )?;
         }
         Ok(())
@@ -294,7 +295,7 @@ async fn process_webhook(
 
     let mut status_projected = false;
     let mut status_error: Option<String> = None;
-    if decision.decision == "accepted" {
+    if decision.would_dispatch {
         if let Some(issue_number) = record.issue_number {
             let dispatch_identity = projection::dispatch_comment_identity(state, &decision);
             if let Err(err) = projection::project_issue_runtime_state(
@@ -339,7 +340,7 @@ async fn process_webhook(
                 }
                 DispatchMode::TmuxExec | DispatchMode::TmuxTui => {
                     let defer_impl = match decision.directive.as_deref() {
-                        Some("impl") => match db::latest_repo_inflight_impl_dispatch_id(
+                        Some(DIRECTIVE_IMPL) => match db::latest_repo_inflight_impl_dispatch_id(
                             &state.db_path,
                             &record.repo_full_name,
                         ) {
@@ -349,7 +350,7 @@ async fn process_webhook(
                                     json!({
                                         "repo": record.repo_full_name,
                                         "issue_number": issue_number,
-                                        "directive": "impl",
+                                        "directive": DIRECTIVE_IMPL,
                                         "inflight_dispatch_id": inflight,
                                     }),
                                 );
@@ -578,7 +579,7 @@ async fn dispatch_queue_once(state: &AppState) -> Result<()> {
 fn heartbeat_once(state: &AppState) -> Result<()> {
     let conn = db::open_db(&state.db_path)?;
     let queue_depth: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM decisions WHERE decision = 'accepted' AND would_dispatch = 1 AND comment_posted = 0",
+        "SELECT COUNT(*) FROM decisions WHERE would_dispatch = 1 AND comment_posted = 0",
         [],
         |row| row.get(0),
     )?;

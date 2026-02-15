@@ -4,6 +4,9 @@ use chrono::Utc;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
+use super::lexicon::{
+    DECISION_ACCEPTED, DECISION_IGNORED, EVENT_ISSUE_COMMENT, EVENT_ISSUES, directive_is_known,
+};
 use super::paths::expand_tilde_path;
 use super::state::{DecisionRecord, EventContext, ParsedDirective, WebhookPayload};
 
@@ -73,8 +76,8 @@ pub(super) fn extract_event_context(
         });
 
     let text = match event_type {
-        "issue_comment" => payload.comment.as_ref().map(|comment| comment.body.clone()),
-        "issues" => payload.issue.as_ref().and_then(|issue| issue.body.clone()),
+        EVENT_ISSUE_COMMENT => payload.comment.as_ref().map(|comment| comment.body.clone()),
+        EVENT_ISSUES => payload.issue.as_ref().and_then(|issue| issue.body.clone()),
         _ => None,
     };
     let source_comment_id = payload.comment.as_ref().and_then(|comment| comment.id);
@@ -96,7 +99,7 @@ pub(super) fn extract_event_context(
 pub(super) fn decide(event_type: &str, context: Option<&EventContext>) -> DecisionRecord {
     let Some(context) = context else {
         return DecisionRecord {
-            decision: "ignored".to_string(),
+            decision: DECISION_IGNORED.to_string(),
             reason_code: "missing_context".to_string(),
             directive: None,
             target_role: None,
@@ -104,9 +107,11 @@ pub(super) fn decide(event_type: &str, context: Option<&EventContext>) -> Decisi
         };
     };
 
-    if event_type == "issue_comment" && context.text.as_deref().is_some_and(is_orchd_echo_comment) {
+    if event_type == EVENT_ISSUE_COMMENT
+        && context.text.as_deref().is_some_and(is_orchd_echo_comment)
+    {
         return DecisionRecord {
-            decision: "ignored".to_string(),
+            decision: DECISION_IGNORED.to_string(),
             reason_code: "orchd_echo_comment".to_string(),
             directive: None,
             target_role: None,
@@ -118,7 +123,7 @@ pub(super) fn decide(event_type: &str, context: Option<&EventContext>) -> Decisi
         && let Some(parsed) = parse_directive(text)
     {
         return DecisionRecord {
-            decision: "accepted".to_string(),
+            decision: DECISION_ACCEPTED.to_string(),
             reason_code: "explicit_directive".to_string(),
             directive: Some(parsed.directive),
             target_role: Some(parsed.role),
@@ -127,7 +132,7 @@ pub(super) fn decide(event_type: &str, context: Option<&EventContext>) -> Decisi
     }
 
     DecisionRecord {
-        decision: "ignored".to_string(),
+        decision: DECISION_IGNORED.to_string(),
         reason_code: "no_directive".to_string(),
         directive: None,
         target_role: None,
@@ -163,7 +168,7 @@ fn parse_directive_line(line: &str) -> Option<ParsedDirective> {
         return None;
     };
 
-    if !matches!(directive.as_str(), "design" | "impl" | "pr" | "poke") {
+    if !directive_is_known(directive.as_str()) {
         return None;
     }
 
@@ -185,6 +190,9 @@ pub(super) fn extract_header(headers: &HeaderMap, names: &[&str]) -> Option<Stri
 
 #[cfg(test)]
 mod tests {
+    use crate::orchd::lexicon::{
+        DECISION_ACCEPTED, DECISION_IGNORED, DIRECTIVE_POKE, EVENT_ISSUE_COMMENT,
+    };
     use crate::orchd::state::EventContext;
 
     use super::{decide, parse_directive};
@@ -199,8 +207,8 @@ mod tests {
             source_comment_id: None,
             source_created_at: None,
         };
-        let decision = decide("issue_comment", Some(&context));
-        assert_eq!(decision.decision, "ignored");
+        let decision = decide(EVENT_ISSUE_COMMENT, Some(&context));
+        assert_eq!(decision.decision, DECISION_IGNORED);
         assert_eq!(decision.reason_code, "no_directive");
         assert!(!decision.would_dispatch);
     }
@@ -215,10 +223,10 @@ mod tests {
             source_comment_id: None,
             source_created_at: None,
         };
-        let decision = decide("issue_comment", Some(&context));
-        assert_eq!(decision.decision, "accepted");
+        let decision = decide(EVENT_ISSUE_COMMENT, Some(&context));
+        assert_eq!(decision.decision, DECISION_ACCEPTED);
         assert_eq!(decision.reason_code, "explicit_directive");
-        assert_eq!(decision.directive.as_deref(), Some("poke"));
+        assert_eq!(decision.directive.as_deref(), Some(DIRECTIVE_POKE));
         assert_eq!(decision.target_role.as_deref(), Some("codex-orch"));
         assert!(decision.would_dispatch);
     }
@@ -227,6 +235,6 @@ mod tests {
     fn codex_alias_maps_to_orch_role() {
         let parsed = parse_directive("@codex poke").expect("directive should parse");
         assert_eq!(parsed.role, "codex-orch");
-        assert_eq!(parsed.directive, "poke");
+        assert_eq!(parsed.directive, DIRECTIVE_POKE);
     }
 }

@@ -21,6 +21,7 @@ use super::db;
 use super::dispatch_config::{DispatchConfig, DispatchDirectiveConfig, DispatchRoleConfig};
 use super::errors::DispatchError;
 use super::forgejoctl_cmd;
+use super::lexicon;
 use super::repo;
 use super::state::{AppState, DecisionRecord, EventRecord};
 use super::telemetry::{log_line, record_phase_latency_ms};
@@ -172,7 +173,7 @@ impl DispatchBackendAdapter for LocalBackendAdapter {
 
 fn codex_sandbox_for_directive(directive: &str) -> &'static str {
     match directive {
-        "design" | "poke" => "read-only",
+        lexicon::DIRECTIVE_DESIGN | lexicon::DIRECTIVE_POKE => "read-only",
         _ => "workspace-write",
     }
 }
@@ -512,7 +513,7 @@ async fn plan_dispatch(
         }
     }
     let (workdir, git_remote, git_base, git_branch) =
-        if repo::directive_uses_worktree(&intent.directive) {
+        if lexicon::directive_uses_worktree(&intent.directive) {
             let git_remote = repo::DEFAULT_GIT_REMOTE.to_string();
             let git_base = repo::DEFAULT_GIT_BASE_BRANCH.to_string();
             let git_branch = repo::dispatch_worktree_branch(
