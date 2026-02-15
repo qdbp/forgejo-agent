@@ -21,6 +21,7 @@ const FORGEJO_BIN_ENV: &str = "FORGEJO_BIN";
 
 static TIMINGS_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+#[derive(Debug)]
 struct ChildGuard(Child);
 
 impl Drop for ChildGuard {
@@ -151,6 +152,7 @@ fn run_command_checked(cmd: &mut Command, context: &str) -> Result<Output> {
 struct ForgejoFixture {
     base_url: String,
     work_path: PathBuf,
+    repos_root: PathBuf,
     owner: String,
     token: String,
     server_stdout: PathBuf,
@@ -239,6 +241,7 @@ impl ForgejoFixture {
         let mut fixture = Self {
             base_url,
             work_path,
+            repos_root: repos_path,
             owner,
             token,
             server_stdout,
@@ -385,6 +388,12 @@ impl ForgejoFixture {
         Ok((config_path, token_path))
     }
 
+    fn repo_git_dir(&self, repo_name: &str) -> PathBuf {
+        self.repos_root
+            .join(self.owner.as_str())
+            .join(format!("{repo_name}.git"))
+    }
+
     fn authed_get(&self, path: &str) -> Result<Value> {
         let client = Client::builder()
             .timeout(Duration::from_secs(3))
@@ -507,6 +516,110 @@ fn fake_codex_bin() -> Result<PathBuf> {
         "failed to locate fake-codex binary; checked env vars {CANDIDATE_ENV:?} and {}",
         path.display()
     );
+}
+
+fn ensure_fake_codex_bin() -> Result<PathBuf> {
+    fake_codex_bin().or_else(|_| {
+        let status = Command::new("cargo")
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .args(["build", "--quiet", "--bin", "fake-codex"])
+            .status()
+            .context("failed to build fake-codex")?;
+        if !status.success() {
+            bail!("failed building fake-codex");
+        }
+        fake_codex_bin()
+    })
+}
+
+fn git_output_checked(workdir: &Path, args: &[&str], context: &str) -> Result<Output> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(workdir).args(args);
+    run_command_checked(&mut cmd, context)
+}
+
+fn git_bare_output_checked(git_dir: &Path, args: &[&str], context: &str) -> Result<Output> {
+    let mut cmd = Command::new("git");
+    cmd.arg("--git-dir").arg(git_dir).args(args);
+    run_command_checked(&mut cmd, context)
+}
+
+fn stdout_trim(output: &Output) -> Result<String> {
+    String::from_utf8(output.stdout.clone())
+        .context("command stdout was not utf-8")
+        .map(|s| s.trim().to_string())
+}
+
+#[derive(Debug)]
+struct GitWorkspace {
+    _temp: TempDir,
+    checkout: PathBuf,
+    bare_repo: PathBuf,
+}
+
+impl GitWorkspace {
+    fn from_fixture(fixture: &ForgejoFixture, repo_name: &str) -> Result<Self> {
+        let bare_repo = fixture.repo_git_dir(repo_name);
+        if !bare_repo.is_dir() {
+            bail!(
+                "expected bare repo at {}, but it does not exist",
+                bare_repo.display()
+            );
+        }
+
+        let temp = TempDir::new().context("failed to create temp dir for git workspace")?;
+        let checkout = temp.path().join("checkout");
+
+        let mut clone = Command::new("git");
+        clone.args(["clone"]).arg(&bare_repo).arg(&checkout);
+        run_command_checked(&mut clone, "git clone bare repo")?;
+
+        let head = stdout_trim(&git_output_checked(
+            &checkout,
+            &["rev-parse", "--abbrev-ref", "HEAD"],
+            "git rev-parse --abbrev-ref HEAD",
+        )?)?;
+
+        if head != "main" {
+            git_output_checked(
+                &checkout,
+                &["branch", "-f", "main", "HEAD"],
+                "git branch -f main HEAD",
+            )?;
+            git_output_checked(&checkout, &["checkout", "main"], "git checkout main")?;
+        }
+
+        // Ensure remote branch exists so orchd's `git fetch origin main` + `origin/main` worktree
+        // base does not fail.
+        git_output_checked(
+            &checkout,
+            &["push", "-u", "origin", "main"],
+            "git push -u origin main",
+        )?;
+
+        Ok(Self {
+            _temp: temp,
+            checkout,
+            bare_repo,
+        })
+    }
+
+    fn bare_head_main(&self) -> Result<String> {
+        stdout_trim(&git_bare_output_checked(
+            &self.bare_repo,
+            &["rev-parse", "refs/heads/main"],
+            "git --git-dir rev-parse refs/heads/main",
+        )?)
+    }
+
+    fn bare_commit_count_main(&self) -> Result<u64> {
+        let out = stdout_trim(&git_bare_output_checked(
+            &self.bare_repo,
+            &["rev-list", "--count", "refs/heads/main"],
+            "git --git-dir rev-list --count refs/heads/main",
+        )?)?;
+        out.parse::<u64>().context("rev-list count was not a u64")
+    }
 }
 
 fn run_cli_output(config_path: &Path, token_path: &Path, args: &[&str]) -> Result<Output> {
@@ -716,6 +829,235 @@ impl LiveHarness {
             .as_array()
             .ok_or_else(|| anyhow!("list open issues payload was not an array"))?;
         Ok(issues.clone())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum OrchdTestDirective {
+    Poke,
+    Impl,
+    Pr,
+}
+
+impl OrchdTestDirective {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Poke => "poke",
+            Self::Impl => "impl",
+            Self::Pr => "pr",
+        }
+    }
+
+    const fn prompt_file(self) -> &'static str {
+        match self {
+            Self::Poke => "orchd-poke.md",
+            Self::Impl => "orchd-impl.md",
+            Self::Pr => "orchd-pr.md",
+        }
+    }
+}
+
+struct OrchdDispatchTomlInputs<'a> {
+    actor: &'a str,
+    workdir: &'a Path,
+    codex_bin: &'a Path,
+    token_file: &'a Path,
+    forgejoctl: &'a Path,
+    directives: &'a [OrchdTestDirective],
+    timeout_sec: u64,
+}
+
+fn write_orchd_dispatch_toml(path: &Path, inputs: OrchdDispatchTomlInputs<'_>) -> Result<()> {
+    use std::fmt::Write as _;
+
+    let prompts_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("prompts");
+    let fresh_env = prompts_dir.join("orchd-envelope-fresh.md");
+    let follow_env = prompts_dir.join("orchd-envelope-followup.md");
+
+    let mut out = String::new();
+    writeln!(&mut out, "version = 1")?;
+    writeln!(&mut out, "allowed_actors = [\"{}\"]", inputs.actor)?;
+    writeln!(
+        &mut out,
+        "forgejoctl_bin = \"{}\"\n",
+        inputs.forgejoctl.display()
+    )?;
+
+    writeln!(&mut out, "[tmux]")?;
+    writeln!(&mut out, "session = \"itest\"")?;
+    writeln!(&mut out, "remain_on_exit = false\n")?;
+
+    writeln!(&mut out, "[prompt_envelopes]")?;
+    writeln!(
+        &mut out,
+        "fresh_envelope_file = \"{}\"",
+        fresh_env.display()
+    )?;
+    writeln!(
+        &mut out,
+        "followup_envelope_file = \"{}\"\n",
+        follow_env.display()
+    )?;
+
+    writeln!(&mut out, "[roles.codex-orch]")?;
+    writeln!(&mut out, "codex_bin = \"{}\"", inputs.codex_bin.display())?;
+    writeln!(&mut out, "codex_role_arg = \"orch\"")?;
+    writeln!(&mut out, "token_file = \"{}\"", inputs.token_file.display())?;
+    writeln!(&mut out, "workdir = \"{}\"\n", inputs.workdir.display())?;
+
+    for directive in inputs.directives {
+        let prompt = prompts_dir.join(directive.prompt_file());
+        writeln!(&mut out, "[directives.{}]", directive.as_str())?;
+        writeln!(&mut out, "role = \"codex-orch\"")?;
+        writeln!(&mut out, "prompt_file = \"{}\"", prompt.display())?;
+        writeln!(&mut out, "timeout_sec = {}\n", inputs.timeout_sec)?;
+    }
+
+    fs::write(path, out).with_context(|| format!("failed writing {}", path.display()))?;
+    Ok(())
+}
+
+fn post_orchd_issue_comment_webhook(
+    client: &Client,
+    orchd_base_url: &str,
+    repo_ref: &str,
+    issue_number: u64,
+    actor: &str,
+    comment_body: &str,
+) -> Result<()> {
+    let delivery_id = format!("itest-webhook-{}", unique_suffix()?);
+    let webhook_body = serde_json::json!({
+        "action": "created",
+        "repository": { "full_name": repo_ref },
+        "issue": { "number": issue_number },
+        "comment": { "body": comment_body, "user": { "login": actor } },
+        "sender": { "login": actor },
+    });
+
+    let webhook_resp = client
+        .post(format!("{orchd_base_url}/webhook"))
+        .header("Content-Type", "application/json")
+        .header("X-Forgejo-Event", "issue_comment")
+        .header("X-Forgejo-Delivery", delivery_id)
+        .body(webhook_body.to_string())
+        .send()
+        .context("failed POSTing webhook to orchd")?;
+    let webhook_status = webhook_resp.status();
+    if webhook_status != StatusCode::ACCEPTED && webhook_status != StatusCode::OK {
+        let body = webhook_resp.text().unwrap_or_default();
+        bail!("orchd webhook returned {} body={body}", webhook_status);
+    }
+    Ok(())
+}
+
+fn wait_for_issue_label(
+    harness: &LiveHarness,
+    issue_number: u64,
+    label: &str,
+    timeout: Duration,
+) -> Result<Value> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let issue = harness.get_issue(issue_number)?;
+        if issue_has_label(&issue, label)? {
+            return Ok(issue);
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "timed out waiting for label {label} on issue {} labels={:?}",
+                harness.issue_ref(issue_number),
+                issue_label_names(&issue)?
+            );
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
+#[derive(Debug)]
+struct OrchdTestProcess {
+    base_url: String,
+    client: Client,
+    _guard: ChildGuard,
+}
+
+struct OrchdSpawnInputs<'a> {
+    listen_port: u16,
+    db_path: &'a Path,
+    repo_ref: &'a str,
+    dispatch_cfg_path: &'a Path,
+    config_path: &'a Path,
+    token_path: &'a Path,
+    stdout_path: &'a Path,
+    stderr_path: &'a Path,
+    env: &'a [(&'a str, &'a str)],
+}
+
+impl OrchdTestProcess {
+    fn spawn(inputs: OrchdSpawnInputs<'_>) -> Result<Self> {
+        let base_url = format!("http://127.0.0.1:{}", inputs.listen_port);
+        let listen = format!("127.0.0.1:{}", inputs.listen_port);
+
+        let stdout = fs::File::create(inputs.stdout_path)
+            .with_context(|| format!("failed creating {}", inputs.stdout_path.display()))?;
+        let stderr = fs::File::create(inputs.stderr_path)
+            .with_context(|| format!("failed creating {}", inputs.stderr_path.display()))?;
+
+        let mut cmd = Command::new(orchd_bin()?);
+        cmd.arg("--listen")
+            .arg(&listen)
+            .arg("--db-path")
+            .arg(inputs.db_path)
+            .arg("--reconcile-repo")
+            .arg(inputs.repo_ref)
+            .arg("--heartbeat-sec")
+            .arg("1")
+            .arg("--reconcile-sec")
+            .arg("1")
+            .arg("--dispatch-mode")
+            .arg("tmux-exec")
+            .arg("--dispatch-backend")
+            .arg("local")
+            .arg("--dispatch-config")
+            .arg(inputs.dispatch_cfg_path)
+            .arg("--config")
+            .arg(inputs.config_path)
+            .arg("--token-file")
+            .arg(inputs.token_path)
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr));
+
+        for (k, v) in inputs.env {
+            cmd.env(k, v);
+        }
+
+        let orchd = cmd.spawn().context("failed spawning orchd")?;
+        let guard = ChildGuard(orchd);
+
+        let client = Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .context("failed to build orchd HTTP client")?;
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if Instant::now() > deadline {
+                let stdout = fs::read_to_string(inputs.stdout_path).unwrap_or_default();
+                let stderr = fs::read_to_string(inputs.stderr_path).unwrap_or_default();
+                bail!("orchd did not become ready\nstdout:\n{stdout}\nstderr:\n{stderr}");
+            }
+            if let Ok(resp) = client.get(format!("{base_url}/healthz")).send()
+                && resp.status() == StatusCode::OK
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(150));
+        }
+
+        Ok(Self {
+            base_url,
+            client,
+            _guard: guard,
+        })
     }
 }
 
@@ -993,147 +1335,383 @@ fn live_orchd_local_backend_smoke() -> Result<()> {
     let orchd_stdout = harness.fixture.work_path.join("orchd-stdout.log");
     let orchd_stderr = harness.fixture.work_path.join("orchd-stderr.log");
 
-    let fake_codex = fake_codex_bin().or_else(|_| {
-        let status = Command::new("cargo")
-            .current_dir(env!("CARGO_MANIFEST_DIR"))
-            .args(["build", "--quiet", "--bin", "fake-codex"])
-            .status()
-            .context("failed to build fake-codex")?;
-        if !status.success() {
-            bail!("failed building fake-codex");
-        }
-        fake_codex_bin()
-    })?;
+    let fake_codex = ensure_fake_codex_bin()?;
     let forgejoctl = forgejo_agent_bin()?;
 
-    let prompts_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("prompts");
-    let dispatch_toml = format!(
-        r#"
-version = 1
-allowed_actors = ["{actor}"]
-
-[tmux]
-session = "itest"
-remain_on_exit = false
-
-[prompt_envelopes]
-fresh_envelope_file = "{fresh_env}"
-followup_envelope_file = "{follow_env}"
-
-[roles.codex-orch]
-codex_bin = "{codex_bin}"
-codex_role_arg = "orch"
-token_file = "{token_file}"
-workdir = "{workdir}"
-
-[directives.poke]
-role = "codex-orch"
-prompt_file = "{poke_prompt}"
-timeout_sec = 10
-
-forgejoctl_bin = "{forgejoctl}"
-"#,
-        actor = harness.fixture.owner.as_str(),
-        fresh_env = prompts_dir.join("orchd-envelope-fresh.md").display(),
-        follow_env = prompts_dir.join("orchd-envelope-followup.md").display(),
-        poke_prompt = prompts_dir.join("orchd-poke.md").display(),
-        codex_bin = fake_codex.display(),
-        token_file = harness.token_path.display(),
-        workdir = env!("CARGO_MANIFEST_DIR"),
-        forgejoctl = forgejoctl.display(),
-    );
-    fs::write(&dispatch_cfg_path, dispatch_toml)
-        .with_context(|| format!("failed writing {}", dispatch_cfg_path.display()))?;
+    write_orchd_dispatch_toml(
+        &dispatch_cfg_path,
+        OrchdDispatchTomlInputs {
+            actor: harness.fixture.owner.as_str(),
+            workdir: Path::new(env!("CARGO_MANIFEST_DIR")),
+            codex_bin: &fake_codex,
+            token_file: &harness.token_path,
+            forgejoctl: &forgejoctl,
+            directives: &[OrchdTestDirective::Poke],
+            timeout_sec: 10,
+        },
+    )?;
 
     let port = pick_unused_port().ok_or_else(|| anyhow!("failed to pick unused port"))?;
-    let base_url = format!("http://127.0.0.1:{port}");
-    let listen = format!("127.0.0.1:{port}");
+    let orchd = OrchdTestProcess::spawn(OrchdSpawnInputs {
+        listen_port: port,
+        db_path: &db_path,
+        repo_ref: &harness.repo_ref,
+        dispatch_cfg_path: &dispatch_cfg_path,
+        config_path: &harness.config_path,
+        token_path: &harness.token_path,
+        stdout_path: &orchd_stdout,
+        stderr_path: &orchd_stderr,
+        env: &[],
+    })?;
 
-    let stdout = fs::File::create(&orchd_stdout)
-        .with_context(|| format!("failed creating {}", orchd_stdout.display()))?;
-    let stderr = fs::File::create(&orchd_stderr)
-        .with_context(|| format!("failed creating {}", orchd_stderr.display()))?;
+    post_orchd_issue_comment_webhook(
+        &orchd.client,
+        &orchd.base_url,
+        &harness.repo_ref,
+        issue_number,
+        harness.fixture.owner.as_str(),
+        "@codex-orch poke",
+    )?;
 
-    let orchd = Command::new(orchd_bin()?)
-        .arg("--listen")
-        .arg(&listen)
-        .arg("--db-path")
-        .arg(&db_path)
-        .arg("--reconcile-repo")
-        .arg(&harness.repo_ref)
-        .arg("--dispatch-mode")
-        .arg("tmux-exec")
-        .arg("--dispatch-backend")
-        .arg("local")
-        .arg("--dispatch-config")
-        .arg(&dispatch_cfg_path)
-        .arg("--config")
-        .arg(&harness.config_path)
-        .arg("--token-file")
-        .arg(&harness.token_path)
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
-        .spawn()
-        .context("failed spawning orchd")?;
-    let mut _orchd_guard = ChildGuard(orchd);
+    let _ = wait_for_issue_label(
+        &harness,
+        issue_number,
+        "orchd/state/completed",
+        Duration::from_secs(30),
+    )?;
 
-    let client = Client::builder()
-        .timeout(Duration::from_secs(3))
-        .build()
-        .context("failed to build orchd HTTP client")?;
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if Instant::now() > deadline {
-            let stdout = fs::read_to_string(&orchd_stdout).unwrap_or_default();
-            let stderr = fs::read_to_string(&orchd_stderr).unwrap_or_default();
-            bail!("orchd did not become ready\nstdout:\n{stdout}\nstderr:\n{stderr}");
-        }
-        if let Ok(resp) = client.get(format!("{base_url}/healthz")).send()
-            && resp.status() == StatusCode::OK
-        {
-            break;
-        }
-        thread::sleep(Duration::from_millis(150));
+    Ok(())
+}
+
+#[test]
+#[serial(live_forgejo)]
+fn live_orchd_impl_autoland_updates_remote_main() -> Result<()> {
+    if !live_tests_enabled() {
+        eprintln!(
+            "skipping live orchd integration test; enable with {}=1",
+            LIVE_TESTS_ENV
+        );
+        return Ok(());
     }
 
-    let delivery_id = format!("itest-webhook-{}", unique_suffix()?);
-    let webhook_body = serde_json::json!({
-        "action": "created",
-        "repository": { "full_name": harness.repo_ref.as_str() },
-        "issue": { "number": issue_number },
-        "comment": { "body": "@codex-orch poke", "user": { "login": harness.fixture.owner.as_str() } },
-        "sender": { "login": harness.fixture.owner.as_str() },
-    });
+    let harness = LiveHarness::bootstrap("live_orchd_impl_autoland_updates_remote_main")?;
+    let issue_number = harness.create_issue("orchd impl smoke", "issue body", "ready")?;
 
-    let webhook_resp = client
-        .post(format!("{base_url}/webhook"))
-        .header("Content-Type", "application/json")
-        .header("X-Forgejo-Event", "issue_comment")
-        .header("X-Forgejo-Delivery", delivery_id)
-        .body(webhook_body.to_string())
-        .send()
-        .context("failed POSTing webhook to orchd")?;
-    let webhook_status = webhook_resp.status();
-    if webhook_status != StatusCode::ACCEPTED && webhook_status != StatusCode::OK {
-        let body = webhook_resp.text().unwrap_or_default();
-        bail!("orchd webhook returned {} body={body}", webhook_status);
+    let git = GitWorkspace::from_fixture(&harness.fixture, &harness.repo_name)?;
+    let before_head = git.bare_head_main()?;
+    let before_count = git.bare_commit_count_main()?;
+
+    let fake_codex = ensure_fake_codex_bin()?;
+    let forgejoctl = forgejo_agent_bin()?;
+
+    let dispatch_cfg_path = harness.fixture.work_path.join("orchd-dispatch-impl.toml");
+    write_orchd_dispatch_toml(
+        &dispatch_cfg_path,
+        OrchdDispatchTomlInputs {
+            actor: harness.fixture.owner.as_str(),
+            workdir: &git.checkout,
+            codex_bin: &fake_codex,
+            token_file: &harness.token_path,
+            forgejoctl: &forgejoctl,
+            directives: &[OrchdTestDirective::Impl],
+            timeout_sec: 30,
+        },
+    )?;
+
+    let db_path = harness.fixture.work_path.join("orchd-impl.sqlite");
+    let orchd_stdout = harness.fixture.work_path.join("orchd-impl-stdout.log");
+    let orchd_stderr = harness.fixture.work_path.join("orchd-impl-stderr.log");
+    let port = pick_unused_port().ok_or_else(|| anyhow!("failed to pick unused port"))?;
+
+    let orchd = OrchdTestProcess::spawn(OrchdSpawnInputs {
+        listen_port: port,
+        db_path: &db_path,
+        repo_ref: &harness.repo_ref,
+        dispatch_cfg_path: &dispatch_cfg_path,
+        config_path: &harness.config_path,
+        token_path: &harness.token_path,
+        stdout_path: &orchd_stdout,
+        stderr_path: &orchd_stderr,
+        env: &[
+            ("FAKE_CODEX_MODE", "git_append_commit"),
+            ("FAKE_CODEX_GIT_FILE", "orchd-itest.txt"),
+        ],
+    })?;
+
+    post_orchd_issue_comment_webhook(
+        &orchd.client,
+        &orchd.base_url,
+        &harness.repo_ref,
+        issue_number,
+        harness.fixture.owner.as_str(),
+        "@codex-orch impl",
+    )?;
+
+    let _ = wait_for_issue_label(
+        &harness,
+        issue_number,
+        "orchd/state/completed",
+        Duration::from_secs(60),
+    )?;
+
+    let after_head = git.bare_head_main()?;
+    let after_count = git.bare_commit_count_main()?;
+    if after_head == before_head {
+        bail!("expected autoland to advance main, but head stayed at {after_head}");
+    }
+    if after_count != before_count + 1 {
+        bail!("expected main commit count to increase by 1 ({before_count} -> {after_count})");
     }
 
-    let issue_ref = harness.issue_ref(issue_number);
-    let poll_deadline = Instant::now() + Duration::from_secs(30);
+    let final_issue = harness.get_issue(issue_number)?;
+    if !issue_has_label(&final_issue, "state/review")? {
+        bail!("expected impl success to transition issue to state/review");
+    }
+    if issue_label_prefix_count(&final_issue, "orchd/state/")? != 1 {
+        bail!("expected exactly one orchd/state/* label after impl completion");
+    }
+
+    Ok(())
+}
+
+#[test]
+#[serial(live_forgejo)]
+fn live_orchd_pr_pushes_branch_and_opens_pr() -> Result<()> {
+    if !live_tests_enabled() {
+        eprintln!(
+            "skipping live orchd integration test; enable with {}=1",
+            LIVE_TESTS_ENV
+        );
+        return Ok(());
+    }
+
+    let harness = LiveHarness::bootstrap("live_orchd_pr_pushes_branch_and_opens_pr")?;
+    let issue_number = harness.create_issue("orchd pr smoke", "issue body", "ready")?;
+
+    let git = GitWorkspace::from_fixture(&harness.fixture, &harness.repo_name)?;
+    let before_main = git.bare_head_main()?;
+
+    let fake_codex = ensure_fake_codex_bin()?;
+    let forgejoctl = forgejo_agent_bin()?;
+
+    let dispatch_cfg_path = harness.fixture.work_path.join("orchd-dispatch-pr.toml");
+    write_orchd_dispatch_toml(
+        &dispatch_cfg_path,
+        OrchdDispatchTomlInputs {
+            actor: harness.fixture.owner.as_str(),
+            workdir: &git.checkout,
+            codex_bin: &fake_codex,
+            token_file: &harness.token_path,
+            forgejoctl: &forgejoctl,
+            directives: &[OrchdTestDirective::Pr],
+            timeout_sec: 30,
+        },
+    )?;
+
+    let db_path = harness.fixture.work_path.join("orchd-pr.sqlite");
+    let orchd_stdout = harness.fixture.work_path.join("orchd-pr-stdout.log");
+    let orchd_stderr = harness.fixture.work_path.join("orchd-pr-stderr.log");
+    let port = pick_unused_port().ok_or_else(|| anyhow!("failed to pick unused port"))?;
+
+    let orchd = OrchdTestProcess::spawn(OrchdSpawnInputs {
+        listen_port: port,
+        db_path: &db_path,
+        repo_ref: &harness.repo_ref,
+        dispatch_cfg_path: &dispatch_cfg_path,
+        config_path: &harness.config_path,
+        token_path: &harness.token_path,
+        stdout_path: &orchd_stdout,
+        stderr_path: &orchd_stderr,
+        env: &[
+            ("FAKE_CODEX_MODE", "git_append_commit"),
+            ("FAKE_CODEX_GIT_FILE", "orchd-itest.txt"),
+        ],
+    })?;
+
+    post_orchd_issue_comment_webhook(
+        &orchd.client,
+        &orchd.base_url,
+        &harness.repo_ref,
+        issue_number,
+        harness.fixture.owner.as_str(),
+        "@codex-orch pr",
+    )?;
+
+    let _ = wait_for_issue_label(
+        &harness,
+        issue_number,
+        "orchd/state/completed",
+        Duration::from_secs(60),
+    )?;
+
+    let after_main = git.bare_head_main()?;
+    if after_main != before_main {
+        bail!(
+            "expected pr directive to not advance main (before={before_main} after={after_main})"
+        );
+    }
+
+    let pulls = harness.fixture.authed_get(&format!(
+        "/api/v1/repos/{}/{}/pulls?state=open&limit=50",
+        harness.fixture.owner, harness.repo_name
+    ))?;
+    let pulls = pulls
+        .as_array()
+        .ok_or_else(|| anyhow!("pulls list response was not an array"))?;
+    let pr = pulls
+        .iter()
+        .find(|pr| {
+            pr.get("title")
+                .and_then(Value::as_str)
+                .is_some_and(|t| t == "orchd pr smoke")
+        })
+        .ok_or_else(|| anyhow!("expected a PR titled 'orchd pr smoke'"))?;
+
+    let head_ref = pr
+        .get("head")
+        .and_then(Value::as_object)
+        .and_then(|head| head.get("ref"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("PR JSON missing head.ref"))?;
+    let base_ref = pr
+        .get("base")
+        .and_then(Value::as_object)
+        .and_then(|base| base.get("ref"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("PR JSON missing base.ref"))?;
+    if base_ref != "main" {
+        bail!("expected base branch main, got {base_ref}");
+    }
+
+    let _ = git_bare_output_checked(
+        &git.bare_repo,
+        &["show-ref", "--verify", &format!("refs/heads/{head_ref}")],
+        "git --git-dir show-ref --verify refs/heads/<head>",
+    )?;
+
+    Ok(())
+}
+
+#[test]
+#[serial(live_forgejo)]
+fn live_orchd_impl_serializes_queue_per_repo() -> Result<()> {
+    if !live_tests_enabled() {
+        eprintln!(
+            "skipping live orchd integration test; enable with {}=1",
+            LIVE_TESTS_ENV
+        );
+        return Ok(());
+    }
+
+    let harness = LiveHarness::bootstrap("live_orchd_impl_serializes_queue_per_repo")?;
+    let issue1 = harness.create_issue("orchd impl a", "issue body", "ready")?;
+    let issue2 = harness.create_issue("orchd impl b", "issue body", "ready")?;
+
+    let git = GitWorkspace::from_fixture(&harness.fixture, &harness.repo_name)?;
+    let before_count = git.bare_commit_count_main()?;
+
+    let fake_codex = ensure_fake_codex_bin()?;
+    let forgejoctl = forgejo_agent_bin()?;
+
+    let dispatch_cfg_path = harness.fixture.work_path.join("orchd-dispatch-queue.toml");
+    write_orchd_dispatch_toml(
+        &dispatch_cfg_path,
+        OrchdDispatchTomlInputs {
+            actor: harness.fixture.owner.as_str(),
+            workdir: &git.checkout,
+            codex_bin: &fake_codex,
+            token_file: &harness.token_path,
+            forgejoctl: &forgejoctl,
+            directives: &[OrchdTestDirective::Impl],
+            timeout_sec: 60,
+        },
+    )?;
+
+    let db_path = harness.fixture.work_path.join("orchd-queue.sqlite");
+    let orchd_stdout = harness.fixture.work_path.join("orchd-queue-stdout.log");
+    let orchd_stderr = harness.fixture.work_path.join("orchd-queue-stderr.log");
+    let port = pick_unused_port().ok_or_else(|| anyhow!("failed to pick unused port"))?;
+
+    let orchd = OrchdTestProcess::spawn(OrchdSpawnInputs {
+        listen_port: port,
+        db_path: &db_path,
+        repo_ref: &harness.repo_ref,
+        dispatch_cfg_path: &dispatch_cfg_path,
+        config_path: &harness.config_path,
+        token_path: &harness.token_path,
+        stdout_path: &orchd_stdout,
+        stderr_path: &orchd_stderr,
+        env: &[
+            ("FAKE_CODEX_MODE", "git_append_commit"),
+            ("FAKE_CODEX_GIT_FILE", "orchd-itest.txt"),
+            ("FAKE_CODEX_SLEEP_MS", "1500"),
+        ],
+    })?;
+
+    post_orchd_issue_comment_webhook(
+        &orchd.client,
+        &orchd.base_url,
+        &harness.repo_ref,
+        issue1,
+        harness.fixture.owner.as_str(),
+        "@codex-orch impl",
+    )?;
+
+    let _ = wait_for_issue_label(
+        &harness,
+        issue1,
+        "orchd/state/running",
+        Duration::from_secs(30),
+    )?;
+
+    post_orchd_issue_comment_webhook(
+        &orchd.client,
+        &orchd.base_url,
+        &harness.repo_ref,
+        issue2,
+        harness.fixture.owner.as_str(),
+        "@codex-orch impl",
+    )?;
+
+    let _ = wait_for_issue_label(
+        &harness,
+        issue2,
+        "orchd/state/queued",
+        Duration::from_secs(30),
+    )?;
+
+    // Ensure issue2 does not start running until issue1 completes.
+    let issue1_deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        let issue = harness.get_issue(issue_number)?;
-        if issue_has_label(&issue, "orchd/state/completed")? {
+        let a = harness.get_issue(issue1)?;
+        if issue_has_label(&a, "orchd/state/completed")? {
             break;
         }
-        if Instant::now() > poll_deadline {
-            bail!(
-                "orchd dispatch did not complete; issue={} labels={:?}",
-                issue_ref,
-                issue_label_names(&issue)?
-            );
+
+        let b = harness.get_issue(issue2)?;
+        if issue_has_label(&b, "orchd/state/running")? {
+            bail!("expected queued impl to not run until prior impl completed");
         }
-        thread::sleep(Duration::from_millis(250));
+
+        if Instant::now() >= issue1_deadline {
+            bail!("timed out waiting for issue1 dispatch to complete");
+        }
+
+        thread::sleep(Duration::from_millis(200));
+    }
+
+    let _ = wait_for_issue_label(
+        &harness,
+        issue2,
+        "orchd/state/completed",
+        Duration::from_secs(90),
+    )?;
+
+    let after_count = git.bare_commit_count_main()?;
+    if after_count != before_count + 2 {
+        bail!(
+            "expected two queued impl runs to autoland two commits ({before_count} -> {after_count})"
+        );
     }
 
     Ok(())
