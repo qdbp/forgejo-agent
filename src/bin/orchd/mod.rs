@@ -31,6 +31,9 @@ mod webhook;
 // SQLite schema + queries + dispatch state transitions. Read when changing locking, queues, or persistence.
 mod db;
 
+// Dispatch pipeline (plan/materialize/launch) + stale-dispatch healing. Read when changing orchestration semantics.
+mod dispatch;
+
 // Repo/worktree management + git plumbing (with token injection). Read when touching checkouts, worktrees, or locks.
 mod repo;
 
