@@ -842,3 +842,61 @@ pub(super) async fn dispatch_issue(
     );
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use chrono::{Duration as ChronoDuration, Utc};
+
+    use super::db;
+
+    fn inflight_dispatch(
+        status: &str,
+        started_at: String,
+        tmux_session: Option<&str>,
+    ) -> db::InflightDispatch {
+        db::InflightDispatch {
+            id: 1,
+            status: status.to_string(),
+            started_at,
+            backend_kind: Some("tmux".to_string()),
+            backend_ref: Some("codex-orch:rmain-orchd-debug-i1".to_string()),
+            tmux_session: tmux_session.map(str::to_string),
+            tmux_window: None,
+            lock_path: None,
+        }
+    }
+
+    #[test]
+    fn starting_dispatch_is_not_stale_within_grace_period() {
+        let started_at = (Utc::now() - ChronoDuration::seconds(5)).to_rfc3339();
+        let dispatch = inflight_dispatch("starting", started_at, None);
+        assert!(!super::is_stale_starting_dispatch(
+            &dispatch,
+            "main/orchd-debug",
+            1
+        ));
+    }
+
+    #[test]
+    fn starting_dispatch_with_invalid_timestamp_is_stale() {
+        let dispatch = inflight_dispatch("starting", "invalid-timestamp".to_string(), None);
+        assert!(super::is_stale_starting_dispatch(
+            &dispatch,
+            "main/orchd-debug",
+            1
+        ));
+    }
+
+    #[test]
+    fn starting_dispatch_without_tmux_session_is_stale_after_grace_period() {
+        let started_at = (Utc::now()
+            - ChronoDuration::seconds(super::STARTING_DISPATCH_STALE_AFTER_SEC + 5))
+        .to_rfc3339();
+        let dispatch = inflight_dispatch("starting", started_at, None);
+        assert!(super::is_stale_starting_dispatch(
+            &dispatch,
+            "main/orchd-debug",
+            1
+        ));
+    }
+}

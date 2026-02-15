@@ -182,3 +182,51 @@ pub(super) fn extract_header(headers: &HeaderMap, names: &[&str]) -> Option<Stri
             .map(ToOwned::to_owned)
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::orchd::state::EventContext;
+
+    use super::{decide, parse_directive};
+
+    #[test]
+    fn owner_comment_without_directive_is_ignored() {
+        let context = EventContext {
+            repo_full_name: "main/orchd-debug".to_string(),
+            issue_number: Some(1),
+            actor_login: Some("main".to_string()),
+            text: Some("just checking in".to_string()),
+            source_comment_id: None,
+            source_created_at: None,
+        };
+        let decision = decide("issue_comment", Some(&context));
+        assert_eq!(decision.decision, "ignored");
+        assert_eq!(decision.reason_code, "no_directive");
+        assert!(!decision.would_dispatch);
+    }
+
+    #[test]
+    fn explicit_directive_is_still_accepted() {
+        let context = EventContext {
+            repo_full_name: "main/orchd-debug".to_string(),
+            issue_number: Some(1),
+            actor_login: Some("main".to_string()),
+            text: Some("@codex-orch poke".to_string()),
+            source_comment_id: None,
+            source_created_at: None,
+        };
+        let decision = decide("issue_comment", Some(&context));
+        assert_eq!(decision.decision, "accepted");
+        assert_eq!(decision.reason_code, "explicit_directive");
+        assert_eq!(decision.directive.as_deref(), Some("poke"));
+        assert_eq!(decision.target_role.as_deref(), Some("codex-orch"));
+        assert!(decision.would_dispatch);
+    }
+
+    #[test]
+    fn codex_alias_maps_to_orch_role() {
+        let parsed = parse_directive("@codex poke").expect("directive should parse");
+        assert_eq!(parsed.role, "codex-orch");
+        assert_eq!(parsed.directive, "poke");
+    }
+}

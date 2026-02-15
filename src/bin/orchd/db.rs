@@ -1046,3 +1046,206 @@ pub(super) fn queued_impl_decisions(db_path: &Path, limit: u32) -> Result<Vec<Qu
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    use chrono::Utc;
+    use forgejo_agent::orchd_dispatch_core::DispatchState;
+    use rusqlite::params;
+
+    fn temp_db_path(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock drift")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "forgejo-agent-{label}-{}-{nanos}.sqlite",
+            std::process::id()
+        ))
+    }
+
+    fn reserve_sample_dispatch(
+        db_path: &Path,
+        decision_id: i64,
+        issue_number: u64,
+        directive: &str,
+    ) -> super::DispatchReservation {
+        let started_at = Utc::now().to_rfc3339();
+        super::reserve_dispatch_starting(
+            db_path,
+            super::DispatchInsert {
+                decision_id,
+                repo_full_name: "main/orchd-debug",
+                issue_number,
+                actor_login: Some("main"),
+                directive,
+                target_role: "codex-orch",
+                started_at: &started_at,
+            },
+        )
+        .expect("reserve dispatch")
+    }
+
+    fn seed_decision_id(db_path: &Path) -> i64 {
+        let conn = super::open_db(db_path).expect("open db");
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            r"
+            INSERT INTO events (delivery_id, event_type, repo_full_name, issue_number, action, actor_login, raw_json, received_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            ",
+            params![
+                format!("test-delivery-{}", Utc::now().timestamp_nanos_opt().unwrap_or(0)),
+                "issue_comment",
+                "main/orchd-debug",
+                7_i64,
+                "created",
+                "main",
+                "{}",
+                now
+            ],
+        )
+        .expect("insert event");
+        let event_id = conn.last_insert_rowid();
+        conn.execute(
+            r"
+            INSERT INTO decisions
+            (event_id, repo_full_name, issue_number, actor_login, directive, target_role, decision, reason_code, would_dispatch, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            ",
+            params![
+                event_id,
+                "main/orchd-debug",
+                7_i64,
+                "main",
+                "poke",
+                "codex-orch",
+                "accepted",
+                "explicit_directive",
+                1_i64,
+                Utc::now().to_rfc3339(),
+            ],
+        )
+        .expect("insert decision");
+        conn.last_insert_rowid()
+    }
+
+    fn dispatch_event_kinds(db_path: &Path, dispatch_id: i64) -> Vec<String> {
+        let conn = super::open_db(db_path).expect("open db for event scan");
+        let mut stmt = conn
+            .prepare(
+                "SELECT event_kind FROM dispatch_events WHERE dispatch_id = ?1 ORDER BY id ASC",
+            )
+            .expect("prepare event query");
+        stmt.query_map(params![dispatch_id], |row| row.get::<_, String>(0))
+            .expect("query event rows")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect event rows")
+    }
+
+    #[test]
+    fn reserve_dispatch_blocks_second_inflight_for_issue() {
+        let db_path = temp_db_path("dispatch-reserve");
+        super::init_db(&db_path).expect("db init");
+        let first_decision_id = seed_decision_id(&db_path);
+        let second_decision_id = seed_decision_id(&db_path);
+
+        let first = reserve_sample_dispatch(&db_path, first_decision_id, 7, "poke");
+        let first_id = match first {
+            super::DispatchReservation::Started(id) => id,
+            super::DispatchReservation::InFlightIssue(_)
+            | super::DispatchReservation::InFlightRepo(_) => {
+                panic!("expected first reservation to start")
+            }
+        };
+        assert_eq!(
+            dispatch_event_kinds(&db_path, first_id),
+            vec!["mark_starting".to_string()]
+        );
+
+        let second = reserve_sample_dispatch(&db_path, second_decision_id, 7, "poke");
+        match second {
+            super::DispatchReservation::InFlightIssue(id) => assert_eq!(id, first_id),
+            super::DispatchReservation::Started(_) => {
+                panic!("expected second reservation to be blocked")
+            }
+            super::DispatchReservation::InFlightRepo(_) => {
+                panic!("expected issue-level inflight, not repo-level inflight")
+            }
+        }
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn reserve_dispatch_blocks_second_inflight_impl_for_repo() {
+        let db_path = temp_db_path("dispatch-reserve-repo");
+        super::init_db(&db_path).expect("db init");
+        let first_decision_id = seed_decision_id(&db_path);
+        let second_decision_id = seed_decision_id(&db_path);
+
+        let first = reserve_sample_dispatch(&db_path, first_decision_id, 7, "impl");
+        let first_id = match first {
+            super::DispatchReservation::Started(id) => id,
+            super::DispatchReservation::InFlightIssue(_)
+            | super::DispatchReservation::InFlightRepo(_) => {
+                panic!("expected first reservation to start")
+            }
+        };
+
+        let second = reserve_sample_dispatch(&db_path, second_decision_id, 8, "impl");
+        match second {
+            super::DispatchReservation::InFlightRepo(id) => assert_eq!(id, first_id),
+            super::DispatchReservation::Started(_) => {
+                panic!("expected repo-level inflight block")
+            }
+            super::DispatchReservation::InFlightIssue(_) => {
+                panic!("expected repo-level inflight, not issue-level inflight")
+            }
+        }
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn stale_autoheal_records_heal_event() {
+        let db_path = temp_db_path("dispatch-autoheal");
+        super::init_db(&db_path).expect("db init");
+        let decision_id = seed_decision_id(&db_path);
+        let started_id = match reserve_sample_dispatch(&db_path, decision_id, 9, "poke") {
+            super::DispatchReservation::Started(id) => id,
+            super::DispatchReservation::InFlightIssue(_)
+            | super::DispatchReservation::InFlightRepo(_) => {
+                panic!("expected started dispatch")
+            }
+        };
+        super::mark_dispatch_failed_runtime(
+            &db_path,
+            started_id,
+            "stale_dispatch_autohealed",
+            "stale dispatch test",
+        )
+        .expect("autoheal should succeed");
+
+        let kinds = dispatch_event_kinds(&db_path, started_id);
+        assert_eq!(
+            kinds,
+            vec!["mark_starting".to_string(), "heal_stale".to_string()]
+        );
+
+        let conn = super::open_db(&db_path).expect("open db");
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM dispatches WHERE id = ?1",
+                params![started_id],
+                |row| row.get(0),
+            )
+            .expect("fetch status");
+        assert_eq!(status, DispatchState::FailedRuntime.as_db_str());
+
+        let _ = fs::remove_file(db_path);
+    }
+}
