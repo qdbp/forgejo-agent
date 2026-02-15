@@ -231,14 +231,14 @@ cd "$WORKDIR"
 
 run_codex_fresh() {{
   cat "$PROMPT_FILE" \
-    | timeout --preserve-status "$TIMEOUT_SEC" "$CODEX_BIN" "$CODEX_ROLE_ARG" --sandbox "$CODEX_SANDBOX" --cd "$WORKDIR" --no-alt-screen exec --skip-git-repo-check -o "$LAST_MESSAGE_FILE" - \
+    | timeout --preserve-status "$TIMEOUT_SEC" "$CODEX_BIN" "$CODEX_ROLE_ARG" --sandbox "$CODEX_SANDBOX" --cd "$WORKDIR" --no-alt-screen exec -o "$LAST_MESSAGE_FILE" - \
       2>&1 | tee -a "$CODEX_LOG_FILE"
 }}
 
 set +e
 if [[ -n "$ISSUE_SESSION_ID" ]]; then
   cat "$PROMPT_FILE" \
-    | timeout --preserve-status "$TIMEOUT_SEC" "$CODEX_BIN" "$CODEX_ROLE_ARG" --sandbox "$CODEX_SANDBOX" --cd "$WORKDIR" --no-alt-screen exec -o "$LAST_MESSAGE_FILE" resume --skip-git-repo-check "$ISSUE_SESSION_ID" - \
+    | timeout --preserve-status "$TIMEOUT_SEC" "$CODEX_BIN" "$CODEX_ROLE_ARG" --sandbox "$CODEX_SANDBOX" --cd "$WORKDIR" --no-alt-screen exec -o "$LAST_MESSAGE_FILE" resume "$ISSUE_SESSION_ID" - \
       2>&1 | tee -a "$CODEX_LOG_FILE"
   exit_code=$?
   if [[ "$exit_code" -ne 0 && "$exit_code" -ne 124 ]]; then
@@ -420,7 +420,7 @@ run_codex_fresh() {{
   echo
   echo "user"
   cat "$PROMPT_FILE" \
-    | timeout --preserve-status "$TIMEOUT_SEC" "$CODEX_BIN" "$CODEX_ROLE_ARG" --sandbox "$CODEX_SANDBOX" --cd "$WORKDIR" tui --skip-git-repo-check --bootstrap-file "$BOOTSTRAP_PROMPT_FILE" --prompt-file "$PROMPT_FILE" --session-jsonl "$SESSION_JSONL_FILE" -o "$LAST_MESSAGE_FILE" \
+    | timeout --preserve-status "$TIMEOUT_SEC" "$CODEX_BIN" "$CODEX_ROLE_ARG" --sandbox "$CODEX_SANDBOX" --cd "$WORKDIR" tui --bootstrap-file "$BOOTSTRAP_PROMPT_FILE" --prompt-file "$PROMPT_FILE" --session-jsonl "$SESSION_JSONL_FILE" -o "$LAST_MESSAGE_FILE" \
       2>&1 | tee -a "$CODEX_LOG_FILE"
 }}
 
@@ -431,7 +431,7 @@ if [[ -n "$ISSUE_SESSION_ID" ]]; then
   echo
   echo "user"
   cat "$PROMPT_FILE" \
-    | timeout --preserve-status "$TIMEOUT_SEC" "$CODEX_BIN" "$CODEX_ROLE_ARG" --sandbox "$CODEX_SANDBOX" --cd "$WORKDIR" tui resume --skip-git-repo-check "$ISSUE_SESSION_ID" --bootstrap-file "$BOOTSTRAP_PROMPT_FILE" --prompt-file "$PROMPT_FILE" --session-jsonl "$SESSION_JSONL_FILE" -o "$LAST_MESSAGE_FILE" \
+    | timeout --preserve-status "$TIMEOUT_SEC" "$CODEX_BIN" "$CODEX_ROLE_ARG" --sandbox "$CODEX_SANDBOX" --cd "$WORKDIR" tui resume "$ISSUE_SESSION_ID" --bootstrap-file "$BOOTSTRAP_PROMPT_FILE" --prompt-file "$PROMPT_FILE" --session-jsonl "$SESSION_JSONL_FILE" -o "$LAST_MESSAGE_FILE" \
       2>&1 | tee -a "$CODEX_LOG_FILE"
   exit_code=$?
   if [[ "$exit_code" -ne 0 && "$exit_code" -ne 124 ]]; then
