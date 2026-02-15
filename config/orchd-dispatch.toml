@@ -10,7 +10,6 @@ remain_on_exit = true
 codex_bin = "/home/main/forgejo-agent/bin/codex-role"
 codex_role_arg = "orch"
 token_file = "/home/main/.config/forgejo-agent/creds/codex-orch.token"
-workdir = "/home/main/forgejo-agent"
 
 [prompt_envelopes]
 fresh_envelope_file = "../prompts/orchd-envelope-fresh.md"

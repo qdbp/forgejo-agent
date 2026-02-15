@@ -77,6 +77,23 @@ struct CreatePullRequestBody<'a> {
     body: Option<&'a str>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct HookConfig<'a> {
+    url: &'a str,
+    content_type: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    secret: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CreateHookBody<'a> {
+    #[serde(rename = "type")]
+    kind: &'a str,
+    config: HookConfig<'a>,
+    events: Vec<&'a str>,
+    active: bool,
+}
+
 impl ForgejoClient {
     pub fn new(cfg: &AgentConfig) -> Result<Self> {
         let http = Client::builder()
@@ -183,6 +200,35 @@ impl ForgejoClient {
 
     pub fn whoami(&self, cfg: &AgentConfig) -> Result<serde_json::Value> {
         self.send_json(cfg, &Method::GET, "/api/v1/user", Option::<&()>::None)
+    }
+
+    pub fn list_admin_hooks(&self, cfg: &AgentConfig) -> Result<Vec<Value>> {
+        self.send_json(
+            cfg,
+            &Method::GET,
+            "/api/v1/admin/hooks",
+            Option::<&()>::None,
+        )
+    }
+
+    pub fn create_admin_hook(
+        &self,
+        cfg: &AgentConfig,
+        url: &str,
+        secret: Option<&str>,
+        events: &[&str],
+    ) -> Result<Value> {
+        let payload = CreateHookBody {
+            kind: "gitea",
+            config: HookConfig {
+                url,
+                content_type: "json",
+                secret,
+            },
+            events: events.to_vec(),
+            active: true,
+        };
+        self.send_json(cfg, &Method::POST, "/api/v1/admin/hooks", Some(&payload))
     }
 
     pub fn create_pull_request(

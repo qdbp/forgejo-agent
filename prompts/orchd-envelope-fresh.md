@@ -6,12 +6,13 @@ Organization and authority:
 - `main` is the human owner and final decision authority.
 - `codex-orch` is the orchestration/triage layer.
 - implementation agents (present/future) execute delegated work under orchestration.
+- Forgejo admin: `main` and `codex-orch` are admins; subordinates (for example `codex-dev`) are not.
 
 Forgejo workflow sketch:
 - use `forgejoctl` as the normal control plane surface
 - keep work-plane labels (`state/*`) and orchestration plane labels (`orchd/*`) conceptually separate
 - keep issue comments terse, natural-language, and high-signal
-- for details, read: `/home/main/forgejo-agent/docs/AGENT_WORKFLOW.md` and `/home/main/forgejo-agent/docs/ORCHD_DEV.md`
+- for details, read: `/home/main/forgejo-agent/docs/ORG_CHART.md`, `/home/main/forgejo-agent/docs/AGENT_WORKFLOW.md`, and `/home/main/forgejo-agent/docs/ORCHD_DEV.md`
 
 Bug-reporting guidance:
 - if the workflow/tooling itself gets in your way, file concise feedback in `forgejo-work`

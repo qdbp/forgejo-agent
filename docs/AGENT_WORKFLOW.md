@@ -2,7 +2,9 @@
 
 ## Core invariants
 
-- Every work issue must include target local repo path and acceptance checks.
+- Every work issue must include acceptance checks.
+- Prefer filing issues in the repo that will be modified (orchd maps repo -> local checkout automatically).
+- For cross-repo/system issues (for example `main/forgejo-work`), explicitly name the target repo(s).
 - If blocked, agent must transition the issue to `state/blocked` and post a terse natural-language unblock comment.
 - Agents must claim before editing, then release or close when done.
 - Branches and commits must reference issue ID.
@@ -65,11 +67,15 @@ Use one of these on its own line in an issue body/comment:
 
 - `@codex-orch design` (or `codex-orch design`)
 - `@codex-orch impl` (or `codex-orch impl`)
+- `@codex-orch pr` (or `codex-orch pr`)
+- `@codex-orch poke` (or `codex-orch poke`)
 
 Current semantics:
 
 - `design`: produce high-level design/spec response and drive state toward `spec`.
-- `impl`: execute implementation loop; claim, implement, verify, and transition toward `review` (optionally open blocker issue when warranted).
+- `impl`: execute implementation loop and autoland to `main` on success.
+- `pr`: execute implementation loop and open a PR on success (no autoland).
+- `poke`: conversational “status/next action” response (read-only).
 
 ## Traceability
 

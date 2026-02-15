@@ -201,8 +201,8 @@ struct DispatchPromptEnvelopeConfig {
 struct DispatchRoleConfig {
     codex_bin: PathBuf,
     codex_role_arg: String,
+    forgejo_login: String,
     token_file: PathBuf,
-    workdir: PathBuf,
 }
 
 #[derive(Clone, Debug)]
@@ -250,8 +250,8 @@ struct DispatchRoleConfigFile {
     #[serde(default = "default_codex_bin")]
     codex_bin: String,
     codex_role_arg: Option<String>,
+    forgejo_login: Option<String>,
     token_file: String,
-    workdir: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -749,6 +749,7 @@ async fn run() -> Result<()> {
         run_dispatch_queue_loop(queue_state, cli.heartbeat_sec).await;
     });
 
+    let ensure_state = state.clone();
     let app = Router::new()
         .route("/healthz", get(healthz_handler))
         .route("/webhook", post(webhook_handler))
@@ -761,6 +762,31 @@ async fn run() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(listen_addr)
         .await
         .with_context(|| format!("failed to bind {listen_addr}"))?;
+    let webhook_url = {
+        let ip = listen_addr.ip();
+        let ip = if ip.is_unspecified() {
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        } else {
+            ip
+        };
+        format!("http://{}:{}/webhook", ip, listen_addr.port())
+    };
+    if let Err(err) = ensure_admin_webhook(&ensure_state, &webhook_url).await {
+        log_line(
+            "admin_webhook_ensure_failed",
+            json!({
+                "url": webhook_url,
+                "error": err.to_string(),
+            }),
+        );
+    } else {
+        log_line(
+            "admin_webhook_ensured",
+            json!({
+                "url": webhook_url,
+            }),
+        );
+    }
     log_line(
         "startup",
         json!({
@@ -800,6 +826,38 @@ async fn shutdown_signal() {
 
 async fn healthz_handler() -> Json<HealthEnvelope> {
     Json(HealthEnvelope { status: "ok" })
+}
+
+async fn ensure_admin_webhook(state: &AppState, webhook_url: &str) -> Result<()> {
+    let cfg = state.cfg.clone();
+    let secret = state
+        .webhook_secret
+        .as_ref()
+        .map(|bytes| String::from_utf8_lossy(bytes).to_string());
+    let webhook_url = webhook_url.to_string();
+    tokio::task::spawn_blocking(move || {
+        let api = ForgejoClient::new(&cfg)?;
+        let hooks = api.list_admin_hooks(&cfg)?;
+        let exists = hooks.iter().any(|hook| {
+            hook.get("config")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|cfg| cfg.get("url"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|url| url == webhook_url)
+        });
+        if exists {
+            return Ok(());
+        }
+        let _ = api.create_admin_hook(
+            &cfg,
+            &webhook_url,
+            secret.as_deref(),
+            &["issues", "issue_comment"],
+        )?;
+        Ok(())
+    })
+    .await
+    .context("admin hook ensure join failure")?
 }
 
 async fn webhook_handler(
@@ -877,6 +935,7 @@ async fn process_webhook(
             duplicate: true,
         });
     };
+    let _ = upsert_repo_seen(&state.db_path, &record.repo_full_name);
 
     let decision = decide(&event_type, context.as_ref());
     let decision_id = insert_decision(&state.db_path, event_id, &record, &decision)?;
@@ -1384,6 +1443,7 @@ fn load_dispatch_config(path: &Path) -> Result<DispatchConfig> {
 
     let mut roles = HashMap::new();
     for (role_name, role) in raw.roles {
+        let forgejo_login = role.forgejo_login.unwrap_or_else(|| role_name.clone());
         let codex_role_arg = role.codex_role_arg.unwrap_or_else(|| {
             role_name
                 .strip_prefix("codex-")
@@ -1395,8 +1455,8 @@ fn load_dispatch_config(path: &Path) -> Result<DispatchConfig> {
             DispatchRoleConfig {
                 codex_bin: resolve_config_path(&base_dir, &role.codex_bin)?,
                 codex_role_arg,
+                forgejo_login,
                 token_file: resolve_config_path(&base_dir, &role.token_file)?,
-                workdir: resolve_config_path(&base_dir, &role.workdir)?,
             },
         );
     }
@@ -1539,6 +1599,8 @@ fn git_run_checked(repo_root: &Path, args: &[&str]) -> Result<(), DispatchError>
 }
 
 fn create_dispatch_worktree(
+    db_path: &Path,
+    token_file: &Path,
     repo_root: &Path,
     worktree_dir: &Path,
     branch: &str,
@@ -1558,7 +1620,12 @@ fn create_dispatch_worktree(
             repo_root.display()
         )));
     }
-    git_run_checked(repo_root, &["fetch", remote, base_branch])?;
+    let _ = git_checked_with_token(
+        db_path,
+        token_file,
+        Some(repo_root),
+        &["fetch", remote, base_branch],
+    )?;
     let base_ref = format!("{remote}/{base_branch}");
     git_run_checked(
         repo_root,
@@ -1613,6 +1680,188 @@ fn run_root(db_path: &Path) -> Result<PathBuf, DispatchError> {
         ))
     })?;
     Ok(root)
+}
+
+fn repo_store_root(db_path: &Path) -> Result<PathBuf, DispatchError> {
+    let root = db_path
+        .parent()
+        .map(PathBuf::from)
+        .ok_or_else(|| DispatchError::Io("db path has no parent".to_string()))?
+        .join("repos");
+    fs::create_dir_all(&root).map_err(|err| {
+        DispatchError::Io(format!(
+            "failed to create repo store dir {}: {err}",
+            root.display()
+        ))
+    })?;
+    Ok(root)
+}
+
+fn repo_checkout_root(
+    db_path: &Path,
+    role: &DispatchRoleConfig,
+    repo: &RepoRef,
+) -> Result<PathBuf, DispatchError> {
+    Ok(repo_store_root(db_path)?
+        .join(&role.forgejo_login)
+        .join(&repo.owner)
+        .join(&repo.repo))
+}
+
+fn git_askpass_script_path(db_path: &Path) -> Result<PathBuf, DispatchError> {
+    Ok(db_path
+        .parent()
+        .map(PathBuf::from)
+        .ok_or_else(|| DispatchError::Io("db path has no parent".to_string()))?
+        .join("git-askpass.sh"))
+}
+
+fn ensure_git_askpass_script(db_path: &Path) -> Result<PathBuf, DispatchError> {
+    let path = git_askpass_script_path(db_path)?;
+    if path.is_file() {
+        return Ok(path);
+    }
+    let contents = r#"#!/bin/sh
+set -eu
+cat "${ORCHD_GIT_TOKEN_FILE:?missing ORCHD_GIT_TOKEN_FILE}"
+"#;
+    fs::write(&path, contents).map_err(|err| {
+        DispatchError::Io(format!(
+            "failed writing git askpass helper {}: {err}",
+            path.display()
+        ))
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut perms = fs::metadata(&path)
+            .map_err(|err| {
+                DispatchError::Io(format!(
+                    "failed stat git askpass helper {}: {err}",
+                    path.display()
+                ))
+            })?
+            .permissions();
+        perms.set_mode(0o700);
+        fs::set_permissions(&path, perms).map_err(|err| {
+            DispatchError::Io(format!(
+                "failed chmod git askpass helper {}: {err}",
+                path.display()
+            ))
+        })?;
+    }
+    Ok(path)
+}
+
+fn git_output_with_token(
+    db_path: &Path,
+    token_file: &Path,
+    workdir: Option<&Path>,
+    args: &[&str],
+) -> Result<std::process::Output, DispatchError> {
+    let askpass = ensure_git_askpass_script(db_path)?;
+    let mut cmd = Command::new("git");
+    if let Some(workdir) = workdir {
+        cmd.arg("-C").arg(workdir);
+    }
+    cmd.args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", &askpass)
+        .env("ORCHD_GIT_TOKEN_FILE", token_file);
+    cmd.output()
+        .map_err(|err| DispatchError::Io(format!("failed to invoke git: {err}")))
+}
+
+fn git_checked_with_token(
+    db_path: &Path,
+    token_file: &Path,
+    workdir: Option<&Path>,
+    args: &[&str],
+) -> Result<std::process::Output, DispatchError> {
+    let output = git_output_with_token(db_path, token_file, workdir, args)?;
+    if output.status.success() {
+        return Ok(output);
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let cwd = workdir
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<none>".to_string());
+    Err(DispatchError::Io(format!(
+        "git failed (cwd={cwd}) args={args:?} status={:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status.code()
+    )))
+}
+
+fn forgejo_http_git_url(
+    base_url: &url::Url,
+    username: &str,
+    repo_full_name: &str,
+) -> Result<String, DispatchError> {
+    let repo = RepoRef::parse(repo_full_name)
+        .map_err(|_| DispatchError::InvalidIssueRef(repo_full_name.to_string()))?;
+    let mut url = base_url.clone();
+    url.set_username(username).map_err(|()| {
+        DispatchError::Io(format!("failed setting username '{username}' in git URL"))
+    })?;
+    let base_path = url.path().trim_end_matches('/');
+    let new_path = if base_path.is_empty() {
+        format!("/{}/{}.git", repo.owner, repo.repo)
+    } else {
+        format!("{base_path}/{}/{}.git", repo.owner, repo.repo)
+    };
+    url.set_path(&new_path);
+    Ok(url.to_string())
+}
+
+fn ensure_repo_checkout(
+    state: &AppState,
+    role: &DispatchRoleConfig,
+    repo_full_name: &str,
+) -> Result<PathBuf, DispatchError> {
+    let repo = RepoRef::parse(repo_full_name)
+        .map_err(|_| DispatchError::InvalidIssueRef(repo_full_name.to_string()))?;
+    let checkout = repo_checkout_root(&state.db_path, role, &repo)?;
+    let git_dir = checkout.join(".git");
+    if git_dir.is_dir() {
+        let _ = git_checked_with_token(
+            &state.db_path,
+            &role.token_file,
+            Some(&checkout),
+            &["fetch", DEFAULT_GIT_REMOTE, DEFAULT_GIT_BASE_BRANCH],
+        );
+        let _ = update_repo_local_path(&state.db_path, repo_full_name, &checkout);
+        return Ok(checkout);
+    }
+    if checkout.exists() {
+        return Err(DispatchError::Io(format!(
+            "repo checkout path exists but is not a git repo: {}",
+            checkout.display()
+        )));
+    }
+    if let Some(parent) = checkout.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            DispatchError::Io(format!(
+                "failed to create repo checkout parent dir {}: {err}",
+                parent.display()
+            ))
+        })?;
+    }
+    let url = forgejo_http_git_url(&state.cfg.base_url, &role.forgejo_login, repo_full_name)?;
+    git_checked_with_token(
+        &state.db_path,
+        &role.token_file,
+        None,
+        &[
+            "clone",
+            "--origin",
+            DEFAULT_GIT_REMOTE,
+            &url,
+            &checkout.to_string_lossy(),
+        ],
+    )?;
+    let _ = update_repo_local_path(&state.db_path, repo_full_name, &checkout);
+    Ok(checkout)
 }
 
 fn acquire_repo_lock(db_path: &Path, repo_full_name: &str) -> Result<PathBuf, DispatchError> {
@@ -2399,6 +2648,47 @@ async fn plan_dispatch(
     let issue_body = issue.body.unwrap_or_default();
     let issue_url = issue.html_url;
 
+    let base_repo_checkout = ensure_repo_checkout(state, &role, &intent.repo_full_name)?;
+    if repo_labels_ensured_at(&state.db_path, &intent.repo_full_name)
+        .unwrap_or(None)
+        .is_none()
+    {
+        let repo_full_name = intent.repo_full_name.clone();
+        let forgejoctl_bin = dispatch_config.forgejoctl_bin.clone();
+        let config_file = state.forgejo_config_file.clone();
+        let token_file = role.token_file.clone();
+        let ensure_outcome = tokio::task::spawn_blocking(move || {
+            run_forgejoctl(
+                &forgejoctl_bin,
+                config_file.as_deref(),
+                &token_file,
+                &["repo", "ensure", &repo_full_name],
+            )
+        })
+        .await;
+        match ensure_outcome {
+            Ok(Ok(())) => {
+                let _ =
+                    update_repo_labels_ensured(&state.db_path, &intent.repo_full_name, true, None);
+            }
+            Ok(Err(err)) => {
+                let _ = update_repo_labels_ensured(
+                    &state.db_path,
+                    &intent.repo_full_name,
+                    false,
+                    Some(&err.to_string()),
+                );
+            }
+            Err(err) => {
+                let _ = update_repo_labels_ensured(
+                    &state.db_path,
+                    &intent.repo_full_name,
+                    false,
+                    Some(&format!("ensure join failure: {err}")),
+                );
+            }
+        }
+    }
     let (workdir, git_remote, git_base, git_branch) = if directive_uses_worktree(&intent.directive)
     {
         let git_remote = DEFAULT_GIT_REMOTE.to_string();
@@ -2410,11 +2700,19 @@ async fn plan_dispatch(
             directive_name,
         );
         let workdir = run_dir.join("worktree");
-        create_dispatch_worktree(&role.workdir, &workdir, &git_branch, &git_remote, &git_base)?;
+        create_dispatch_worktree(
+            &state.db_path,
+            &role.token_file,
+            &base_repo_checkout,
+            &workdir,
+            &git_branch,
+            &git_remote,
+            &git_base,
+        )?;
         (workdir, git_remote, git_base, git_branch)
     } else {
         (
-            role.workdir.clone(),
+            base_repo_checkout,
             DEFAULT_GIT_REMOTE.to_string(),
             DEFAULT_GIT_BASE_BRANCH.to_string(),
             String::new(),
@@ -2873,16 +3171,43 @@ fn git_stdout_trim(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-fn autoland_to_main(workdir: &Path, remote: &str, base_branch: &str) -> Result<String> {
+fn autoland_to_main(
+    db_path: &Path,
+    token_file: &Path,
+    workdir: &Path,
+    remote: &str,
+    base_branch: &str,
+) -> Result<String> {
     let head = git_stdout_trim(&git_checked(workdir, &["rev-parse", "--short", "HEAD"])?);
-    let _ = git_checked(workdir, &["fetch", remote, base_branch]);
-    git_checked(workdir, &["push", remote, &format!("HEAD:{base_branch}")])?;
+    let _ = git_checked_with_token(
+        db_path,
+        token_file,
+        Some(workdir),
+        &["fetch", remote, base_branch],
+    );
+    git_checked_with_token(
+        db_path,
+        token_file,
+        Some(workdir),
+        &["push", remote, &format!("HEAD:{base_branch}")],
+    )?;
     Ok(format!("autoland: pushed {head} -> {remote}/{base_branch}"))
 }
 
-fn push_branch(workdir: &Path, remote: &str, branch: &str) -> Result<String> {
+fn push_branch(
+    db_path: &Path,
+    token_file: &Path,
+    workdir: &Path,
+    remote: &str,
+    branch: &str,
+) -> Result<String> {
     let head = git_stdout_trim(&git_checked(workdir, &["rev-parse", "--short", "HEAD"])?);
-    git_checked(workdir, &["push", "-u", remote, &format!("HEAD:{branch}")])?;
+    git_checked_with_token(
+        db_path,
+        token_file,
+        Some(workdir),
+        &["push", "-u", remote, &format!("HEAD:{branch}")],
+    )?;
     Ok(format!("pushed branch: {head} -> {remote}/{branch}"))
 }
 
@@ -2965,7 +3290,13 @@ fn finalize_dispatch_command(args: FinalizeDispatchArgs) -> Result<()> {
     let mut landing_lines: Vec<String> = Vec::new();
     if status_spec.state_literal == DispatchState::Completed {
         match args.directive.as_str() {
-            "impl" => match autoland_to_main(&args.git_workdir, &args.git_remote, &args.git_base) {
+            "impl" => match autoland_to_main(
+                &args.db_path,
+                &args.token_file,
+                &args.git_workdir,
+                &args.git_remote,
+                &args.git_base,
+            ) {
                 Ok(line) => landing_lines.push(line),
                 Err(err) => {
                     landing_ok = false;
@@ -2977,7 +3308,13 @@ fn finalize_dispatch_command(args: FinalizeDispatchArgs) -> Result<()> {
                     landing_ok = false;
                     landing_lines.push("missing git branch; cannot create PR".to_string());
                 } else {
-                    match push_branch(&args.git_workdir, &args.git_remote, &args.git_branch) {
+                    match push_branch(
+                        &args.db_path,
+                        &args.token_file,
+                        &args.git_workdir,
+                        &args.git_remote,
+                        &args.git_branch,
+                    ) {
                         Ok(line) => landing_lines.push(line),
                         Err(err) => {
                             landing_ok = false;
@@ -3272,6 +3609,14 @@ fn init_db(db_path: &Path) -> Result<()> {
             updated_at TEXT NOT NULL,
             PRIMARY KEY (repo_full_name, issue_number, role_name)
         );
+        CREATE TABLE IF NOT EXISTS repos (
+            repo_full_name TEXT PRIMARY KEY,
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            labels_ensured_at TEXT,
+            local_path TEXT,
+            last_error TEXT
+        );
         ",
     )?;
     ensure_column_exists(&conn, "events", "event_text", "TEXT")?;
@@ -3308,6 +3653,68 @@ fn open_db(path: &Path) -> Result<Connection> {
     conn.busy_timeout(StdDuration::from_secs(5))?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
     Ok(conn)
+}
+
+fn upsert_repo_seen(db_path: &Path, repo_full_name: &str) -> Result<()> {
+    let conn = open_db(db_path)?;
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        r"
+        INSERT INTO repos (repo_full_name, first_seen_at, last_seen_at, labels_ensured_at, local_path, last_error)
+        VALUES (?1, ?2, ?3, NULL, NULL, NULL)
+        ON CONFLICT(repo_full_name) DO UPDATE SET last_seen_at = excluded.last_seen_at
+        ",
+        params![repo_full_name, now, now],
+    )?;
+    Ok(())
+}
+
+fn repo_labels_ensured_at(db_path: &Path, repo_full_name: &str) -> Result<Option<String>> {
+    let conn = open_db(db_path)?;
+    let row: Option<Option<String>> = conn
+        .query_row(
+            "SELECT labels_ensured_at FROM repos WHERE repo_full_name = ?1",
+            params![repo_full_name],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?;
+    Ok(row.flatten())
+}
+
+fn update_repo_labels_ensured(
+    db_path: &Path,
+    repo_full_name: &str,
+    ok: bool,
+    err: Option<&str>,
+) -> Result<()> {
+    let conn = open_db(db_path)?;
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        r"
+        UPDATE repos
+        SET labels_ensured_at = CASE WHEN ?2 THEN ?3 ELSE labels_ensured_at END,
+            last_error = ?4,
+            last_seen_at = ?3
+        WHERE repo_full_name = ?1
+        ",
+        params![repo_full_name, ok, now, err],
+    )?;
+    Ok(())
+}
+
+fn update_repo_local_path(db_path: &Path, repo_full_name: &str, local_path: &Path) -> Result<()> {
+    let conn = open_db(db_path)?;
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        r"
+        UPDATE repos
+        SET local_path = ?2,
+            last_seen_at = ?3
+        WHERE repo_full_name = ?1
+        ",
+        params![repo_full_name, local_path.to_string_lossy(), now],
+    )?;
+    Ok(())
 }
 
 fn insert_event(db_path: &Path, event: &EventRecord) -> Result<Option<i64>> {
