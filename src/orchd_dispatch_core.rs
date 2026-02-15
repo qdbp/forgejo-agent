@@ -8,6 +8,25 @@ pub enum DispatchBackendKind {
     Local,
 }
 
+impl DispatchBackendKind {
+    #[must_use]
+    pub const fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Tmux => "tmux",
+            Self::Local => "local",
+        }
+    }
+
+    #[must_use]
+    pub fn parse_db(value: &str) -> Option<Self> {
+        match value {
+            "tmux" => Some(Self::Tmux),
+            "local" => Some(Self::Local),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RunHandle {
     pub backend_kind: DispatchBackendKind,

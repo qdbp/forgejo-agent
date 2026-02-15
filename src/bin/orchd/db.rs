@@ -23,9 +23,9 @@ pub(super) enum DispatchReservation {
 #[derive(Debug)]
 pub(super) struct InflightDispatch {
     pub(super) id: i64,
-    pub(super) status: String,
+    pub(super) status: DispatchState,
     pub(super) started_at: String,
-    pub(super) backend_kind: Option<String>,
+    pub(super) backend_kind: Option<DispatchBackendKind>,
     pub(super) backend_ref: Option<String>,
     pub(super) tmux_session: Option<String>,
     pub(super) tmux_window: Option<String>,
@@ -677,10 +677,7 @@ pub(super) fn update_dispatch_running(
             plan.next_state.as_db_str(),
             tmux_session.as_deref(),
             tmux_window.as_deref(),
-            match run_handle.backend_kind {
-                DispatchBackendKind::Tmux => "tmux",
-                DispatchBackendKind::Local => "local",
-            },
+            run_handle.backend_kind.as_db_str(),
             run_handle.backend_ref.as_str(),
             run_dir.to_string_lossy(),
             lock_path.to_string_lossy(),
@@ -854,11 +851,26 @@ pub(super) fn latest_issue_inflight_dispatch(
                 running_status
             ],
             |row| {
+                let status: String = row.get(1)?;
+                let status = DispatchState::parse_db(&status).ok_or_else(|| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Text,
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("invalid dispatch status in db: {status}"),
+                        )),
+                    )
+                })?;
+                let backend_kind_raw: Option<String> = row.get(3)?;
+                let backend_kind = backend_kind_raw
+                    .as_deref()
+                    .and_then(DispatchBackendKind::parse_db);
                 Ok(InflightDispatch {
                     id: row.get(0)?,
-                    status: row.get(1)?,
+                    status,
                     started_at: row.get(2)?,
-                    backend_kind: row.get(3)?,
+                    backend_kind,
                     backend_ref: row.get(4)?,
                     tmux_session: row.get(5)?,
                     tmux_window: row.get(6)?,

@@ -202,13 +202,13 @@ fn probe_dispatch_liveness(
     repo_full_name: &str,
     issue_number: u64,
 ) -> Result<bool, DispatchError> {
-    match dispatch.backend_kind.as_deref().unwrap_or("tmux") {
-        "tmux" => TmuxBackendAdapter.probe(dispatch, repo_full_name, issue_number),
-        "local" => LocalBackendAdapter.probe(dispatch, repo_full_name, issue_number),
-        other => Err(DispatchError::Io(format!(
-            "unknown backend kind '{other}' on dispatch {}",
-            dispatch.id
-        ))),
+    match dispatch.backend_kind.unwrap_or(DispatchBackendKind::Tmux) {
+        DispatchBackendKind::Tmux => {
+            TmuxBackendAdapter.probe(dispatch, repo_full_name, issue_number)
+        }
+        DispatchBackendKind::Local => {
+            LocalBackendAdapter.probe(dispatch, repo_full_name, issue_number)
+        }
     }
 }
 
@@ -230,10 +230,10 @@ pub(super) fn is_stale_starting_dispatch(
     {
         return true;
     }
-    if dispatch.backend_kind.as_deref() == Some("local") && dispatch.backend_ref.is_none() {
+    if dispatch.backend_kind == Some(DispatchBackendKind::Local) && dispatch.backend_ref.is_none() {
         return true;
     }
-    if dispatch.backend_kind.as_deref().unwrap_or("tmux") == "tmux"
+    if dispatch.backend_kind.unwrap_or(DispatchBackendKind::Tmux) == DispatchBackendKind::Tmux
         && dispatch.tmux_session.is_none()
     {
         return true;
@@ -261,10 +261,7 @@ fn should_heal_dispatch_stale(
     repo_full_name: &str,
     issue_number: u64,
 ) -> bool {
-    let Some(dispatch_state) = DispatchState::parse_db(dispatch.status.as_str()) else {
-        return false;
-    };
-    match dispatch_state {
+    match dispatch.status {
         DispatchState::Running => {
             match probe_dispatch_liveness(dispatch, repo_full_name, issue_number) {
                 Ok(alive) => !alive,
@@ -847,18 +844,18 @@ pub(super) async fn dispatch_issue(
 mod tests {
     use chrono::{Duration as ChronoDuration, Utc};
 
-    use super::db;
+    use super::{DispatchBackendKind, DispatchState, db};
 
     fn inflight_dispatch(
-        status: &str,
+        status: DispatchState,
         started_at: String,
         tmux_session: Option<&str>,
     ) -> db::InflightDispatch {
         db::InflightDispatch {
             id: 1,
-            status: status.to_string(),
+            status,
             started_at,
-            backend_kind: Some("tmux".to_string()),
+            backend_kind: Some(DispatchBackendKind::Tmux),
             backend_ref: Some("codex-orch:rmain-orchd-debug-i1".to_string()),
             tmux_session: tmux_session.map(str::to_string),
             tmux_window: None,
@@ -869,7 +866,7 @@ mod tests {
     #[test]
     fn starting_dispatch_is_not_stale_within_grace_period() {
         let started_at = (Utc::now() - ChronoDuration::seconds(5)).to_rfc3339();
-        let dispatch = inflight_dispatch("starting", started_at, None);
+        let dispatch = inflight_dispatch(DispatchState::Starting, started_at, None);
         assert!(!super::is_stale_starting_dispatch(
             &dispatch,
             "main/orchd-debug",
@@ -879,7 +876,11 @@ mod tests {
 
     #[test]
     fn starting_dispatch_with_invalid_timestamp_is_stale() {
-        let dispatch = inflight_dispatch("starting", "invalid-timestamp".to_string(), None);
+        let dispatch = inflight_dispatch(
+            DispatchState::Starting,
+            "invalid-timestamp".to_string(),
+            None,
+        );
         assert!(super::is_stale_starting_dispatch(
             &dispatch,
             "main/orchd-debug",
@@ -892,7 +893,7 @@ mod tests {
         let started_at = (Utc::now()
             - ChronoDuration::seconds(super::STARTING_DISPATCH_STALE_AFTER_SEC + 5))
         .to_rfc3339();
-        let dispatch = inflight_dispatch("starting", started_at, None);
+        let dispatch = inflight_dispatch(DispatchState::Starting, started_at, None);
         assert!(super::is_stale_starting_dispatch(
             &dispatch,
             "main/orchd-debug",
