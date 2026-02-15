@@ -71,6 +71,7 @@ pub const ORCHD_CONTROL_LABELS: [(&str, &str, &str, bool); 2] = [
     ),
 ];
 
+#[must_use]
 pub const fn can_transition(from: Option<WorkflowState>, to: WorkflowState) -> bool {
     use WorkflowState as S;
     match from {

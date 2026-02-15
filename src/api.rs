@@ -3,6 +3,7 @@ use reqwest::Method;
 use reqwest::blocking::{Client, RequestBuilder};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde_json::Value;
 
 use crate::config::AgentConfig;
 use crate::types::{ApiIssue, ApiLabel, IssueRef, OpenState, RepoRef};
@@ -65,6 +66,15 @@ struct PatchIssueBody<'a> {
 #[derive(Debug, Clone, Serialize)]
 struct CommentBody<'a> {
     body: &'a str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CreatePullRequestBody<'a> {
+    title: &'a str,
+    head: &'a str,
+    base: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body: Option<&'a str>,
 }
 
 impl ForgejoClient {
@@ -173,6 +183,25 @@ impl ForgejoClient {
 
     pub fn whoami(&self, cfg: &AgentConfig) -> Result<serde_json::Value> {
         self.send_json(cfg, &Method::GET, "/api/v1/user", Option::<&()>::None)
+    }
+
+    pub fn create_pull_request(
+        &self,
+        cfg: &AgentConfig,
+        repo: &RepoRef,
+        title: &str,
+        head: &str,
+        base: &str,
+        body: &str,
+    ) -> Result<Value> {
+        let path = format!("/api/v1/repos/{}/{}/pulls", repo.owner, repo.repo);
+        let payload = CreatePullRequestBody {
+            title,
+            head,
+            base,
+            body: Some(body),
+        };
+        self.send_json(cfg, &Method::POST, &path, Some(&payload))
     }
 
     pub fn get_repo(&self, cfg: &AgentConfig, repo: &RepoRef) -> Result<Option<serde_json::Value>> {

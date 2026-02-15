@@ -1,16 +1,3 @@
-#[allow(dead_code)]
-#[path = "../api.rs"]
-mod api;
-#[allow(dead_code)]
-#[path = "../config.rs"]
-mod config;
-#[allow(dead_code)]
-#[path = "../orchd_dispatch_core.rs"]
-mod orchd_dispatch_core;
-#[allow(dead_code)]
-#[path = "../types.rs"]
-mod types;
-
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
@@ -42,13 +29,13 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
-use api::ForgejoClient;
-use config::AgentConfig;
-use orchd_dispatch_core::{
+use forgejo_agent::api::ForgejoClient;
+use forgejo_agent::config::AgentConfig;
+use forgejo_agent::orchd_dispatch_core::{
     DispatchBackendKind, DispatchEventKind, DispatchIntentV1, DispatchPolicyOutcome, DispatchState,
     PolicyDecision as DispatchPolicyDecision, RunHandle, reduce_dispatch_state,
 };
-use types::{ApiIssue, IssueRef, OrchdRuntimeState, RepoRef};
+use forgejo_agent::types::{ApiIssue, IssueRef, OrchdRuntimeState, RepoRef};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -124,6 +111,10 @@ struct FinalizeDispatchArgs {
     session_id: String,
     #[arg(long = "issue-ref")]
     issue_ref: IssueRef,
+    #[arg(long = "issue-title")]
+    issue_title: String,
+    #[arg(long = "issue-url")]
+    issue_url: String,
     #[arg(long)]
     directive: String,
     #[arg(long = "role-name")]
@@ -136,6 +127,14 @@ struct FinalizeDispatchArgs {
     log_file: PathBuf,
     #[arg(long = "completion-file")]
     completion_file: PathBuf,
+    #[arg(long = "git-workdir")]
+    git_workdir: PathBuf,
+    #[arg(long = "git-remote", default_value = "origin")]
+    git_remote: String,
+    #[arg(long = "git-base", default_value = "main")]
+    git_base: String,
+    #[arg(long = "git-branch", default_value = "")]
+    git_branch: String,
     #[arg(long = "forgejoctl-bin")]
     forgejoctl_bin: PathBuf,
     #[arg(long = "forgejo-config")]
@@ -308,6 +307,11 @@ enum DispatchError {
         issue_number: u64,
         dispatch_id: i64,
     },
+    #[error("repo impl dispatch already in flight for {repo_full_name} (dispatch {dispatch_id})")]
+    RepoImplDispatchInFlight {
+        repo_full_name: String,
+        dispatch_id: i64,
+    },
     #[error("invalid issue ref: {0}")]
     InvalidIssueRef(String),
     #[error("io failure: {0}")]
@@ -328,6 +332,7 @@ impl DispatchError {
             Self::DirectiveNotConfigured(_) => "directive_not_configured",
             Self::RoleNotConfigured(_) => "role_not_configured",
             Self::IssueDispatchInFlight { .. } => "issue_dispatch_in_flight",
+            Self::RepoImplDispatchInFlight { .. } => "repo_impl_dispatch_in_flight",
             Self::InvalidIssueRef(_) => "invalid_issue_ref",
             Self::Io(_) => "io_failure",
             Self::Tmux(_) => "tmux_failure",
@@ -340,6 +345,7 @@ impl DispatchError {
 const fn runtime_state_for_dispatch_error(error: &DispatchError) -> OrchdRuntimeState {
     match error {
         DispatchError::IssueDispatchInFlight { .. } => OrchdRuntimeState::Running,
+        DispatchError::RepoImplDispatchInFlight { .. } => OrchdRuntimeState::Queued,
         DispatchError::ActorNotAllowed(_)
         | DispatchError::DirectiveNotConfigured(_)
         | DispatchError::RoleNotConfigured(_)
@@ -354,7 +360,8 @@ const fn runtime_state_for_dispatch_error(error: &DispatchError) -> OrchdRuntime
 
 enum DispatchReservation {
     Started(i64),
-    InFlight(i64),
+    InFlightIssue(i64),
+    InFlightRepo(i64),
 }
 
 #[derive(Clone)]
@@ -403,6 +410,12 @@ struct TmuxRunScriptInputs<'a> {
     forgejo_config_file: Option<&'a Path>,
     token_file: &'a Path,
     workdir: &'a Path,
+    codex_sandbox: &'a str,
+    git_remote: &'a str,
+    git_base: &'a str,
+    git_branch: &'a str,
+    issue_title: &'a str,
+    issue_url: &'a str,
     codex_bin: &'a Path,
     codex_role_arg: &'a str,
     issue_session_id: Option<&'a str>,
@@ -418,6 +431,10 @@ struct DispatchPlan {
     event_type: String,
     directive: DispatchDirectiveConfig,
     role: DispatchRoleConfig,
+    workdir: PathBuf,
+    git_remote: String,
+    git_base: String,
+    git_branch: String,
     intent: DispatchIntentV1,
     issue_ref: IssueRef,
     issue_title: String,
@@ -727,6 +744,11 @@ async fn run() -> Result<()> {
         run_reconcile_loop(reconcile_state, cli.reconcile_sec).await;
     });
 
+    let queue_state = state.clone();
+    tokio::spawn(async move {
+        run_dispatch_queue_loop(queue_state, cli.heartbeat_sec).await;
+    });
+
     let app = Router::new()
         .route("/healthz", get(healthz_handler))
         .route("/webhook", post(webhook_handler))
@@ -905,62 +927,98 @@ async fn process_webhook(
                     }
                 }
                 DispatchMode::TmuxExec | DispatchMode::TmuxTui => {
-                    match dispatch_issue(state.clone(), decision_id, event_id, &record, &decision)
-                        .await
-                    {
-                        Ok(()) => {
-                            if let Err(err) = project_issue_runtime_state(
-                                state.clone(),
-                                &record.repo_full_name,
-                                issue_number,
-                                OrchdRuntimeState::Running,
-                                dispatch_identity.clone(),
-                            )
-                            .await
-                            {
-                                if status_error.is_none() {
-                                    status_error = Some(err.to_string());
-                                }
-                            } else {
-                                status_projected = true;
+                    let defer_impl = match decision.directive.as_deref() {
+                        Some("impl") => match latest_repo_inflight_impl_dispatch_id(
+                            &state.db_path,
+                            &record.repo_full_name,
+                        ) {
+                            Ok(Some(inflight)) => {
+                                log_line(
+                                    "dispatch_deferred_repo_busy",
+                                    json!({
+                                        "repo": record.repo_full_name,
+                                        "issue_number": issue_number,
+                                        "directive": "impl",
+                                        "inflight_dispatch_id": inflight,
+                                    }),
+                                );
+                                true
                             }
-                            if let Some(role_name) = decision.target_role.as_deref()
-                                && let Err(err) = upsert_issue_role_cursor_event_id(
-                                    &state.db_path,
+                            Ok(None) => false,
+                            Err(err) => {
+                                status_error = Some(format!(
+                                    "failed checking repo inflight impl dispatch: {err}"
+                                ));
+                                false
+                            }
+                        },
+                        _ => false,
+                    };
+
+                    if !defer_impl {
+                        match dispatch_issue(
+                            state.clone(),
+                            decision_id,
+                            event_id,
+                            &record,
+                            &decision,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                if let Err(err) = project_issue_runtime_state(
+                                    state.clone(),
                                     &record.repo_full_name,
                                     issue_number,
-                                    role_name,
-                                    event_id,
+                                    OrchdRuntimeState::Running,
+                                    dispatch_identity.clone(),
                                 )
-                                && status_error.is_none()
-                            {
-                                status_error = Some(format!(
-                                    "failed updating issue cursor for role {role_name}: {err}"
-                                ));
-                            }
-                        }
-                        Err(err) => {
-                            let projection = project_issue_runtime_state(
-                                state.clone(),
-                                &record.repo_full_name,
-                                issue_number,
-                                runtime_state_for_dispatch_error(&err),
-                                dispatch_identity.clone(),
-                            )
-                            .await;
-                            match projection {
-                                Ok(()) => {
+                                .await
+                                {
+                                    if status_error.is_none() {
+                                        status_error = Some(err.to_string());
+                                    }
+                                } else {
                                     status_projected = true;
                                 }
-                                Err(projection_err) => {
-                                    if status_error.is_none() {
-                                        status_error = Some(projection_err.to_string());
-                                    }
+                                if let Some(role_name) = decision.target_role.as_deref()
+                                    && let Err(err) = upsert_issue_role_cursor_event_id(
+                                        &state.db_path,
+                                        &record.repo_full_name,
+                                        issue_number,
+                                        role_name,
+                                        event_id,
+                                    )
+                                    && status_error.is_none()
+                                {
+                                    status_error = Some(format!(
+                                        "failed updating issue cursor for role {role_name}: {err}"
+                                    ));
                                 }
                             }
-                            if status_error.is_none() {
-                                status_error =
-                                    Some(format!("dispatch {}: {}", err.reason_code(), err));
+                            Err(err) => {
+                                let projection = project_issue_runtime_state(
+                                    state.clone(),
+                                    &record.repo_full_name,
+                                    issue_number,
+                                    runtime_state_for_dispatch_error(&err),
+                                    dispatch_identity.clone(),
+                                )
+                                .await;
+                                match projection {
+                                    Ok(()) => {
+                                        status_projected = true;
+                                    }
+                                    Err(projection_err) => {
+                                        if status_error.is_none() {
+                                            status_error = Some(projection_err.to_string());
+                                        }
+                                    }
+                                }
+                                if status_error.is_none() {
+                                    status_error =
+                                        Some(format!("dispatch {}: {}", err.reason_code(), err));
+                                }
                             }
                         }
                     }
@@ -1267,11 +1325,18 @@ fn parse_directive_line(line: &str) -> Option<ParsedDirective> {
         return None;
     };
 
-    if !matches!(directive.as_str(), "design" | "impl" | "poke") {
+    if !matches!(directive.as_str(), "design" | "impl" | "pr" | "poke") {
         return None;
     }
 
     Some(ParsedDirective { role, directive })
+}
+
+fn codex_sandbox_for_directive(directive: &str) -> &'static str {
+    match directive {
+        "design" | "poke" => "read-only",
+        _ => "workspace-write",
+    }
 }
 
 fn dispatch_comment_identity(
@@ -1416,6 +1481,97 @@ fn tmux_repo_slug(repo_full_name: &str) -> String {
 fn issue_tmux_window_name(repo_full_name: &str, issue_number: u64) -> String {
     let repo_slug = tmux_repo_slug(repo_full_name);
     format!("r{repo_slug}-i{issue_number}")
+}
+
+const DEFAULT_GIT_REMOTE: &str = "origin";
+const DEFAULT_GIT_BASE_BRANCH: &str = "main";
+
+fn directive_uses_worktree(directive: &str) -> bool {
+    matches!(directive, "impl" | "pr")
+}
+
+fn git_sanitize_token(input: &str, max_len: usize) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut last_dash = false;
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+        if out.len() >= max_len {
+            break;
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
+fn dispatch_worktree_branch(
+    repo_full_name: &str,
+    issue_number: u64,
+    dispatch_id: i64,
+    directive: &str,
+) -> String {
+    let repo_slug = git_sanitize_token(repo_full_name, 24);
+    let directive = git_sanitize_token(directive, 12);
+    format!("orchd/d{dispatch_id}/r{repo_slug}-i{issue_number}-{directive}")
+}
+
+fn git_run_checked(repo_root: &Path, args: &[&str]) -> Result<(), DispatchError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(args)
+        .output()
+        .map_err(|err| DispatchError::Io(format!("failed to invoke git: {err}")))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(DispatchError::Io(format!(
+        "git failed (cwd={}) args={args:?} status={:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        repo_root.display(),
+        output.status.code()
+    )))
+}
+
+fn create_dispatch_worktree(
+    repo_root: &Path,
+    worktree_dir: &Path,
+    branch: &str,
+    remote: &str,
+    base_branch: &str,
+) -> Result<(), DispatchError> {
+    if worktree_dir.exists() {
+        return Err(DispatchError::Io(format!(
+            "dispatch worktree path already exists: {}",
+            worktree_dir.display()
+        )));
+    }
+    let git_dir = repo_root.join(".git");
+    if !git_dir.exists() {
+        return Err(DispatchError::Io(format!(
+            "repo root is not a git checkout: {}",
+            repo_root.display()
+        )));
+    }
+    git_run_checked(repo_root, &["fetch", remote, base_branch])?;
+    let base_ref = format!("{remote}/{base_branch}");
+    git_run_checked(
+        repo_root,
+        &[
+            "worktree",
+            "add",
+            "-B",
+            branch,
+            &worktree_dir.to_string_lossy(),
+            &base_ref,
+        ],
+    )?;
+    Ok(())
 }
 
 async fn fetch_issue(state: AppState, issue: IssueRef) -> Result<ApiIssue, DispatchError> {
@@ -1612,11 +1768,18 @@ LAST_MESSAGE_FILE={last_message_file}
 CODEX_LOG_FILE={codex_log_file}
 MARKER_FILE={marker_file}
 ISSUE_REF={issue_ref}
+ISSUE_TITLE={issue_title}
+ISSUE_URL={issue_url}
 ORCHD_BIN={orchd_bin}
 FORGEJOCTL_BIN={forgejoctl_bin}
 FORGEJO_CONFIG_FILE={forgejo_config_file}
 TOKEN_FILE={token_file}
 WORKDIR={workdir}
+CODEX_SANDBOX={codex_sandbox}
+GIT_WORKDIR={git_workdir}
+GIT_REMOTE={git_remote}
+GIT_BASE={git_base}
+GIT_BRANCH={git_branch}
 CODEX_BIN={codex_bin}
 CODEX_ROLE_ARG={codex_role_arg}
 ISSUE_SESSION_ID={issue_session_id}
@@ -1636,14 +1799,14 @@ cd "$WORKDIR"
 
 run_codex_fresh() {{
   cat "$PROMPT_FILE" \
-    | timeout --preserve-status "$TIMEOUT_SEC" "$CODEX_BIN" "$CODEX_ROLE_ARG" --no-alt-screen exec --skip-git-repo-check -o "$LAST_MESSAGE_FILE" - \
+    | timeout --preserve-status "$TIMEOUT_SEC" "$CODEX_BIN" "$CODEX_ROLE_ARG" --sandbox "$CODEX_SANDBOX" --cd "$WORKDIR" --no-alt-screen exec --skip-git-repo-check -o "$LAST_MESSAGE_FILE" - \
       2>&1 | tee -a "$CODEX_LOG_FILE"
 }}
 
 set +e
 if [[ -n "$ISSUE_SESSION_ID" ]]; then
   cat "$PROMPT_FILE" \
-    | timeout --preserve-status "$TIMEOUT_SEC" "$CODEX_BIN" "$CODEX_ROLE_ARG" --no-alt-screen exec -o "$LAST_MESSAGE_FILE" resume --skip-git-repo-check "$ISSUE_SESSION_ID" - \
+    | timeout --preserve-status "$TIMEOUT_SEC" "$CODEX_BIN" "$CODEX_ROLE_ARG" --sandbox "$CODEX_SANDBOX" --cd "$WORKDIR" --no-alt-screen exec -o "$LAST_MESSAGE_FILE" resume --skip-git-repo-check "$ISSUE_SESSION_ID" - \
       2>&1 | tee -a "$CODEX_LOG_FILE"
   exit_code=$?
   if [[ "$exit_code" -ne 0 && "$exit_code" -ne 124 ]]; then
@@ -1685,15 +1848,6 @@ else
   runtime_state="failed"
 fi
 
-work_state_target=""
-if [[ "$DIRECTIVE" == "impl" ]]; then
-  if [[ "$status" == "completed" ]]; then
-    work_state_target="review"
-  else
-    work_state_target="blocked"
-  fi
-fi
-
 if [[ -n "$session_id" ]]; then
   session_for_finalize="$session_id"
 else
@@ -1705,7 +1859,6 @@ fi
   echo "directive=$DIRECTIVE role=$ROLE_NAME"
   echo "tmux=$TMUX_LOCATOR"
   echo "codex_session_id=${{session_id:-unknown}}"
-  echo "work_state_target=${{work_state_target:-unchanged}}"
   echo "run_dir=$RUN_DIR"
   echo "log=$CODEX_LOG_FILE"
   echo
@@ -1727,12 +1880,18 @@ fi
   --exit-code "$exit_code" \
   --session-id "$session_for_finalize" \
   --issue-ref "$ISSUE_REF" \
+  --issue-title "$ISSUE_TITLE" \
+  --issue-url "$ISSUE_URL" \
   --directive "$DIRECTIVE" \
   --role-name "$ROLE_NAME" \
   --tmux-locator "$TMUX_LOCATOR" \
   --run-dir "$RUN_DIR" \
   --log-file "$CODEX_LOG_FILE" \
   --completion-file "$COMPLETION_FILE" \
+  --git-workdir "$GIT_WORKDIR" \
+  --git-remote "$GIT_REMOTE" \
+  --git-base "$GIT_BASE" \
+  --git-branch "$GIT_BRANCH" \
   --forgejoctl-bin "$FORGEJOCTL_BIN" \
   --token-file "$TOKEN_FILE" || true
 "#,
@@ -1747,11 +1906,18 @@ fi
         codex_log_file = shell_quote(&inputs.codex_log_path.to_string_lossy()),
         marker_file = shell_quote(&inputs.marker_path.to_string_lossy()),
         issue_ref = shell_quote(inputs.issue_ref_text),
+        issue_title = shell_quote(inputs.issue_title),
+        issue_url = shell_quote(inputs.issue_url),
         orchd_bin = shell_quote(&inputs.orchd_bin.to_string_lossy()),
         forgejoctl_bin = shell_quote(&inputs.forgejoctl_bin.to_string_lossy()),
         forgejo_config_file = shell_quote(forgejo_config_file.as_ref()),
         token_file = shell_quote(&inputs.token_file.to_string_lossy()),
         workdir = shell_quote(&inputs.workdir.to_string_lossy()),
+        codex_sandbox = shell_quote(inputs.codex_sandbox),
+        git_workdir = shell_quote(&inputs.workdir.to_string_lossy()),
+        git_remote = shell_quote(inputs.git_remote),
+        git_base = shell_quote(inputs.git_base),
+        git_branch = shell_quote(inputs.git_branch),
         codex_bin = shell_quote(&inputs.codex_bin.to_string_lossy()),
         codex_role_arg = shell_quote(inputs.codex_role_arg),
         issue_session_id = shell_quote(inputs.issue_session_id.unwrap_or("")),
@@ -1787,11 +1953,18 @@ LAST_MESSAGE_FILE={last_message_file}
 CODEX_LOG_FILE={codex_log_file}
 MARKER_FILE={marker_file}
 ISSUE_REF={issue_ref}
+ISSUE_TITLE={issue_title}
+ISSUE_URL={issue_url}
 ORCHD_BIN={orchd_bin}
 FORGEJOCTL_BIN={forgejoctl_bin}
 FORGEJO_CONFIG_FILE={forgejo_config_file}
 TOKEN_FILE={token_file}
 WORKDIR={workdir}
+CODEX_SANDBOX={codex_sandbox}
+GIT_WORKDIR={git_workdir}
+GIT_REMOTE={git_remote}
+GIT_BASE={git_base}
+GIT_BRANCH={git_branch}
 CODEX_BIN={codex_bin}
 CODEX_ROLE_ARG={codex_role_arg}
 ISSUE_SESSION_ID={issue_session_id}
@@ -1942,10 +2115,10 @@ watcher_pid=$!
 
 set +e
 if [[ -n "$ISSUE_SESSION_ID" ]]; then
-  timeout --foreground --preserve-status "$TIMEOUT_SEC" "$CODEX_BIN" "$CODEX_ROLE_ARG" resume "$ISSUE_SESSION_ID" "$bootstrap_prompt"
+  timeout --foreground --preserve-status "$TIMEOUT_SEC" "$CODEX_BIN" "$CODEX_ROLE_ARG" --sandbox "$CODEX_SANDBOX" --cd "$WORKDIR" resume "$ISSUE_SESSION_ID" "$bootstrap_prompt"
   exit_code=$?
 else
-  timeout --foreground --preserve-status "$TIMEOUT_SEC" "$CODEX_BIN" "$CODEX_ROLE_ARG" --cd "$WORKDIR" "$bootstrap_prompt"
+  timeout --foreground --preserve-status "$TIMEOUT_SEC" "$CODEX_BIN" "$CODEX_ROLE_ARG" --sandbox "$CODEX_SANDBOX" --cd "$WORKDIR" "$bootstrap_prompt"
   exit_code=$?
 fi
 set -e
@@ -1993,15 +2166,6 @@ else
   runtime_state="failed"
 fi
 
-work_state_target=""
-if [[ "$DIRECTIVE" == "impl" ]]; then
-  if [[ "$status" == "completed" ]]; then
-    work_state_target="review"
-  else
-    work_state_target="blocked"
-  fi
-fi
-
 if [[ -n "$session_id" ]]; then
   session_for_finalize="$session_id"
 else
@@ -2014,7 +2178,6 @@ fi
   echo "tmux=$TMUX_LOCATOR"
   echo "codex_session_id=${{session_id:-unknown}}"
   echo "session_jsonl=${{session_jsonl:-unknown}}"
-  echo "work_state_target=${{work_state_target:-unchanged}}"
   echo "run_dir=$RUN_DIR"
   echo "log=$CODEX_LOG_FILE"
   echo
@@ -2046,12 +2209,18 @@ fi
   --exit-code "$exit_code" \
   --session-id "$session_for_finalize" \
   --issue-ref "$ISSUE_REF" \
+  --issue-title "$ISSUE_TITLE" \
+  --issue-url "$ISSUE_URL" \
   --directive "$DIRECTIVE" \
   --role-name "$ROLE_NAME" \
   --tmux-locator "$TMUX_LOCATOR" \
   --run-dir "$RUN_DIR" \
   --log-file "$CODEX_LOG_FILE" \
   --completion-file "$COMPLETION_FILE" \
+  --git-workdir "$GIT_WORKDIR" \
+  --git-remote "$GIT_REMOTE" \
+  --git-base "$GIT_BASE" \
+  --git-branch "$GIT_BRANCH" \
   --forgejoctl-bin "$FORGEJOCTL_BIN" \
   --token-file "$TOKEN_FILE" || true
 "#,
@@ -2068,11 +2237,18 @@ fi
         codex_log_file = shell_quote(&inputs.codex_log_path.to_string_lossy()),
         marker_file = shell_quote(&inputs.marker_path.to_string_lossy()),
         issue_ref = shell_quote(inputs.issue_ref_text),
+        issue_title = shell_quote(inputs.issue_title),
+        issue_url = shell_quote(inputs.issue_url),
         orchd_bin = shell_quote(&inputs.orchd_bin.to_string_lossy()),
         forgejoctl_bin = shell_quote(&inputs.forgejoctl_bin.to_string_lossy()),
         forgejo_config_file = shell_quote(forgejo_config_file.as_ref()),
         token_file = shell_quote(&inputs.token_file.to_string_lossy()),
         workdir = shell_quote(&inputs.workdir.to_string_lossy()),
+        codex_sandbox = shell_quote(inputs.codex_sandbox),
+        git_workdir = shell_quote(&inputs.workdir.to_string_lossy()),
+        git_remote = shell_quote(inputs.git_remote),
+        git_base = shell_quote(inputs.git_base),
+        git_branch = shell_quote(inputs.git_branch),
         codex_bin = shell_quote(&inputs.codex_bin.to_string_lossy()),
         codex_role_arg = shell_quote(inputs.codex_role_arg),
         issue_session_id = shell_quote(inputs.issue_session_id.unwrap_or("")),
@@ -2199,11 +2375,18 @@ async fn plan_dispatch(
     .map_err(|err| DispatchError::Db(err.to_string()))?
     {
         DispatchReservation::Started(dispatch_id) => dispatch_id,
-        DispatchReservation::InFlight(dispatch_id) => {
+        DispatchReservation::InFlightIssue(dispatch_id) => {
             let _ = fs::remove_file(&lock_path);
             return Err(DispatchError::IssueDispatchInFlight {
                 repo_full_name: intent.repo_full_name.clone(),
                 issue_number: intent.issue_number,
+                dispatch_id,
+            });
+        }
+        DispatchReservation::InFlightRepo(dispatch_id) => {
+            let _ = fs::remove_file(&lock_path);
+            return Err(DispatchError::RepoImplDispatchInFlight {
+                repo_full_name: intent.repo_full_name.clone(),
                 dispatch_id,
             });
         }
@@ -2216,11 +2399,37 @@ async fn plan_dispatch(
     let issue_body = issue.body.unwrap_or_default();
     let issue_url = issue.html_url;
 
+    let (workdir, git_remote, git_base, git_branch) = if directive_uses_worktree(&intent.directive)
+    {
+        let git_remote = DEFAULT_GIT_REMOTE.to_string();
+        let git_base = DEFAULT_GIT_BASE_BRANCH.to_string();
+        let git_branch = dispatch_worktree_branch(
+            &intent.repo_full_name,
+            intent.issue_number,
+            dispatch_id,
+            directive_name,
+        );
+        let workdir = run_dir.join("worktree");
+        create_dispatch_worktree(&role.workdir, &workdir, &git_branch, &git_remote, &git_base)?;
+        (workdir, git_remote, git_base, git_branch)
+    } else {
+        (
+            role.workdir.clone(),
+            DEFAULT_GIT_REMOTE.to_string(),
+            DEFAULT_GIT_BASE_BRANCH.to_string(),
+            String::new(),
+        )
+    };
+
     Ok(DispatchPlan {
         actor,
         event_type: record.event_type.clone(),
         directive,
         role,
+        workdir,
+        git_remote,
+        git_base,
+        git_branch,
         intent,
         issue_ref,
         issue_title,
@@ -2337,7 +2546,13 @@ fn materialize_run_artifacts(
         forgejoctl_bin: &dispatch_config.forgejoctl_bin,
         forgejo_config_file: state.forgejo_config_file.as_deref(),
         token_file: &plan.role.token_file,
-        workdir: &plan.role.workdir,
+        workdir: &plan.workdir,
+        codex_sandbox: codex_sandbox_for_directive(&plan.intent.directive),
+        git_remote: &plan.git_remote,
+        git_base: &plan.git_base,
+        git_branch: &plan.git_branch,
+        issue_title: &plan.issue_title,
+        issue_url: &plan.issue_url,
         codex_bin: &plan.role.codex_bin,
         codex_role_arg: &plan.role.codex_role_arg,
         issue_session_id: plan.issue_session_id.as_deref(),
@@ -2517,7 +2732,7 @@ fn update_dispatch_terminal(
     reason_code: &str,
     exit_code: i64,
     session_id: Option<&str>,
-) -> Result<()> {
+) -> Result<bool> {
     let mut conn = open_db(db_path)?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let Some(current_status) = tx
@@ -2528,13 +2743,13 @@ fn update_dispatch_terminal(
         )
         .optional()?
     else {
-        return Ok(());
+        return Ok(false);
     };
     let Some(current_state) = DispatchState::parse_db(&current_status) else {
-        return Ok(());
+        return Ok(false);
     };
     if current_state.is_terminal() {
-        return Ok(());
+        return Ok(false);
     }
     let next_state =
         reduce_dispatch_state(current_state, status_spec.event_kind).map_err(|err| {
@@ -2567,7 +2782,7 @@ fn update_dispatch_terminal(
         ],
     )?;
     if rows == 0 {
-        return Ok(());
+        return Ok(false);
     }
     append_dispatch_event_tx(
         &tx,
@@ -2579,7 +2794,7 @@ fn update_dispatch_terminal(
         None,
     )?;
     tx.commit()?;
-    Ok(())
+    Ok(true)
 }
 
 fn run_forgejoctl(
@@ -2609,6 +2824,113 @@ fn run_forgejoctl(
     }
 }
 
+fn append_completion_section(completion_file: &Path, header: &str, lines: &[String]) -> Result<()> {
+    if lines.is_empty() {
+        return Ok(());
+    }
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(completion_file)
+        .with_context(|| {
+            format!(
+                "failed opening completion file for append: {}",
+                completion_file.display()
+            )
+        })?;
+    writeln!(file)?;
+    writeln!(file, "---")?;
+    writeln!(file, "{header}:")?;
+    for line in lines {
+        writeln!(file, "- {line}")?;
+    }
+    Ok(())
+}
+
+fn git_output(workdir: &Path, args: &[&str]) -> Result<std::process::Output> {
+    Command::new("git")
+        .arg("-C")
+        .arg(workdir)
+        .args(args)
+        .output()
+        .with_context(|| format!("failed spawning git in {}", workdir.display()))
+}
+
+fn git_checked(workdir: &Path, args: &[&str]) -> Result<std::process::Output> {
+    let output = git_output(workdir, args)?;
+    if output.status.success() {
+        return Ok(output);
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(anyhow!(
+        "git failed (cwd={}) args={args:?} status={:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        workdir.display(),
+        output.status.code()
+    ))
+}
+
+fn git_stdout_trim(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn autoland_to_main(workdir: &Path, remote: &str, base_branch: &str) -> Result<String> {
+    let head = git_stdout_trim(&git_checked(workdir, &["rev-parse", "--short", "HEAD"])?);
+    let _ = git_checked(workdir, &["fetch", remote, base_branch]);
+    git_checked(workdir, &["push", remote, &format!("HEAD:{base_branch}")])?;
+    Ok(format!("autoland: pushed {head} -> {remote}/{base_branch}"))
+}
+
+fn push_branch(workdir: &Path, remote: &str, branch: &str) -> Result<String> {
+    let head = git_stdout_trim(&git_checked(workdir, &["rev-parse", "--short", "HEAD"])?);
+    git_checked(workdir, &["push", "-u", remote, &format!("HEAD:{branch}")])?;
+    Ok(format!("pushed branch: {head} -> {remote}/{branch}"))
+}
+
+fn create_pull_request_for_dispatch(args: &FinalizeDispatchArgs) -> Result<String> {
+    let forgejo_config = args
+        .forgejo_config
+        .clone()
+        .ok_or_else(|| anyhow!("missing --forgejo-config; cannot create pull request"))?;
+    let cfg = AgentConfig::load(Some(forgejo_config), Some(args.token_file.clone()))?;
+    let api = ForgejoClient::new(&cfg)?;
+
+    let repo = &args.issue_ref.repo;
+    let head_branch = args.git_branch.trim();
+    let base_branch = args.git_base.trim();
+    if head_branch.is_empty() {
+        return Err(anyhow!("missing git branch; cannot create pull request"));
+    }
+    if base_branch.is_empty() {
+        return Err(anyhow!("missing base branch; cannot create pull request"));
+    }
+
+    let body = format!("Refs: {}\n\nIssue: {}\n", args.issue_url, args.issue_ref);
+    let try_heads = [
+        head_branch.to_string(),
+        format!("{}:{head_branch}", repo.owner),
+    ];
+
+    let mut last_err: Option<anyhow::Error> = None;
+    for head in &try_heads {
+        match api.create_pull_request(&cfg, repo, &args.issue_title, head, base_branch, &body) {
+            Ok(value) => {
+                let url = value
+                    .get("html_url")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| value.get("url").and_then(serde_json::Value::as_str))
+                    .unwrap_or("")
+                    .to_string();
+                if url.is_empty() {
+                    return Ok("(pull request created; URL missing in response)".to_string());
+                }
+                return Ok(url);
+            }
+            Err(err) => last_err = Some(err),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("pull request creation failed")))
+}
+
 fn finalize_dispatch_command(args: FinalizeDispatchArgs) -> Result<()> {
     let span = info_span!(
         "finalize_dispatch",
@@ -2621,7 +2943,7 @@ fn finalize_dispatch_command(args: FinalizeDispatchArgs) -> Result<()> {
     let _entered = span.enter();
     let status_spec = parse_terminal_status_spec(&args.status)?;
     let phase_update_start = Instant::now();
-    update_dispatch_terminal(
+    let did_transition = update_dispatch_terminal(
         &args.db_path,
         args.dispatch_id,
         status_spec,
@@ -2634,13 +2956,68 @@ fn finalize_dispatch_command(args: FinalizeDispatchArgs) -> Result<()> {
         phase_update_start.elapsed().as_secs_f64() * 1000.0,
         "ok",
     );
+    if !did_transition {
+        info!("finalize-dispatch: no-op (dispatch already terminal or missing)");
+        return Ok(());
+    }
 
-    if args.directive == "impl" {
-        let work_state_target = if status_spec.state_literal == DispatchState::Completed {
-            "review"
-        } else {
-            "blocked"
-        };
+    let mut landing_ok = true;
+    let mut landing_lines: Vec<String> = Vec::new();
+    if status_spec.state_literal == DispatchState::Completed {
+        match args.directive.as_str() {
+            "impl" => match autoland_to_main(&args.git_workdir, &args.git_remote, &args.git_base) {
+                Ok(line) => landing_lines.push(line),
+                Err(err) => {
+                    landing_ok = false;
+                    landing_lines.push(format!("autoland failed: {err:#}"));
+                }
+            },
+            "pr" => {
+                if args.git_branch.trim().is_empty() {
+                    landing_ok = false;
+                    landing_lines.push("missing git branch; cannot create PR".to_string());
+                } else {
+                    match push_branch(&args.git_workdir, &args.git_remote, &args.git_branch) {
+                        Ok(line) => landing_lines.push(line),
+                        Err(err) => {
+                            landing_ok = false;
+                            landing_lines.push(format!("push failed: {err:#}"));
+                        }
+                    }
+                    if landing_ok {
+                        let pr_url = create_pull_request_for_dispatch(&args);
+                        match pr_url {
+                            Ok(url) => landing_lines.push(format!("pull request: {url}")),
+                            Err(err) => {
+                                landing_ok = false;
+                                landing_lines.push(format!("PR create failed: {err:#}"));
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    } else if matches!(args.directive.as_str(), "impl" | "pr") {
+        landing_ok = false;
+    }
+
+    if let Err(err) = append_completion_section(&args.completion_file, "Landing", &landing_lines) {
+        eprintln!("finalize-dispatch: failed appending landing info: {err}");
+    }
+
+    let work_state_target = match args.directive.as_str() {
+        "impl" | "pr" => Some(
+            if status_spec.state_literal == DispatchState::Completed && landing_ok {
+                "review"
+            } else {
+                "blocked"
+            },
+        ),
+        _ => None,
+    };
+
+    if let Some(work_state_target) = work_state_target {
         let phase_transition_start = Instant::now();
         if let Err(err) = run_forgejoctl(
             &args.forgejoctl_bin,
@@ -3243,7 +3620,33 @@ fn reserve_dispatch_starting(
         .optional()?;
     if let Some(dispatch_id) = inflight_id {
         tx.commit()?;
-        return Ok(DispatchReservation::InFlight(dispatch_id));
+        return Ok(DispatchReservation::InFlightIssue(dispatch_id));
+    }
+
+    if dispatch.directive == "impl" {
+        let repo_inflight = tx
+            .query_row(
+                r"
+                SELECT id
+                FROM dispatches
+                WHERE repo_full_name = ?1
+                  AND directive = 'impl'
+                  AND status IN (?2, ?3)
+                ORDER BY id DESC
+                LIMIT 1
+                ",
+                params![
+                    dispatch.repo_full_name.as_str(),
+                    starting_status,
+                    running_status
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        if let Some(dispatch_id) = repo_inflight {
+            tx.commit()?;
+            return Ok(DispatchReservation::InFlightRepo(dispatch_id));
+        }
     }
 
     tx.execute(
@@ -3439,6 +3842,30 @@ fn latest_issue_inflight_dispatch(
         )
         .optional()?;
     Ok(dispatch)
+}
+
+fn latest_repo_inflight_impl_dispatch_id(
+    db_path: &Path,
+    repo_full_name: &str,
+) -> Result<Option<i64>> {
+    let conn = open_db(db_path)?;
+    let starting_status = DispatchState::Starting.as_db_str();
+    let running_status = DispatchState::Running.as_db_str();
+    conn.query_row(
+        r"
+        SELECT id
+        FROM dispatches
+        WHERE repo_full_name = ?1
+          AND directive = 'impl'
+          AND status IN (?2, ?3)
+        ORDER BY id DESC
+        LIMIT 1
+        ",
+        params![repo_full_name, starting_status, running_status],
+        |row| row.get::<_, i64>(0),
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
 fn probe_dispatch_liveness(
@@ -3658,6 +4085,178 @@ async fn run_heartbeat_loop(state: AppState, interval_sec: u64) {
         }
         tokio::time::sleep(interval).await;
     }
+}
+
+#[derive(Debug, Clone)]
+struct QueuedDecision {
+    decision_id: i64,
+    event_id: i64,
+    record: EventRecord,
+    decision: DecisionRecord,
+}
+
+fn queued_impl_decisions(db_path: &Path, limit: u32) -> Result<Vec<QueuedDecision>> {
+    let conn = open_db(db_path)?;
+    let mut stmt = conn.prepare(
+        r"
+        WITH latest AS (
+            SELECT repo_full_name, issue_number, target_role, MAX(id) AS decision_id
+            FROM decisions
+            WHERE decision = 'accepted'
+              AND would_dispatch = 1
+              AND directive = 'impl'
+              AND issue_number IS NOT NULL
+              AND target_role IS NOT NULL
+            GROUP BY repo_full_name, issue_number, target_role
+        )
+        SELECT
+            d.id,
+            d.event_id,
+            e.delivery_id,
+            e.event_type,
+            e.repo_full_name,
+            e.issue_number,
+            e.action,
+            e.actor_login,
+            e.event_text,
+            e.source_comment_id,
+            e.source_created_at,
+            e.raw_json,
+            d.decision,
+            d.reason_code,
+            d.directive,
+            d.target_role,
+            d.would_dispatch
+        FROM latest l
+        JOIN decisions d ON d.id = l.decision_id
+        JOIN events e ON e.id = d.event_id
+        WHERE NOT EXISTS (SELECT 1 FROM dispatches x WHERE x.decision_id = d.id)
+        ORDER BY d.id ASC
+        LIMIT ?1
+        ",
+    )?;
+    let rows = stmt
+        .query_map(params![i64::from(limit)], |row| {
+            let decision_id: i64 = row.get(0)?;
+            let event_id: i64 = row.get(1)?;
+            let record = EventRecord {
+                delivery_id: row.get(2)?,
+                event_type: row.get(3)?,
+                repo_full_name: row.get(4)?,
+                issue_number: row
+                    .get::<_, Option<i64>>(5)?
+                    .and_then(|n| u64::try_from(n).ok()),
+                action: row.get(6)?,
+                actor_login: row.get(7)?,
+                event_text: row.get(8)?,
+                source_comment_id: row.get(9)?,
+                source_created_at: row.get(10)?,
+                raw_json: row.get(11)?,
+            };
+            let would_dispatch_int: i64 = row.get(16)?;
+            let decision = DecisionRecord {
+                decision: row.get(12)?,
+                reason_code: row.get(13)?,
+                directive: row.get(14)?,
+                target_role: row.get(15)?,
+                would_dispatch: would_dispatch_int != 0,
+            };
+            Ok(QueuedDecision {
+                decision_id,
+                event_id,
+                record,
+                decision,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+async fn run_dispatch_queue_loop(state: AppState, interval_sec: u64) {
+    let interval = StdDuration::from_secs(interval_sec.max(1));
+    loop {
+        if let Err(err) = dispatch_queue_once(&state).await {
+            log_line(
+                "dispatch_queue_error",
+                json!({
+                    "error": err.to_string(),
+                }),
+            );
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
+async fn dispatch_queue_once(state: &AppState) -> Result<()> {
+    if matches!(state.dispatch_mode, DispatchMode::DryRun) {
+        return Ok(());
+    }
+    let items = queued_impl_decisions(&state.db_path, 10)?;
+    for item in items {
+        let repo_full_name = item.record.repo_full_name.clone();
+        if let Ok(Some(inflight)) =
+            latest_repo_inflight_impl_dispatch_id(&state.db_path, &repo_full_name)
+        {
+            log_line(
+                "dispatch_queue_repo_busy",
+                json!({
+                    "repo": repo_full_name,
+                    "decision_id": item.decision_id,
+                    "event_id": item.event_id,
+                    "inflight_dispatch_id": inflight,
+                }),
+            );
+            continue;
+        }
+        let issue_number = item
+            .record
+            .issue_number
+            .ok_or_else(|| anyhow!("queued decision missing issue number"))?;
+        let dispatch_identity = dispatch_comment_identity(state, &item.decision);
+        match dispatch_issue(
+            state.clone(),
+            item.decision_id,
+            item.event_id,
+            &item.record,
+            &item.decision,
+        )
+        .await
+        {
+            Ok(()) => {
+                let _ = project_issue_runtime_state(
+                    state.clone(),
+                    &item.record.repo_full_name,
+                    issue_number,
+                    OrchdRuntimeState::Running,
+                    dispatch_identity.clone(),
+                )
+                .await;
+                if let Some(role_name) = item.decision.target_role.as_deref() {
+                    let _ = upsert_issue_role_cursor_event_id(
+                        &state.db_path,
+                        &item.record.repo_full_name,
+                        issue_number,
+                        role_name,
+                        item.event_id,
+                    );
+                }
+            }
+            Err(err) => {
+                log_line(
+                    "dispatch_queue_dispatch_failed",
+                    json!({
+                        "repo": item.record.repo_full_name,
+                        "issue_number": issue_number,
+                        "decision_id": item.decision_id,
+                        "event_id": item.event_id,
+                        "reason_code": err.reason_code(),
+                        "error": err.to_string(),
+                    }),
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn heartbeat_once(state: &AppState) -> Result<()> {
@@ -3900,7 +4499,9 @@ mod tests {
             .expect("first");
         let first_id = match first {
             DispatchReservation::Started(id) => id,
-            DispatchReservation::InFlight(_) => panic!("expected first reservation to start"),
+            DispatchReservation::InFlightIssue(_) | DispatchReservation::InFlightRepo(_) => {
+                panic!("expected first reservation to start")
+            }
         };
         assert_eq!(
             dispatch_event_kinds(&db_path, first_id),
@@ -3910,8 +4511,43 @@ mod tests {
         let second = reserve_dispatch_starting(&db_path, &sample_dispatch(second_decision_id, 7))
             .expect("second");
         match second {
-            DispatchReservation::InFlight(id) => assert_eq!(id, first_id),
+            DispatchReservation::InFlightIssue(id) => assert_eq!(id, first_id),
             DispatchReservation::Started(_) => panic!("expected second reservation to be blocked"),
+            DispatchReservation::InFlightRepo(_) => {
+                panic!("expected issue-level inflight, not repo-level inflight")
+            }
+        }
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn reserve_dispatch_blocks_second_inflight_impl_for_repo() {
+        let db_path = temp_db_path("dispatch-reserve-repo");
+        init_db(&db_path).expect("db init");
+        let first_decision_id = seed_decision_id(&db_path);
+        let second_decision_id = seed_decision_id(&db_path);
+
+        let mut first_insert = sample_dispatch(first_decision_id, 7);
+        first_insert.directive = "impl".to_string();
+        let mut second_insert = sample_dispatch(second_decision_id, 8);
+        second_insert.directive = "impl".to_string();
+
+        let first = reserve_dispatch_starting(&db_path, &first_insert).expect("first");
+        let first_id = match first {
+            DispatchReservation::Started(id) => id,
+            DispatchReservation::InFlightIssue(_) | DispatchReservation::InFlightRepo(_) => {
+                panic!("expected first reservation to start")
+            }
+        };
+
+        let second = reserve_dispatch_starting(&db_path, &second_insert).expect("second");
+        match second {
+            DispatchReservation::InFlightRepo(id) => assert_eq!(id, first_id),
+            DispatchReservation::Started(_) => panic!("expected repo-level inflight block"),
+            DispatchReservation::InFlightIssue(_) => {
+                panic!("expected repo-level inflight, not issue-level inflight")
+            }
         }
 
         let _ = fs::remove_file(db_path);
@@ -3926,7 +4562,9 @@ mod tests {
             .expect("reserve")
         {
             DispatchReservation::Started(id) => id,
-            DispatchReservation::InFlight(_) => panic!("expected started dispatch"),
+            DispatchReservation::InFlightIssue(_) | DispatchReservation::InFlightRepo(_) => {
+                panic!("expected started dispatch")
+            }
         };
         mark_dispatch_failed_runtime(
             &db_path,

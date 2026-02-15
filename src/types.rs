@@ -135,6 +135,7 @@ pub enum WorkflowState {
 }
 
 impl WorkflowState {
+    #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Triage => "triage",
@@ -146,6 +147,7 @@ impl WorkflowState {
         }
     }
 
+    #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
             Self::Triage => "state/triage",
@@ -157,6 +159,7 @@ impl WorkflowState {
         }
     }
 
+    #[must_use]
     pub fn from_label(label: &str) -> Option<Self> {
         match label {
             "state/triage" => Some(Self::Triage),
@@ -180,6 +183,7 @@ pub enum OrchdRuntimeState {
 }
 
 impl OrchdRuntimeState {
+    #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Queued => "queued",
@@ -190,6 +194,7 @@ impl OrchdRuntimeState {
         }
     }
 
+    #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
             Self::Queued => "orchd/state/queued",
@@ -200,6 +205,7 @@ impl OrchdRuntimeState {
         }
     }
 
+    #[must_use]
     pub fn from_label(label: &str) -> Option<Self> {
         match label {
             "orchd/state/queued" => Some(Self::Queued),

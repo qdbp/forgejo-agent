@@ -1,8 +1,3 @@
-mod api;
-mod config;
-mod policy;
-mod types;
-
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::fs;
@@ -16,10 +11,15 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::{Duration as ChronoDuration, Utc};
 use clap::{Args, Parser, Subcommand};
 
-use api::ForgejoClient;
-use config::AgentConfig;
-use policy::{ORCHD_CONTROL_LABELS, ORCHD_STATE_LABELS, OTHER_LABELS, STATE_LABEL_COLOR};
-use types::{ApiIssue, IssueRef, ListState, OpenState, OrchdRuntimeState, RepoRef, WorkflowState};
+use forgejo_agent::api::ForgejoClient;
+use forgejo_agent::config::AgentConfig;
+use forgejo_agent::policy;
+use forgejo_agent::policy::{
+    ORCHD_CONTROL_LABELS, ORCHD_STATE_LABELS, OTHER_LABELS, STATE_LABEL_COLOR,
+};
+use forgejo_agent::types::{
+    ApiIssue, IssueRef, ListState, OpenState, OrchdRuntimeState, RepoRef, WorkflowState,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "forgejo-agent")]
@@ -1020,7 +1020,7 @@ fn cmd_worker_run(api: &ForgejoClient, cfg: &AgentConfig, args: WorkerRunArgs) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ApiLabel, OpenState};
+    use forgejo_agent::types::{ApiLabel, OpenState};
 
     fn issue_with_labels(labels: &[(&str, u64)]) -> ApiIssue {
         ApiIssue {
