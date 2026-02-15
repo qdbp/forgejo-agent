@@ -23,7 +23,7 @@ Dispatch behavior is configured in `config/orchd-dispatch.toml`:
 - actor allowlist (`allowed_actors`)
 - directive -> role mapping
 - role -> codex binary / token file / Forgejo login mapping
-- prompt envelopes (`prompt_envelopes.fresh_envelope_file`, `prompt_envelopes.followup_envelope_file`)
+- prompt envelopes (`prompt_envelopes.fresh_envelope`, `prompt_envelopes.followup_envelope`)
 - tmux session naming and remain-on-exit policy
 
 ## Run

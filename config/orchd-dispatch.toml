@@ -12,8 +12,8 @@ codex_role_arg = "orch"
 token_file = "/home/main/.config/forgejo-agent/creds/codex-orch.token"
 
 [prompt_envelopes]
-fresh_envelope_file = "../prompts/orchd-envelope-fresh.md"
-followup_envelope_file = "../prompts/orchd-envelope-followup.md"
+fresh_envelope = "../prompts/orchd-envelope-fresh.md"
+followup_envelope = "../prompts/orchd-envelope-followup.md"
 
 [directives.design]
 role = "codex-orch"

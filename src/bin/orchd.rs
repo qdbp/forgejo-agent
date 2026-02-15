@@ -239,9 +239,9 @@ struct DispatchTmuxConfigFile {
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct DispatchPromptEnvelopeConfigFile {
-    #[serde(default = "default_fresh_envelope_file")]
+    #[serde(default = "default_fresh_envelope")]
     fresh_envelope: String,
-    #[serde(default = "default_followup_envelope_file")]
+    #[serde(default = "default_followup_envelope")]
     followup_envelope: String,
     #[serde(default = "default_tmux_tui_bootstrap_file")]
     tmux_tui_bootstrap: String,
@@ -278,11 +278,11 @@ fn default_forgejoctl_bin() -> String {
     "/home/main/.local/bin/forgejoctl".to_string()
 }
 
-fn default_fresh_envelope_file() -> String {
+fn default_fresh_envelope() -> String {
     "../prompts/orchd-envelope-fresh.md".to_string()
 }
 
-fn default_followup_envelope_file() -> String {
+fn default_followup_envelope() -> String {
     "../prompts/orchd-envelope-followup.md".to_string()
 }
 
@@ -698,19 +698,21 @@ fn main() {
 }
 
 fn run_entry() -> Result<()> {
+    init_telemetry();
+    let cli = Cli::parse();
+    if let Some(command) = cli.command {
+        // Subcommands are intentionally synchronous to avoid mixing reqwest::blocking
+        // with a Tokio runtime.
+        return run_command(command);
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("failed to build tokio runtime")?;
-    runtime.block_on(run())
+    runtime.block_on(run_server(cli))
 }
 
-async fn run() -> Result<()> {
-    init_telemetry();
-    let cli = Cli::parse();
-    if let Some(command) = cli.command {
-        return run_command(command);
-    }
+async fn run_server(cli: Cli) -> Result<()> {
     let listen_addr: SocketAddr = cli
         .listen
         .parse()

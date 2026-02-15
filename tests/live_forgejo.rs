@@ -552,8 +552,6 @@ fn stdout_trim(output: &Output) -> Result<String> {
 
 #[derive(Debug)]
 struct GitWorkspace {
-    _temp: TempDir,
-    checkout: PathBuf,
     bare_repo: PathBuf,
 }
 
@@ -597,11 +595,7 @@ impl GitWorkspace {
             "git push -u origin main",
         )?;
 
-        Ok(Self {
-            _temp: temp,
-            checkout,
-            bare_repo,
-        })
+        Ok(Self { bare_repo })
     }
 
     fn bare_head_main(&self) -> Result<String> {
@@ -859,7 +853,7 @@ impl OrchdTestDirective {
 
 struct OrchdDispatchTomlInputs<'a> {
     actor: &'a str,
-    workdir: &'a Path,
+    forgejo_login: &'a str,
     codex_bin: &'a Path,
     token_file: &'a Path,
     forgejoctl: &'a Path,
@@ -888,22 +882,19 @@ fn write_orchd_dispatch_toml(path: &Path, inputs: OrchdDispatchTomlInputs<'_>) -
     writeln!(&mut out, "remain_on_exit = false\n")?;
 
     writeln!(&mut out, "[prompt_envelopes]")?;
+    writeln!(&mut out, "fresh_envelope = \"{}\"", fresh_env.display())?;
     writeln!(
         &mut out,
-        "fresh_envelope_file = \"{}\"",
-        fresh_env.display()
-    )?;
-    writeln!(
-        &mut out,
-        "followup_envelope_file = \"{}\"\n",
+        "followup_envelope = \"{}\"\n",
         follow_env.display()
     )?;
 
     writeln!(&mut out, "[roles.codex-orch]")?;
     writeln!(&mut out, "codex_bin = \"{}\"", inputs.codex_bin.display())?;
     writeln!(&mut out, "codex_role_arg = \"orch\"")?;
+    writeln!(&mut out, "forgejo_login = \"{}\"", inputs.forgejo_login)?;
     writeln!(&mut out, "token_file = \"{}\"", inputs.token_file.display())?;
-    writeln!(&mut out, "workdir = \"{}\"\n", inputs.workdir.display())?;
+    writeln!(&mut out)?;
 
     for directive in inputs.directives {
         let prompt = prompts_dir.join(directive.prompt_file());
@@ -1342,7 +1333,7 @@ fn live_orchd_local_backend_smoke() -> Result<()> {
         &dispatch_cfg_path,
         OrchdDispatchTomlInputs {
             actor: harness.fixture.owner.as_str(),
-            workdir: Path::new(env!("CARGO_MANIFEST_DIR")),
+            forgejo_login: harness.fixture.owner.as_str(),
             codex_bin: &fake_codex,
             token_file: &harness.token_path,
             forgejoctl: &forgejoctl,
@@ -1409,7 +1400,7 @@ fn live_orchd_impl_autoland_updates_remote_main() -> Result<()> {
         &dispatch_cfg_path,
         OrchdDispatchTomlInputs {
             actor: harness.fixture.owner.as_str(),
-            workdir: &git.checkout,
+            forgejo_login: harness.fixture.owner.as_str(),
             codex_bin: &fake_codex,
             token_file: &harness.token_path,
             forgejoctl: &forgejoctl,
@@ -1499,7 +1490,7 @@ fn live_orchd_pr_pushes_branch_and_opens_pr() -> Result<()> {
         &dispatch_cfg_path,
         OrchdDispatchTomlInputs {
             actor: harness.fixture.owner.as_str(),
-            workdir: &git.checkout,
+            forgejo_login: harness.fixture.owner.as_str(),
             codex_bin: &fake_codex,
             token_file: &harness.token_path,
             forgejoctl: &forgejoctl,
@@ -1618,7 +1609,7 @@ fn live_orchd_impl_serializes_queue_per_repo() -> Result<()> {
         &dispatch_cfg_path,
         OrchdDispatchTomlInputs {
             actor: harness.fixture.owner.as_str(),
-            workdir: &git.checkout,
+            forgejo_login: harness.fixture.owner.as_str(),
             codex_bin: &fake_codex,
             token_file: &harness.token_path,
             forgejoctl: &forgejoctl,
