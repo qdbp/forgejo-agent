@@ -1,10 +1,10 @@
-# orchd Core Refactor + OTel-First Plan
+# orchd Core Refactor Plan (SQLite-First Telemetry)
 
 ## 1. Goals
 
 - Refactor orchd into a typed, backend-agnostic orchestration core.
 - Keep SQLite as the sole dispatch/lock source of truth.
-- Add OpenTelemetry in the target architecture (not retrofitted later).
+- Keep telemetry SQLite-first (queryable by agents); avoid OTel for now.
 - Preserve tmux/TUI operator ergonomics while enabling deterministic local tests.
 - Keep issue comments natural-language; no model-output parsing contract.
 
@@ -42,38 +42,27 @@
 - Backend-specific operations are isolated behind backend adapters.
 - No lock/state authority outside SQLite.
 
-## 4. Telemetry Contract (OTel-First)
+## 4. Telemetry Contract (SQLite-First)
 
-Telemetry is derived from typed dispatch events.
+Telemetry is derived from typed dispatch events and persisted in SQLite.
 
-### 4.1 Spans
+### 4.1 Canonical event ledger
 
-- One root span per dispatch.
-- Child spans per phase (`plan`, `materialize`, `launch`, `probe`, `finalize`).
-- Required attributes:
-  - `dispatch_id`
-  - `intent_id`
-  - `repo`
-  - `issue`
-  - `role`
-  - `directive`
-  - `backend_kind`
-  - `delivery_id`
+- Every dispatch transition appends one row to `dispatch_events` in the same transaction as the `dispatches` row update.
+- The ledger is the canonical truth for:
+  - lifecycle state transitions
+  - stale auto-heal transitions
+  - failure reasons (via `reason_code` + `error_text`)
 
-### 4.2 Metrics
+### 4.2 Optional phase timings
 
-- Counter edges by lifecycle event:
-  - started/completed/failed/blocked/timed_out/canceled
-  - stale auto-heal count
-  - retry count
-- Histograms:
-  - phase latency
-  - end-to-end dispatch duration
+Phase timings can be logged (via tracing) and later persisted for slicing/reporting. We intentionally avoid
+requiring a metrics backend in early dogfooding.
 
 ### 4.3 Cardinality policy
 
-- High-cardinality IDs remain in spans/events.
-- Metrics avoid high-cardinality labels.
+- SQLite can store high-cardinality IDs (dispatch_id, delivery_id, etc.).
+- Any derived aggregates or future exports should avoid high-cardinality labels by default.
 
 ## 5. Backend Strategy
 
@@ -141,15 +130,17 @@ Exit criteria:
 
 - Control-plane mutation is Rust-owned and deterministic.
 
-## CP5: OTel wiring over typed events
+## CP5: Telemetry slicing (SQLite) (future)
 
-- Add tracing + OTLP exporter integration.
-- Map typed dispatch events to spans and metrics.
-- Add correlation IDs across all phase spans.
+- Add an `orchd obs ...` CLI that slices SQLite into concise, agent-friendly views:
+  - issue timeline
+  - dispatch timeline
+  - recent failures + reasons
+  - latency reports (if persisted)
 
 Exit criteria:
 
-- Every dispatch transition emits consistent telemetry.
+- Operators and agents can debug most failures from SQLite + run artifacts without a metrics backend.
 
 ## CP6: Live orchd integration harness
 

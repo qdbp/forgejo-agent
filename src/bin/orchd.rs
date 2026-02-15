@@ -19,7 +19,7 @@ use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Once, OnceLock};
+use std::sync::Once;
 use std::time::Duration as StdDuration;
 use std::time::Instant;
 
@@ -44,13 +44,6 @@ use tracing_subscriber::util::SubscriberInitExt as _;
 
 use api::ForgejoClient;
 use config::AgentConfig;
-use opentelemetry::metrics::{Counter, Histogram};
-use opentelemetry::trace::TracerProvider as _;
-use opentelemetry::{KeyValue, global};
-use opentelemetry_otlp::{MetricExporter, SpanExporter, WithExportConfig};
-use opentelemetry_sdk::Resource;
-use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider, Temporality};
-use opentelemetry_sdk::trace as sdktrace;
 use orchd_dispatch_core::{
     DispatchBackendKind, DispatchEventKind, DispatchIntentV1, DispatchPolicyOutcome, DispatchState,
     PolicyDecision as DispatchPolicyDecision, RunHandle, reduce_dispatch_state,
@@ -59,115 +52,17 @@ use types::{ApiIssue, IssueRef, OrchdRuntimeState, RepoRef};
 
 type HmacSha256 = Hmac<Sha256>;
 
-static TELEMETRY_INIT: Once = Once::new();
-static TELEMETRY_METRICS: OnceLock<OrchdMetrics> = OnceLock::new();
-
-struct OrchdMetrics {
-    dispatch_transitions_total: Counter<u64>,
-    dispatch_phase_latency_ms: Histogram<f64>,
-}
-
-fn orchd_metrics() -> &'static OrchdMetrics {
-    TELEMETRY_METRICS.get_or_init(|| {
-        let meter = global::meter("orchd");
-        OrchdMetrics {
-            dispatch_transitions_total: meter
-                .u64_counter("orchd.dispatch.transitions_total")
-                .with_description("Total dispatch transition events recorded by orchd")
-                .build(),
-            dispatch_phase_latency_ms: meter
-                .f64_histogram("orchd.dispatch.phase_latency_ms")
-                .with_description("Dispatch orchestration phase latency in milliseconds")
-                .build(),
-        }
-    })
-}
+static TRACING_INIT: Once = Once::new();
 
 fn record_phase_latency_ms(phase: &'static str, elapsed_ms: f64, outcome: &'static str) {
-    orchd_metrics().dispatch_phase_latency_ms.record(
-        elapsed_ms,
-        &[
-            KeyValue::new("phase", phase),
-            KeyValue::new("outcome", outcome),
-        ],
-    );
-}
-
-fn record_dispatch_transition_metric(event_kind: DispatchEventKind, to_state: &str) {
-    orchd_metrics().dispatch_transitions_total.add(
-        1,
-        &[
-            KeyValue::new("event_kind", event_kind.as_db_str()),
-            KeyValue::new("to_state", to_state.to_string()),
-        ],
-    );
+    tracing::debug!(phase, outcome, elapsed_ms, "dispatch phase latency");
 }
 
 fn init_telemetry() {
-    TELEMETRY_INIT.call_once(|| {
+    TRACING_INIT.call_once(|| {
         let env_filter =
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
         let fmt_layer = tracing_subscriber::fmt::layer().with_target(true).compact();
-
-        if let Ok(endpoint) = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT") {
-            let resource = Resource::new(vec![
-                KeyValue::new("service.name", "orchd"),
-                KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
-            ]);
-            let tracer_result = SpanExporter::builder()
-                .with_http()
-                .with_endpoint(endpoint.clone())
-                .build()
-                .map(|exporter| {
-                    sdktrace::TracerProvider::builder()
-                        .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
-                        .with_resource(resource.clone())
-                        .build()
-                });
-            let meter_result = MetricExporter::builder()
-                .with_http()
-                .with_endpoint(endpoint)
-                .with_temporality(Temporality::Delta)
-                .build()
-                .map(|exporter| {
-                    let reader = PeriodicReader::builder(exporter, opentelemetry_sdk::runtime::Tokio)
-                        .with_interval(StdDuration::from_secs(5))
-                        .build();
-                    SdkMeterProvider::builder()
-                        .with_reader(reader)
-                        .with_resource(resource)
-                        .build()
-                });
-            match (tracer_result, meter_result) {
-                (Ok(tracer_provider), Ok(meter_provider)) => {
-                    global::set_tracer_provider(tracer_provider.clone());
-                    global::set_meter_provider(meter_provider);
-                    let tracer = tracer_provider.tracer("orchd");
-                    let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
-                    let _ = tracing_subscriber::registry()
-                        .with(env_filter)
-                        .with(fmt_layer)
-                        .with(otel_layer)
-                        .try_init();
-                    return;
-                }
-                (Err(trace_err), Ok(_)) => {
-                    eprintln!(
-                        "failed to initialize OTLP tracer, falling back to fmt logs: {trace_err}"
-                    );
-                }
-                (Ok(_), Err(metric_err)) => {
-                    eprintln!(
-                        "failed to initialize OTLP metrics exporter, falling back to fmt logs: {metric_err}"
-                    );
-                }
-                (Err(trace_err), Err(metric_err)) => {
-                    eprintln!(
-                        "failed to initialize OTLP telemetry, falling back to fmt logs: trace={trace_err}; metrics={metric_err}"
-                    );
-                }
-            }
-        }
 
         let _ = tracing_subscriber::registry()
             .with(env_filter)
@@ -861,7 +756,6 @@ async fn run() -> Result<()> {
         .await
         .context("orchd server failed")?;
 
-    global::shutdown_tracer_provider();
     Ok(())
 }
 
@@ -3276,7 +3170,6 @@ fn append_dispatch_event_tx(
             Utc::now().to_rfc3339(),
         ],
     )?;
-    record_dispatch_transition_metric(event_kind, to_state);
     info!(
         dispatch_id = dispatch_id,
         event_kind = event_kind.as_db_str(),
