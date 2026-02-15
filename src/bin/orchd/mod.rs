@@ -28,6 +28,9 @@ mod webhook;
 // SQLite schema + queries + dispatch state transitions. Read when changing locking, queues, or persistence.
 mod db;
 
+// Repo/worktree management + git plumbing (with token injection). Read when touching checkouts, worktrees, or locks.
+mod repo;
+
 // tmux integration: naming, window/pane liveness probing, and run-script generation. Read when debugging operator UX.
 mod tmux;
 
