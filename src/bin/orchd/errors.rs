@@ -25,6 +25,8 @@ pub(super) enum DispatchError {
     },
     #[error("invalid issue ref: {0}")]
     InvalidIssueRef(String),
+    #[error("prompt template failure: {0}")]
+    PromptTemplate(String),
     #[error("io failure: {0}")]
     Io(String),
     #[error("tmux failure: {0}")]
@@ -45,6 +47,7 @@ impl DispatchError {
             Self::IssueDispatchInFlight { .. } => "issue_dispatch_in_flight",
             Self::RepoImplDispatchInFlight { .. } => "repo_impl_dispatch_in_flight",
             Self::InvalidIssueRef(_) => "invalid_issue_ref",
+            Self::PromptTemplate(_) => "prompt_template_error",
             Self::Io(_) => "io_failure",
             Self::Tmux(_) => "tmux_failure",
             Self::IssueFetch(_) => "issue_fetch_failure",
@@ -61,7 +64,8 @@ pub(super) const fn runtime_state_for_dispatch_error(error: &DispatchError) -> O
         | DispatchError::DirectiveNotConfigured(_)
         | DispatchError::RoleNotConfigured(_)
         | DispatchError::InvalidIssueRef(_) => OrchdRuntimeState::Blocked,
-        DispatchError::ConfigNotLoaded
+        DispatchError::PromptTemplate(_)
+        | DispatchError::ConfigNotLoaded
         | DispatchError::Io(_)
         | DispatchError::Tmux(_)
         | DispatchError::IssueFetch(_)

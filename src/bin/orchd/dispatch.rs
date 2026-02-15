@@ -180,13 +180,120 @@ fn codex_sandbox_for_directive(directive: &str) -> &'static str {
     }
 }
 
-fn render_prompt(template: &str, values: &[(&str, String)]) -> String {
+fn unresolved_prompt_tokens(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut remainder = text;
+    loop {
+        let Some(start) = remainder.find("{{") else {
+            break;
+        };
+        let after_start = &remainder[start + 2..];
+        let Some(end) = after_start.find("}}") else {
+            break;
+        };
+        let key = &after_start[..end];
+        if !key.is_empty()
+            && key
+                .bytes()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == b'_')
+        {
+            tokens.push(format!("{{{{{key}}}}}"));
+        }
+        remainder = &after_start[end + 2..];
+    }
+    tokens.sort();
+    tokens.dedup();
+    tokens
+}
+
+fn render_prompt(template: &str, values: &[(&str, &str)]) -> Result<String, DispatchError> {
     let mut text = template.to_string();
     for (key, value) in values {
         let token = format!("{{{{{key}}}}}");
         text = text.replace(&token, value);
     }
-    text
+
+    let unresolved = unresolved_prompt_tokens(&text);
+    if !unresolved.is_empty() {
+        return Err(DispatchError::PromptTemplate(format!(
+            "unresolved prompt tokens: {}",
+            unresolved.join(", ")
+        )));
+    }
+    Ok(text)
+}
+
+fn build_dispatch_md(plan: &DispatchPlan, prompt_mode: &str) -> String {
+    format!(
+        r"## Dispatch
+
+- role: `{role}`
+- directive: `{directive}`
+- actor: `{actor}`
+- issue: `{issue_ref}`
+- session: `{prompt_mode}`
+- delivery: `{delivery_id}`
+- event: `{event_type}`
+- issue url: <{issue_url}>
+",
+        role = plan.intent.role,
+        directive = plan.intent.directive,
+        actor = plan.actor,
+        issue_ref = plan.issue_ref,
+        prompt_mode = prompt_mode,
+        delivery_id = plan.intent.delivery_id,
+        event_type = plan.event_type,
+        issue_url = plan.issue_url,
+    )
+}
+
+fn build_issue_md_fresh(plan: &DispatchPlan) -> String {
+    let body = if plan.issue_body.trim().is_empty() {
+        "(empty)".to_string()
+    } else {
+        plan.issue_body.clone()
+    };
+    format!(
+        r"## Issue
+
+Title:
+{title}
+
+Body:
+{body}
+",
+        title = plan.issue_title,
+        body = body
+    )
+}
+
+fn build_issue_md_followup(plan: &DispatchPlan) -> String {
+    let delta = if plan.issue_delta_summary.trim().is_empty() {
+        "(no new issue activity)".to_string()
+    } else {
+        plan.issue_delta_summary.clone()
+    };
+    let body = if plan.issue_body.trim().is_empty() {
+        "(empty)".to_string()
+    } else {
+        plan.issue_body.clone()
+    };
+    format!(
+        r"## Issue
+
+Title:
+{title}
+
+What's new since your last turn:
+{delta}
+
+Body (for reference):
+{body}
+",
+        title = plan.issue_title,
+        delta = delta,
+        body = body
+    )
 }
 
 async fn fetch_issue(state: AppState, issue: IssueRef) -> Result<ApiIssue, DispatchError> {
@@ -580,41 +687,41 @@ fn materialize_run_artifacts(
     dispatch_config: &DispatchConfig,
     plan: &DispatchPlan,
 ) -> Result<DispatchRunArtifacts, DispatchError> {
-    let directive_template = fs::read_to_string(&plan.directive.prompt_file).map_err(|err| {
+    let orders_template = fs::read_to_string(&plan.directive.prompt_file).map_err(|err| {
         DispatchError::Io(format!(
             "failed reading prompt {}: {err}",
             plan.directive.prompt_file.display()
         ))
     })?;
-    let directive_prompt = render_prompt(
-        &directive_template,
-        &[
-            ("issue_ref", plan.issue_ref.to_string()),
-            ("repo", plan.intent.repo_full_name.clone()),
-            ("issue_number", plan.intent.issue_number.to_string()),
-            ("directive", plan.intent.directive.clone()),
-            ("target_role", plan.intent.role.clone()),
-            ("actor", plan.actor.clone()),
-            ("issue_title", plan.issue_title.clone()),
-            ("issue_body", plan.issue_body.clone()),
-            ("issue_url", plan.issue_url.clone()),
-            ("event_type", plan.event_type.clone()),
-            ("delivery_id", plan.intent.delivery_id.clone()),
-        ],
-    );
-    let (prompt_mode, envelope_path, issue_delta) = if plan.issue_session_id.is_some() {
+    let orders_md = render_prompt(&orders_template, &[])?;
+
+    let (prompt_mode, envelope_path) = if plan.issue_session_id.is_some() {
         (
             "followup",
             &dispatch_config.prompt_envelopes.followup_envelope,
-            plan.issue_delta_summary.clone(),
         )
     } else {
-        (
-            "fresh",
-            &dispatch_config.prompt_envelopes.fresh_envelope,
-            "(fresh session; no prior issue delta context)".to_string(),
-        )
+        ("fresh", &dispatch_config.prompt_envelopes.fresh_envelope)
     };
+
+    let preamble_md = if prompt_mode == "fresh" {
+        fs::read_to_string(&dispatch_config.prompt_envelopes.preamble_file).map_err(|err| {
+            DispatchError::Io(format!(
+                "failed reading prompt preamble {}: {err}",
+                dispatch_config.prompt_envelopes.preamble_file.display()
+            ))
+        })?
+    } else {
+        String::new()
+    };
+
+    let dispatch_md = build_dispatch_md(plan, prompt_mode);
+    let issue_md = if prompt_mode == "fresh" {
+        build_issue_md_fresh(plan)
+    } else {
+        build_issue_md_followup(plan)
+    };
+
     let envelope_template = fs::read_to_string(envelope_path).map_err(|err| {
         DispatchError::Io(format!(
             "failed reading prompt envelope {}: {err}",
@@ -624,22 +731,12 @@ fn materialize_run_artifacts(
     let prompt = render_prompt(
         &envelope_template,
         &[
-            ("issue_ref", plan.issue_ref.to_string()),
-            ("repo", plan.intent.repo_full_name.clone()),
-            ("issue_number", plan.intent.issue_number.to_string()),
-            ("directive", plan.intent.directive.clone()),
-            ("target_role", plan.intent.role.clone()),
-            ("actor", plan.actor.clone()),
-            ("issue_title", plan.issue_title.clone()),
-            ("issue_body", plan.issue_body.clone()),
-            ("issue_url", plan.issue_url.clone()),
-            ("event_type", plan.event_type.clone()),
-            ("delivery_id", plan.intent.delivery_id.clone()),
-            ("session_mode", prompt_mode.to_string()),
-            ("issue_delta", issue_delta),
-            ("directive_prompt", directive_prompt),
+            ("preamble_md", &preamble_md),
+            ("dispatch_md", &dispatch_md),
+            ("issue_md", &issue_md),
+            ("orders_md", &orders_md),
         ],
-    );
+    )?;
 
     let prompt_path = plan.run_dir.join("prompt.md");
     fs::write(&prompt_path, prompt)
@@ -709,22 +806,9 @@ fn materialize_run_artifacts(
                         .display()
                 ))
             })?;
-            let bootstrap_prompt = render_prompt(
-                &bootstrap_template,
-                &[
-                    ("issue_ref", plan.issue_ref.to_string()),
-                    ("repo", plan.intent.repo_full_name.clone()),
-                    ("issue_number", plan.intent.issue_number.to_string()),
-                    ("directive", plan.intent.directive.clone()),
-                    ("target_role", plan.intent.role.clone()),
-                    ("actor", plan.actor.clone()),
-                    ("issue_title", plan.issue_title.clone()),
-                    ("issue_url", plan.issue_url.clone()),
-                    ("event_type", plan.event_type.clone()),
-                    ("delivery_id", plan.intent.delivery_id.clone()),
-                    ("prompt_path", prompt_path.display().to_string()),
-                ],
-            );
+            let prompt_path_text = prompt_path.display().to_string();
+            let bootstrap_prompt =
+                render_prompt(&bootstrap_template, &[("prompt_path", &prompt_path_text)])?;
             fs::write(&bootstrap_prompt_path, bootstrap_prompt).map_err(|err| {
                 DispatchError::Io(format!("failed writing bootstrap prompt: {err}"))
             })?;

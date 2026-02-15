@@ -25,6 +25,7 @@ pub(super) struct DispatchTmuxConfig {
 
 #[derive(Clone, Debug)]
 pub(super) struct DispatchPromptEnvelopeConfig {
+    pub(super) preamble_file: PathBuf,
     pub(super) fresh_envelope: PathBuf,
     pub(super) followup_envelope: PathBuf,
     pub(super) tmux_tui_bootstrap: PathBuf,
@@ -68,15 +69,28 @@ struct DispatchTmuxConfigFile {
     remain_on_exit: bool,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DispatchPromptEnvelopeConfigFile {
+    #[serde(default = "default_preamble_file")]
+    preamble_file: String,
     #[serde(default = "default_fresh_envelope")]
     fresh_envelope: String,
     #[serde(default = "default_followup_envelope")]
     followup_envelope: String,
     #[serde(default = "default_tmux_tui_bootstrap_file")]
     tmux_tui_bootstrap: String,
+}
+
+impl Default for DispatchPromptEnvelopeConfigFile {
+    fn default() -> Self {
+        Self {
+            preamble_file: default_preamble_file(),
+            fresh_envelope: default_fresh_envelope(),
+            followup_envelope: default_followup_envelope(),
+            tmux_tui_bootstrap: default_tmux_tui_bootstrap_file(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -108,6 +122,10 @@ fn default_codex_bin() -> String {
 
 fn default_forgejoctl_bin() -> String {
     "/home/main/.local/bin/forgejoctl".to_string()
+}
+
+fn default_preamble_file() -> String {
+    "../prompts/orchd-preamble.md".to_string()
 }
 
 fn default_fresh_envelope() -> String {
@@ -194,6 +212,7 @@ pub(super) fn load_dispatch_config(path: &Path) -> Result<DispatchConfig> {
             remain_on_exit: raw.tmux.remain_on_exit,
         },
         prompt_envelopes: DispatchPromptEnvelopeConfig {
+            preamble_file: resolve_config_path(&base_dir, &raw.prompt_envelopes.preamble_file)?,
             fresh_envelope: resolve_config_path(&base_dir, &raw.prompt_envelopes.fresh_envelope)?,
             followup_envelope: resolve_config_path(
                 &base_dir,
