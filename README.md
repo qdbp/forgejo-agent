@@ -192,6 +192,31 @@ For Rust changes in this repo, run:
 python3 /home/main/forgejo-agent/scripts/check.py
 ```
 
+## Live Forgejo Integration Test
+
+`tests/live_forgejo.rs` provides the first full round-trip test:
+
+- starts a self-contained Forgejo instance in a temp directory
+- migrates DB + creates admin user/token
+- runs `forgejoctl repo ensure`
+- runs `forgejoctl issue create`
+- verifies issue fields via direct Forgejo API read-back
+
+Default `cargo test` keeps this test inert unless explicitly enabled.
+
+Run it manually:
+
+```bash
+cd /home/main/forgejo-agent
+FORGEJO_LIVE_TESTS=1 cargo test --test live_forgejo -- --nocapture
+```
+
+Timing collection:
+
+- each step appends JSONL timing entries to `target/live-test-timings.jsonl`
+- override sink path with `FORGEJO_LIVE_TIMINGS_PATH=/path/to/file.jsonl`
+- keep fixture dirs for debugging with `FORGEJO_LIVE_KEEP_FIXTURE=1`
+
 ## Git Hooks
 
 Install repo-managed hooks:
