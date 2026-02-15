@@ -10,6 +10,9 @@
 - For any Rust code change in this repo, run `python3 scripts/check.py` before finishing.
 - Treat any failure from `scripts/check.py` as blocking; do not ship until green.
 - Prefer fixing code over weakening lint settings; only add an allow when there is a clear policy reason.
+- Follow `docs/TESTING_POLICY.md` for tiered test requirements.
+- If you touch `src/main.rs`, `src/api.rs`, `src/policy.rs`, `src/types.rs`, or `tests/live_forgejo.rs`, also run:
+  - `FORGEJO_LIVE_TESTS=1 cargo test --test live_forgejo -- --nocapture`
 
 ## Forgejo Access Policy
 

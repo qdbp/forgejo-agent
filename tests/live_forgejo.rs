@@ -449,7 +449,7 @@ fn forgejo_agent_bin() -> Result<PathBuf> {
     );
 }
 
-fn run_cli_json(config_path: &Path, token_path: &Path, args: &[&str]) -> Result<Value> {
+fn run_cli_output(config_path: &Path, token_path: &Path, args: &[&str]) -> Result<Output> {
     let mut cmd = Command::new(forgejo_agent_bin()?);
 
     cmd.arg("--config")
@@ -458,40 +458,205 @@ fn run_cli_json(config_path: &Path, token_path: &Path, args: &[&str]) -> Result<
         .arg(token_path)
         .args(args);
 
-    let output = cmd.output().context("failed to run forgejo-agent CLI")?;
-    if !output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!(
-            "forgejo-agent command failed (status={:?})\nstdout:\n{stdout}\nstderr:\n{stderr}",
-            output.status.code()
-        );
-    }
+    cmd.output().context("failed to run forgejo-agent CLI")
+}
 
-    let stdout = String::from_utf8(output.stdout).context("forgejo-agent stdout not utf-8")?;
-    serde_json::from_str(&stdout).with_context(|| format!("stdout was not JSON: {stdout}"))
+fn decode_output_stdout(output: &Output) -> Result<String> {
+    String::from_utf8(output.stdout.clone()).context("forgejo-agent stdout not utf-8")
+}
+
+fn decode_output_stderr(output: &Output) -> Result<String> {
+    String::from_utf8(output.stderr.clone()).context("forgejo-agent stderr not utf-8")
 }
 
 fn run_cli_plain(config_path: &Path, token_path: &Path, args: &[&str]) -> Result<String> {
-    let mut cmd = Command::new(forgejo_agent_bin()?);
-
-    cmd.arg("--config")
-        .arg(config_path)
-        .arg("--token-file")
-        .arg(token_path)
-        .args(args);
-
-    let output = cmd.output().context("failed to run forgejo-agent CLI")?;
-    if !output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!(
-            "forgejo-agent command failed (status={:?})\nstdout:\n{stdout}\nstderr:\n{stderr}",
-            output.status.code()
-        );
+    let output = run_cli_output(config_path, token_path, args)?;
+    let stdout = decode_output_stdout(&output)?;
+    let stderr = decode_output_stderr(&output)?;
+    if output.status.success() {
+        return Ok(stdout);
     }
 
-    String::from_utf8(output.stdout).context("forgejo-agent stdout not utf-8")
+    bail!(
+        "forgejo-agent command failed (status={:?})\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status.code()
+    )
+}
+
+fn run_cli_json(config_path: &Path, token_path: &Path, args: &[&str]) -> Result<Value> {
+    let stdout = run_cli_plain(config_path, token_path, args)?;
+    serde_json::from_str(&stdout).with_context(|| format!("stdout was not JSON: {stdout}"))
+}
+
+fn run_cli_expect_failure(config_path: &Path, token_path: &Path, args: &[&str]) -> Result<Output> {
+    let output = run_cli_output(config_path, token_path, args)?;
+    if !output.status.success() {
+        return Ok(output);
+    }
+
+    let stdout = decode_output_stdout(&output)?;
+    let stderr = decode_output_stderr(&output)?;
+    bail!("expected failure but command succeeded\nstdout:\n{stdout}\nstderr:\n{stderr}")
+}
+
+fn json_u64_field(value: &Value, field: &str) -> Result<u64> {
+    value
+        .get(field)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("JSON missing numeric field '{field}'"))
+}
+
+fn json_str_field<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("JSON missing string field '{field}'"))
+}
+
+fn issue_label_names(issue: &Value) -> Result<Vec<String>> {
+    let labels = issue
+        .get("labels")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("issue JSON missing labels array"))?;
+
+    let mut names = Vec::with_capacity(labels.len());
+    for label in labels {
+        let name = label
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("issue label missing name"))?;
+        names.push(name.to_string());
+    }
+    names.sort_unstable();
+    Ok(names)
+}
+
+fn issue_has_label(issue: &Value, label_name: &str) -> Result<bool> {
+    Ok(issue_label_names(issue)?
+        .iter()
+        .any(|name| name == label_name))
+}
+
+fn issue_label_prefix_count(issue: &Value, prefix: &str) -> Result<usize> {
+    Ok(issue_label_names(issue)?
+        .iter()
+        .filter(|name| name.starts_with(prefix))
+        .count())
+}
+
+fn ensure_contains(haystack: &str, needle: &str, context: &str) -> Result<()> {
+    if haystack.contains(needle) {
+        return Ok(());
+    }
+    bail!("expected '{needle}' in {context}: {haystack}");
+}
+
+#[derive(Debug)]
+struct LiveHarness {
+    timer: StepTimer,
+    fixture: ForgejoFixture,
+    repo_name: String,
+    repo_ref: String,
+    config_path: PathBuf,
+    token_path: PathBuf,
+}
+
+impl LiveHarness {
+    fn bootstrap(test_name: &'static str) -> Result<Self> {
+        let timer = StepTimer::new(test_name);
+        let fixture = ForgejoFixture::spawn(&timer)?;
+        let repo_name = format!("itest-{}", unique_suffix()?);
+        let repo_ref = format!("{}/{}", fixture.owner, repo_name);
+        let (config_path, token_path) = fixture.write_agent_config(&repo_name, &timer)?;
+
+        let start = Instant::now();
+        let ensure_output =
+            run_cli_plain(&config_path, &token_path, &["repo", "ensure", &repo_ref])?;
+        timer.record("repo.ensure", start)?;
+        ensure_contains(&ensure_output, "repo ensured", "repo ensure output")?;
+
+        Ok(Self {
+            timer,
+            fixture,
+            repo_name,
+            repo_ref,
+            config_path,
+            token_path,
+        })
+    }
+
+    fn issue_ref(&self, issue_number: u64) -> String {
+        format!("{}#{issue_number}", self.repo_ref)
+    }
+
+    fn issue_api_path(&self, issue_number: u64) -> String {
+        format!(
+            "/api/v1/repos/{}/{}/issues/{issue_number}",
+            self.fixture.owner, self.repo_name
+        )
+    }
+
+    fn run_plain_timed(&self, step: &str, args: &[&str]) -> Result<String> {
+        let start = Instant::now();
+        let output = run_cli_plain(&self.config_path, &self.token_path, args)?;
+        self.timer.record(step, start)?;
+        Ok(output)
+    }
+
+    fn run_json_timed(&self, step: &str, args: &[&str]) -> Result<Value> {
+        let start = Instant::now();
+        let output = run_cli_json(&self.config_path, &self.token_path, args)?;
+        self.timer.record(step, start)?;
+        Ok(output)
+    }
+
+    fn run_failure_timed(&self, step: &str, args: &[&str]) -> Result<Output> {
+        let start = Instant::now();
+        let output = run_cli_expect_failure(&self.config_path, &self.token_path, args)?;
+        self.timer.record(step, start)?;
+        Ok(output)
+    }
+
+    fn create_issue(&self, title: &str, body: &str, workflow: &str) -> Result<u64> {
+        let issue = self.run_json_timed(
+            "issue.create",
+            &[
+                "issue",
+                "create",
+                self.repo_ref.as_str(),
+                "--title",
+                title,
+                "--body",
+                body,
+                "--workflow",
+                workflow,
+                "--json",
+            ],
+        )?;
+        json_u64_field(&issue, "number")
+    }
+
+    fn get_issue(&self, issue_number: u64) -> Result<Value> {
+        let start = Instant::now();
+        let issue = self
+            .fixture
+            .authed_get(&self.issue_api_path(issue_number))?;
+        self.timer.record("issue.verify_read_back", start)?;
+        Ok(issue)
+    }
+
+    fn list_open_issues(&self) -> Result<Vec<Value>> {
+        let start = Instant::now();
+        let payload = self.fixture.authed_get(&format!(
+            "/api/v1/repos/{}/{}/issues?state=open&limit=100",
+            self.fixture.owner, self.repo_name
+        ))?;
+        self.timer.record("issues.list_open", start)?;
+        let issues = payload
+            .as_array()
+            .ok_or_else(|| anyhow!("list open issues payload was not an array"))?;
+        Ok(issues.clone())
+    }
 }
 
 #[test]
@@ -505,29 +670,14 @@ fn live_smoke_then_add_issue_round_trip() -> Result<()> {
         return Ok(());
     }
 
-    let timer = StepTimer::new("live_smoke_then_add_issue_round_trip");
+    let harness = LiveHarness::bootstrap("live_smoke_then_add_issue_round_trip")?;
 
-    let fixture = ForgejoFixture::spawn(&timer)?;
-
-    let repo_name = format!("itest-{}", unique_suffix()?);
-    let repo_ref = format!("{}/{}", fixture.owner, repo_name);
-    let (config_path, token_path) = fixture.write_agent_config(&repo_name, &timer)?;
-
-    let ensure_started = Instant::now();
-    let ensure_output = run_cli_plain(&config_path, &token_path, &["repo", "ensure", &repo_ref])?;
-    timer.record("repo.ensure", ensure_started)?;
-    if !ensure_output.contains("repo ensured") {
-        bail!("unexpected repo ensure output: {ensure_output}");
-    }
-
-    let create_started = Instant::now();
-    let create_output = run_cli_json(
-        &config_path,
-        &token_path,
+    let create_output = harness.run_json_timed(
+        "issue.create",
         &[
             "issue",
             "create",
-            &repo_ref,
+            harness.repo_ref.as_str(),
             "--title",
             "itest title",
             "--body",
@@ -537,48 +687,25 @@ fn live_smoke_then_add_issue_round_trip() -> Result<()> {
             "--json",
         ],
     )?;
-    timer.record("issue.create", create_started)?;
 
-    let issue_number = create_output
-        .get("number")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| anyhow!("issue create JSON missing numeric 'number'"))?;
-
-    let issue_title = create_output
-        .get("title")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("issue create JSON missing string 'title'"))?;
+    let issue_number = json_u64_field(&create_output, "number")?;
+    let issue_title = json_str_field(&create_output, "title")?;
     if issue_title != "itest title" {
         bail!("issue create returned unexpected title: {issue_title}");
     }
 
-    let verify_started = Instant::now();
-    let read_back = fixture.authed_get(&format!(
-        "/api/v1/repos/{}/{}/issues/{issue_number}",
-        fixture.owner, repo_name
-    ))?;
-    timer.record("issue.verify_read_back", verify_started)?;
-
-    let read_back_title = read_back
-        .get("title")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("read-back issue JSON missing string 'title'"))?;
+    let read_back = harness.get_issue(issue_number)?;
+    let read_back_title = json_str_field(&read_back, "title")?;
     if read_back_title != "itest title" {
         bail!("read-back issue title mismatch: {read_back_title}");
     }
 
-    let read_back_body = read_back
-        .get("body")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("read-back issue JSON missing string 'body'"))?;
+    let read_back_body = json_str_field(&read_back, "body")?;
     if read_back_body != "itest body" {
         bail!("read-back issue body mismatch: {read_back_body}");
     }
 
-    let read_back_state = read_back
-        .get("state")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("read-back issue JSON missing string 'state'"))?;
+    let read_back_state = json_str_field(&read_back, "state")?;
     if read_back_state != "open" {
         bail!("read-back issue state mismatch: expected open, got {read_back_state}");
     }
@@ -589,11 +716,198 @@ fn live_smoke_then_add_issue_round_trip() -> Result<()> {
         .and_then(|user| user.get("login"))
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("read-back issue JSON missing author login"))?;
-    if author_login != fixture.owner {
+    if author_login != harness.fixture.owner {
         bail!(
             "read-back author mismatch: expected {}, got {author_login}",
-            fixture.owner
+            harness.fixture.owner
         );
+    }
+
+    Ok(())
+}
+
+#[test]
+#[serial(live_forgejo)]
+fn live_issue_claim_release_and_transition_round_trip() -> Result<()> {
+    if !live_tests_enabled() {
+        eprintln!(
+            "skipping live Forgejo integration test; enable with {}=1",
+            LIVE_TESTS_ENV
+        );
+        return Ok(());
+    }
+
+    let harness = LiveHarness::bootstrap("live_issue_claim_release_and_transition_round_trip")?;
+    let issue_number = harness.create_issue("claim lifecycle", "claim lifecycle body", "ready")?;
+    let issue_ref = harness.issue_ref(issue_number);
+
+    let claim_output = harness.run_plain_timed(
+        "issue.claim",
+        &["issue", "claim", &issue_ref, "--agent", "codex-a"],
+    )?;
+    ensure_contains(&claim_output, "claimed:", "claim output")?;
+
+    let claimed = harness.get_issue(issue_number)?;
+    if !issue_has_label(&claimed, "state/in-progress")? {
+        bail!("expected state/in-progress after claim");
+    }
+    if !issue_has_label(&claimed, "claimed/codex-a")? {
+        bail!("expected claimed/codex-a label after claim");
+    }
+
+    let conflict = harness.run_failure_timed(
+        "issue.claim_non_ready_rejected",
+        &["issue", "claim", &issue_ref, "--agent", "codex-b"],
+    )?;
+    let conflict_stderr = decode_output_stderr(&conflict)?;
+    ensure_contains(&conflict_stderr, "is not ready", "non-ready claim stderr")?;
+
+    let release_output = harness.run_plain_timed(
+        "issue.release",
+        &["issue", "release", &issue_ref, "--agent", "codex-a"],
+    )?;
+    ensure_contains(&release_output, "released:", "release output")?;
+
+    let released = harness.get_issue(issue_number)?;
+    if issue_has_label(&released, "claimed/codex-a")? {
+        bail!("claim label should be removed after release");
+    }
+    if !issue_has_label(&released, "state/ready")? {
+        bail!("expected state/ready after release");
+    }
+
+    let illegal_transition = harness.run_failure_timed(
+        "issue.transition_illegal",
+        &["issue", "transition", &issue_ref, "--to", "review"],
+    )?;
+    let illegal_stderr = decode_output_stderr(&illegal_transition)?;
+    ensure_contains(
+        &illegal_stderr,
+        "illegal workflow transition",
+        "illegal transition stderr",
+    )?;
+
+    let to_in_progress = harness.run_plain_timed(
+        "issue.transition_in_progress",
+        &["issue", "transition", &issue_ref, "--to", "in-progress"],
+    )?;
+    ensure_contains(&to_in_progress, "transitioned:", "transition output")?;
+
+    let to_review = harness.run_plain_timed(
+        "issue.transition_review",
+        &["issue", "transition", &issue_ref, "--to", "review"],
+    )?;
+    ensure_contains(&to_review, "transitioned:", "transition output")?;
+
+    let close_output = harness.run_plain_timed("issue.close", &["issue", "close", &issue_ref])?;
+    ensure_contains(&close_output, "closed:", "close output")?;
+
+    let closed_issue = harness.get_issue(issue_number)?;
+    let closed_state = json_str_field(&closed_issue, "state")?;
+    if closed_state != "closed" {
+        bail!("expected closed issue state, got {closed_state}");
+    }
+
+    let reopen_output = harness.run_plain_timed(
+        "issue.reopen",
+        &["issue", "reopen", &issue_ref, "--workflow", "triage"],
+    )?;
+    ensure_contains(&reopen_output, "reopened:", "reopen output")?;
+
+    let reopened = harness.get_issue(issue_number)?;
+    let reopened_state = json_str_field(&reopened, "state")?;
+    if reopened_state != "open" {
+        bail!("expected open issue state after reopen, got {reopened_state}");
+    }
+    if !issue_has_label(&reopened, "state/triage")? {
+        bail!("expected state/triage after reopen");
+    }
+
+    Ok(())
+}
+
+#[test]
+#[serial(live_forgejo)]
+fn live_issue_blocker_and_orchd_state_round_trip() -> Result<()> {
+    if !live_tests_enabled() {
+        eprintln!(
+            "skipping live Forgejo integration test; enable with {}=1",
+            LIVE_TESTS_ENV
+        );
+        return Ok(());
+    }
+
+    let harness = LiveHarness::bootstrap("live_issue_blocker_and_orchd_state_round_trip")?;
+    let parent_issue_number = harness.create_issue("parent issue", "parent body", "ready")?;
+    let parent_issue_ref = harness.issue_ref(parent_issue_number);
+
+    let blocker_output = harness.run_plain_timed(
+        "issue.blocker",
+        &[
+            "issue",
+            "blocker",
+            &parent_issue_ref,
+            "--title",
+            "Need upstream design",
+            "--body",
+            "blocked on upstream discussion",
+        ],
+    )?;
+    ensure_contains(&blocker_output, "blocker:", "blocker output")?;
+
+    let parent = harness.get_issue(parent_issue_number)?;
+    if !issue_has_label(&parent, "state/blocked")? {
+        bail!("expected parent issue to transition to state/blocked");
+    }
+
+    let open_issues = harness.list_open_issues()?;
+    let blocker_issue = open_issues
+        .iter()
+        .find(|issue| {
+            issue
+                .get("title")
+                .and_then(Value::as_str)
+                .is_some_and(|title| title == "[BLOCKER] Need upstream design")
+        })
+        .ok_or_else(|| anyhow!("failed to locate blocker issue in list output"))?;
+    let blocker_number = json_u64_field(blocker_issue, "number")?;
+    let blocker_details = harness.get_issue(blocker_number)?;
+    if !issue_has_label(&blocker_details, "type/blocker")? {
+        bail!("expected blocker issue to have type/blocker label");
+    }
+    if !issue_has_label(&blocker_details, "state/triage")? {
+        bail!("expected blocker issue to start in state/triage");
+    }
+
+    let orchd_queued = harness.run_plain_timed(
+        "issue.orchd_state_queued",
+        &["issue", "orchd-state", &parent_issue_ref, "--to", "queued"],
+    )?;
+    ensure_contains(&orchd_queued, "orchd-state:", "orchd queued output")?;
+
+    let parent_queued = harness.get_issue(parent_issue_number)?;
+    if !issue_has_label(&parent_queued, "orchd/state/queued")? {
+        bail!("expected orchd/state/queued after orchd-state transition");
+    }
+    if issue_label_prefix_count(&parent_queued, "orchd/state/")? != 1 {
+        bail!("expected exactly one orchd/state/* label after queued transition");
+    }
+
+    let orchd_running = harness.run_plain_timed(
+        "issue.orchd_state_running",
+        &["issue", "orchd-state", &parent_issue_ref, "--to", "running"],
+    )?;
+    ensure_contains(&orchd_running, "orchd-state:", "orchd running output")?;
+
+    let parent_running = harness.get_issue(parent_issue_number)?;
+    if !issue_has_label(&parent_running, "orchd/state/running")? {
+        bail!("expected orchd/state/running after orchd-state transition");
+    }
+    if issue_has_label(&parent_running, "orchd/state/queued")? {
+        bail!("orchd/state/queued should be replaced by orchd/state/running");
+    }
+    if issue_label_prefix_count(&parent_running, "orchd/state/")? != 1 {
+        bail!("expected exactly one orchd/state/* label after running transition");
     }
 
     Ok(())

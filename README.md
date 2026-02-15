@@ -216,6 +216,7 @@ Timing collection:
 - each step appends JSONL timing entries to `target/live-test-timings.jsonl`
 - override sink path with `FORGEJO_LIVE_TIMINGS_PATH=/path/to/file.jsonl`
 - keep fixture dirs for debugging with `FORGEJO_LIVE_KEEP_FIXTURE=1`
+- summarize timings with `python3 scripts/live_timing_report.py`
 
 ## Git Hooks
 
@@ -246,6 +247,7 @@ python3 /home/main/forgejo-agent/scripts/check.py
 ## Docs
 
 - `docs/ROOT_SETUP.md`
+- `docs/TESTING_POLICY.md`
 - `docs/AGENT_WORKFLOW.md`
 - `docs/WORKER_LOOP.md`
 - `docs/ORCHD_DEV.md`
