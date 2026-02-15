@@ -5,6 +5,9 @@ mod api;
 #[path = "../config.rs"]
 mod config;
 #[allow(dead_code)]
+#[path = "../orchd_dispatch_core.rs"]
+mod orchd_dispatch_core;
+#[allow(dead_code)]
 #[path = "../types.rs"]
 mod types;
 
@@ -34,6 +37,10 @@ use sha2::{Digest, Sha256};
 
 use api::ForgejoClient;
 use config::AgentConfig;
+use orchd_dispatch_core::{
+    DispatchBackendKind, DispatchEventKind, DispatchIntentV1, DispatchPolicyOutcome, DispatchState,
+    PolicyDecision as DispatchPolicyDecision, RunHandle, reduce_dispatch_state,
+};
 use types::{ApiIssue, IssueRef, OrchdRuntimeState, RepoRef};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -1799,11 +1806,16 @@ async fn dispatch_tmux(
         .clone()
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if !dispatch_config
+    let policy_decision = if dispatch_config
         .allowed_actors
         .iter()
         .any(|allowed| allowed == &actor)
     {
+        DispatchPolicyDecision::allow()
+    } else {
+        DispatchPolicyDecision::deny(format!("actor '{actor}' is not allowlisted"))
+    };
+    if policy_decision.outcome != DispatchPolicyOutcome::Allow {
         return Err(DispatchError::ActorNotAllowed(actor));
     }
 
@@ -1823,43 +1835,55 @@ async fn dispatch_tmux(
     let issue_number = record
         .issue_number
         .ok_or_else(|| DispatchError::InvalidIssueRef(record.repo_full_name.clone()))?;
+    let intent = DispatchIntentV1 {
+        intent_id: format!("event-{current_event_id}-decision-{decision_id}"),
+        repo_full_name: record.repo_full_name.clone(),
+        issue_number,
+        role: directive.role.clone(),
+        directive: directive_name.to_string(),
+        actor_login: actor.clone(),
+        delivery_id: record.delivery_id.clone(),
+        parent_dispatch_id: None,
+        created_at: Utc::now(),
+        policy_snapshot: Some("cp0".to_string()),
+    };
     if let Some(dispatch_id) = find_issue_inflight_dispatch_with_healing(
         &state.db_path,
-        &record.repo_full_name,
-        issue_number,
+        &intent.repo_full_name,
+        intent.issue_number,
     )
     .map_err(|err| DispatchError::Db(err.to_string()))?
     {
         return Err(DispatchError::IssueDispatchInFlight {
-            repo_full_name: record.repo_full_name.clone(),
-            issue_number,
+            repo_full_name: intent.repo_full_name,
+            issue_number: intent.issue_number,
             dispatch_id,
         });
     }
     let issue_session_id =
-        latest_issue_codex_session_id(&state.db_path, &record.repo_full_name, issue_number)
+        latest_issue_codex_session_id(&state.db_path, &intent.repo_full_name, intent.issue_number)
             .map_err(|err| DispatchError::Db(err.to_string()))?;
 
-    let lock_path = acquire_repo_lock(&state.db_path, &record.repo_full_name)?;
+    let lock_path = acquire_repo_lock(&state.db_path, &intent.repo_full_name)?;
 
-    let repo = RepoRef::parse(&record.repo_full_name)
-        .map_err(|_| DispatchError::InvalidIssueRef(record.repo_full_name.clone()))?;
+    let repo = RepoRef::parse(&intent.repo_full_name)
+        .map_err(|_| DispatchError::InvalidIssueRef(intent.repo_full_name.clone()))?;
     let issue_ref = IssueRef {
         repo,
-        number: issue_number,
+        number: intent.issue_number,
     };
     let issue = fetch_issue(state.clone(), issue_ref.clone()).await?;
     let previous_event_cursor = issue_role_cursor_event_id(
         &state.db_path,
-        &record.repo_full_name,
-        issue_number,
-        &directive.role,
+        &intent.repo_full_name,
+        intent.issue_number,
+        &intent.role,
     )
     .map_err(|err| DispatchError::Db(err.to_string()))?;
     let delta_rows = issue_delta_rows(
         &state.db_path,
-        &record.repo_full_name,
-        issue_number,
+        &intent.repo_full_name,
+        intent.issue_number,
         previous_event_cursor,
         current_event_id,
     )
@@ -1871,11 +1895,11 @@ async fn dispatch_tmux(
         &state.db_path,
         &DispatchInsert {
             decision_id,
-            repo_full_name: record.repo_full_name.clone(),
-            issue_number,
+            repo_full_name: intent.repo_full_name.clone(),
+            issue_number: intent.issue_number,
             actor_login: record.actor_login.clone(),
-            directive: directive_name.to_string(),
-            target_role: directive.role.clone(),
+            directive: intent.directive.clone(),
+            target_role: intent.role.clone(),
             started_at: now,
         },
     )
@@ -1885,14 +1909,14 @@ async fn dispatch_tmux(
         DispatchReservation::InFlight(dispatch_id) => {
             let _ = fs::remove_file(&lock_path);
             return Err(DispatchError::IssueDispatchInFlight {
-                repo_full_name: record.repo_full_name.clone(),
-                issue_number,
+                repo_full_name: intent.repo_full_name.clone(),
+                issue_number: intent.issue_number,
                 dispatch_id,
             });
         }
     };
 
-    let tmux_window = issue_tmux_window_name(&record.repo_full_name, issue_number);
+    let tmux_window = issue_tmux_window_name(&intent.repo_full_name, intent.issue_number);
     let run_dir = run_root(&state.db_path)?.join(format!("dispatch-{dispatch_id}"));
     fs::create_dir_all(&run_dir)
         .map_err(|err| DispatchError::Io(format!("failed to create run dir: {err}")))?;
@@ -1910,10 +1934,10 @@ async fn dispatch_tmux(
         &directive_template,
         &[
             ("issue_ref", issue_ref.to_string()),
-            ("repo", record.repo_full_name.clone()),
-            ("issue_number", issue_number.to_string()),
-            ("directive", directive_name.to_string()),
-            ("target_role", directive.role.clone()),
+            ("repo", intent.repo_full_name.clone()),
+            ("issue_number", intent.issue_number.to_string()),
+            ("directive", intent.directive.clone()),
+            ("target_role", intent.role.clone()),
             ("actor", actor.clone()),
             ("issue_title", issue_title.clone()),
             ("issue_body", issue_body.clone()),
@@ -1945,10 +1969,10 @@ async fn dispatch_tmux(
         &envelope_template,
         &[
             ("issue_ref", issue_ref.to_string()),
-            ("repo", record.repo_full_name.clone()),
-            ("issue_number", issue_number.to_string()),
-            ("directive", directive_name.to_string()),
-            ("target_role", directive.role.clone()),
+            ("repo", intent.repo_full_name.clone()),
+            ("issue_number", intent.issue_number.to_string()),
+            ("directive", intent.directive.clone()),
+            ("target_role", intent.role.clone()),
             ("actor", actor.clone()),
             ("issue_title", issue_title),
             ("issue_body", issue_body),
@@ -1973,7 +1997,7 @@ async fn dispatch_tmux(
     let last_message_path = run_dir.join("last_message.md");
     let codex_log_path = run_dir.join("codex.log");
     let marker_path = run_dir.join("start.marker");
-    let issue_ref_text = format!("{}#{}", record.repo_full_name, issue_number);
+    let issue_ref_text = format!("{}#{}", intent.repo_full_name, intent.issue_number);
     let tmux_locator = format!("{}:{}", dispatch_config.tmux.session, tmux_window);
 
     let script_inputs = TmuxRunScriptInputs {
@@ -1994,8 +2018,8 @@ async fn dispatch_tmux(
         codex_bin: &role.codex_bin,
         codex_role_arg: &role.codex_role_arg,
         issue_session_id: issue_session_id.as_deref(),
-        directive_name,
-        role_name: &directive.role,
+        directive_name: &intent.directive,
+        role_name: &intent.role,
         tmux_locator: &tmux_locator,
         timeout_sec: directive.timeout_sec,
     };
@@ -2006,7 +2030,7 @@ async fn dispatch_tmux(
             let bootstrap_prompt_path = run_dir.join("bootstrap_prompt.md");
             let bootstrap_prompt = format!(
                 "You are {} running under orchd dispatch.\n\nBefore taking any action, read and follow the full task instructions in this file:\n{}\n\nTreat that file as canonical for this dispatch.",
-                directive.role,
+                intent.role,
                 prompt_path.display()
             );
             fs::write(&bootstrap_prompt_path, bootstrap_prompt).map_err(|err| {
@@ -2040,11 +2064,14 @@ async fn dispatch_tmux(
         return Err(err);
     }
 
+    let run_handle = RunHandle {
+        backend_kind: DispatchBackendKind::Tmux,
+        backend_ref: tmux_locator,
+    };
     update_dispatch_running(
         &state.db_path,
         dispatch_id,
-        &dispatch_config.tmux.session,
-        &tmux_window,
+        &run_handle,
         &run_dir,
         &lock_path,
     )
@@ -2448,6 +2475,41 @@ fn summarize_issue_delta(rows: &[IssueEventDeltaRow]) -> String {
         .join("\n")
 }
 
+struct DispatchTransitionPlan {
+    current_status: String,
+    next_state: DispatchState,
+}
+
+fn plan_dispatch_transition(
+    conn: &Connection,
+    dispatch_id: i64,
+    event: DispatchEventKind,
+) -> Result<Option<DispatchTransitionPlan>> {
+    let Some(current_status) = conn
+        .query_row(
+            "SELECT status FROM dispatches WHERE id = ?1",
+            params![dispatch_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let current_state = DispatchState::parse_db(&current_status).ok_or_else(|| {
+        anyhow!(
+            "dispatch {} has unknown status literal '{}'",
+            dispatch_id,
+            current_status
+        )
+    })?;
+    let next_state = reduce_dispatch_state(current_state, event)
+        .map_err(|err| anyhow!("dispatch {dispatch_id} transition rejected: {err}"))?;
+    Ok(Some(DispatchTransitionPlan {
+        current_status,
+        next_state,
+    }))
+}
+
 fn reserve_dispatch_starting(
     db_path: &Path,
     dispatch: &DispatchInsert,
@@ -2455,6 +2517,8 @@ fn reserve_dispatch_starting(
     let mut conn = open_db(db_path)?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let issue_number = i64::try_from(dispatch.issue_number)?;
+    let starting_status = DispatchState::Starting.as_db_str();
+    let running_status = DispatchState::Running.as_db_str();
 
     let inflight_id = tx
         .query_row(
@@ -2463,11 +2527,16 @@ fn reserve_dispatch_starting(
             FROM dispatches
             WHERE repo_full_name = ?1
               AND issue_number = ?2
-              AND status IN ('starting', 'running')
+              AND status IN (?3, ?4)
             ORDER BY id DESC
             LIMIT 1
             ",
-            params![dispatch.repo_full_name.as_str(), issue_number],
+            params![
+                dispatch.repo_full_name.as_str(),
+                issue_number,
+                starting_status,
+                running_status
+            ],
             |row| row.get::<_, i64>(0),
         )
         .optional()?;
@@ -2480,7 +2549,7 @@ fn reserve_dispatch_starting(
         r"
         INSERT INTO dispatches
         (decision_id, repo_full_name, issue_number, actor_login, directive, target_role, status, started_at, tmux_session)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'starting', ?7, NULL)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)
         ",
         params![
             dispatch.decision_id,
@@ -2489,6 +2558,7 @@ fn reserve_dispatch_starting(
             dispatch.actor_login.as_deref(),
             dispatch.directive.as_str(),
             dispatch.target_role.as_str(),
+            DispatchState::Starting.as_db_str(),
             dispatch.started_at.as_str(),
         ],
     )?;
@@ -2500,30 +2570,53 @@ fn reserve_dispatch_starting(
 fn update_dispatch_running(
     db_path: &Path,
     dispatch_id: i64,
-    tmux_session: &str,
-    tmux_window: &str,
+    run_handle: &RunHandle,
     run_dir: &Path,
     lock_path: &Path,
 ) -> Result<()> {
     let conn = open_db(db_path)?;
-    conn.execute(
+    let Some(plan) = plan_dispatch_transition(&conn, dispatch_id, DispatchEventKind::MarkRunning)?
+    else {
+        return Err(anyhow!("dispatch {dispatch_id} not found"));
+    };
+    let tmux_ref = match run_handle.backend_kind {
+        DispatchBackendKind::Tmux => run_handle.backend_ref.as_str(),
+        DispatchBackendKind::Local => {
+            return Err(anyhow!(
+                "dispatch {dispatch_id} cannot be marked running with local backend handle in tmux update path"
+            ));
+        }
+    };
+    let (tmux_session, tmux_window) = tmux_ref
+        .split_once(':')
+        .ok_or_else(|| anyhow!("invalid tmux run handle ref '{}'", run_handle.backend_ref))?;
+    let rows = conn.execute(
         r"
         UPDATE dispatches
-        SET status = 'running',
-            tmux_session = ?2,
-            tmux_window = ?3,
-            run_dir = ?4,
-            lock_path = ?5
+        SET status = ?2,
+            tmux_session = ?3,
+            tmux_window = ?4,
+            run_dir = ?5,
+            lock_path = ?6
         WHERE id = ?1
+          AND status = ?7
         ",
         params![
             dispatch_id,
+            plan.next_state.as_db_str(),
             tmux_session,
             tmux_window,
             run_dir.to_string_lossy(),
             lock_path.to_string_lossy(),
+            plan.current_status,
         ],
     )?;
+    if rows == 0 {
+        return Err(anyhow!(
+            "dispatch {} state changed concurrently before running transition",
+            dispatch_id
+        ));
+    }
     Ok(())
 }
 
@@ -2534,18 +2627,36 @@ fn update_dispatch_failed_start(
     error_text: &str,
 ) -> Result<()> {
     let conn = open_db(db_path)?;
+    let Some(plan) = plan_dispatch_transition(&conn, dispatch_id, DispatchEventKind::FailStart)?
+    else {
+        return Err(anyhow!("dispatch {dispatch_id} not found"));
+    };
     let now = Utc::now().to_rfc3339();
-    conn.execute(
+    let rows = conn.execute(
         r"
         UPDATE dispatches
-        SET status = 'failed_start',
-            reason_code = ?2,
-            error_text = ?3,
-            ended_at = ?4
+        SET status = ?2,
+            reason_code = ?3,
+            error_text = ?4,
+            ended_at = ?5
         WHERE id = ?1
+          AND status = ?6
         ",
-        params![dispatch_id, reason_code, error_text, now],
+        params![
+            dispatch_id,
+            plan.next_state.as_db_str(),
+            reason_code,
+            error_text,
+            now,
+            plan.current_status,
+        ],
     )?;
+    if rows == 0 {
+        return Err(anyhow!(
+            "dispatch {} state changed concurrently before failed_start transition",
+            dispatch_id
+        ));
+    }
     Ok(())
 }
 
@@ -2555,6 +2666,8 @@ fn latest_issue_inflight_dispatch(
     issue_number: u64,
 ) -> Result<Option<InflightDispatch>> {
     let conn = open_db(db_path)?;
+    let starting_status = DispatchState::Starting.as_db_str();
+    let running_status = DispatchState::Running.as_db_str();
     let dispatch = conn
         .query_row(
             r"
@@ -2562,11 +2675,16 @@ fn latest_issue_inflight_dispatch(
             FROM dispatches
             WHERE repo_full_name = ?1
               AND issue_number = ?2
-              AND status IN ('starting', 'running')
+              AND status IN (?3, ?4)
             ORDER BY id DESC
             LIMIT 1
             ",
-            params![repo_full_name, i64::try_from(issue_number)?],
+            params![
+                repo_full_name,
+                i64::try_from(issue_number)?,
+                starting_status,
+                running_status
+            ],
             |row| {
                 Ok(InflightDispatch {
                     id: row.get(0)?,
@@ -2624,8 +2742,11 @@ fn should_heal_dispatch_stale(
     repo_full_name: &str,
     issue_number: u64,
 ) -> bool {
-    match dispatch.status.as_str() {
-        "running" => {
+    let Some(dispatch_state) = DispatchState::parse_db(dispatch.status.as_str()) else {
+        return false;
+    };
+    match dispatch_state {
+        DispatchState::Running => {
             let Some(session) = dispatch.tmux_session.as_deref() else {
                 return true;
             };
@@ -2649,7 +2770,9 @@ fn should_heal_dispatch_stale(
                 }
             }
         }
-        "starting" => is_stale_starting_dispatch(dispatch, repo_full_name, issue_number),
+        DispatchState::Starting => {
+            is_stale_starting_dispatch(dispatch, repo_full_name, issue_number)
+        }
         _ => false,
     }
 }
@@ -2661,18 +2784,29 @@ fn mark_dispatch_failed_runtime(
     error_text: &str,
 ) -> Result<()> {
     let conn = open_db(db_path)?;
+    let Some(plan) = plan_dispatch_transition(&conn, dispatch_id, DispatchEventKind::FailRuntime)?
+    else {
+        return Ok(());
+    };
     let ended_at = Utc::now().to_rfc3339();
-    conn.execute(
+    let _ = conn.execute(
         r"
         UPDATE dispatches
-        SET status = 'failed_runtime',
-            reason_code = ?2,
-            error_text = ?3,
-            ended_at = ?4
+        SET status = ?2,
+            reason_code = ?3,
+            error_text = ?4,
+            ended_at = ?5
         WHERE id = ?1
-          AND status IN ('starting', 'running')
+          AND status = ?6
         ",
-        params![dispatch_id, reason_code, error_text, ended_at],
+        params![
+            dispatch_id,
+            plan.next_state.as_db_str(),
+            reason_code,
+            error_text,
+            ended_at,
+            plan.current_status,
+        ],
     )?;
     Ok(())
 }
