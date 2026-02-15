@@ -19,6 +19,12 @@ sha2 = "0.10"
 thiserror = "2.0"
 tokio = { version = "1.43", features = ["macros", "rt-multi-thread", "signal", "time", "net"] }
 toml = "0.8"
+opentelemetry = { version = "0.27", features = ["trace", "metrics"] }
+opentelemetry-otlp = { version = "0.27", features = ["http-proto", "trace", "metrics", "reqwest-client"] }
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "trace", "metrics"] }
+tracing = "0.1"
+tracing-opentelemetry = "0.28"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = "2.5"
 
 [dev-dependencies]

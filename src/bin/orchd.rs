@@ -11,6 +11,7 @@ mod orchd_dispatch_core;
 #[path = "../types.rs"]
 mod types;
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::fs::OpenOptions;
@@ -18,7 +19,9 @@ use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Once, OnceLock};
 use std::time::Duration as StdDuration;
+use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
 use axum::body::Bytes;
@@ -28,15 +31,26 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use clap::{Parser, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use hmac::{Hmac, Mac};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use tracing::{info, info_span};
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt as _;
 
 use api::ForgejoClient;
 use config::AgentConfig;
+use opentelemetry::metrics::{Counter, Histogram};
+use opentelemetry::trace::TracerProvider as _;
+use opentelemetry::{KeyValue, global};
+use opentelemetry_otlp::{MetricExporter, SpanExporter, WithExportConfig};
+use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider, Temporality};
+use opentelemetry_sdk::trace as sdktrace;
 use orchd_dispatch_core::{
     DispatchBackendKind, DispatchEventKind, DispatchIntentV1, DispatchPolicyOutcome, DispatchState,
     PolicyDecision as DispatchPolicyDecision, RunHandle, reduce_dispatch_state,
@@ -44,6 +58,123 @@ use orchd_dispatch_core::{
 use types::{ApiIssue, IssueRef, OrchdRuntimeState, RepoRef};
 
 type HmacSha256 = Hmac<Sha256>;
+
+static TELEMETRY_INIT: Once = Once::new();
+static TELEMETRY_METRICS: OnceLock<OrchdMetrics> = OnceLock::new();
+
+struct OrchdMetrics {
+    dispatch_transitions_total: Counter<u64>,
+    dispatch_phase_latency_ms: Histogram<f64>,
+}
+
+fn orchd_metrics() -> &'static OrchdMetrics {
+    TELEMETRY_METRICS.get_or_init(|| {
+        let meter = global::meter("orchd");
+        OrchdMetrics {
+            dispatch_transitions_total: meter
+                .u64_counter("orchd.dispatch.transitions_total")
+                .with_description("Total dispatch transition events recorded by orchd")
+                .build(),
+            dispatch_phase_latency_ms: meter
+                .f64_histogram("orchd.dispatch.phase_latency_ms")
+                .with_description("Dispatch orchestration phase latency in milliseconds")
+                .build(),
+        }
+    })
+}
+
+fn record_phase_latency_ms(phase: &'static str, elapsed_ms: f64, outcome: &'static str) {
+    orchd_metrics().dispatch_phase_latency_ms.record(
+        elapsed_ms,
+        &[
+            KeyValue::new("phase", phase),
+            KeyValue::new("outcome", outcome),
+        ],
+    );
+}
+
+fn record_dispatch_transition_metric(event_kind: DispatchEventKind, to_state: &str) {
+    orchd_metrics().dispatch_transitions_total.add(
+        1,
+        &[
+            KeyValue::new("event_kind", event_kind.as_db_str()),
+            KeyValue::new("to_state", to_state.to_string()),
+        ],
+    );
+}
+
+fn init_telemetry() {
+    TELEMETRY_INIT.call_once(|| {
+        let env_filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        let fmt_layer = tracing_subscriber::fmt::layer().with_target(true).compact();
+
+        if let Ok(endpoint) = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT") {
+            let resource = Resource::new(vec![
+                KeyValue::new("service.name", "orchd"),
+                KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
+            ]);
+            let tracer_result = SpanExporter::builder()
+                .with_http()
+                .with_endpoint(endpoint.clone())
+                .build()
+                .map(|exporter| {
+                    sdktrace::TracerProvider::builder()
+                        .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+                        .with_resource(resource.clone())
+                        .build()
+                });
+            let meter_result = MetricExporter::builder()
+                .with_http()
+                .with_endpoint(endpoint)
+                .with_temporality(Temporality::Delta)
+                .build()
+                .map(|exporter| {
+                    let reader = PeriodicReader::builder(exporter, opentelemetry_sdk::runtime::Tokio)
+                        .with_interval(StdDuration::from_secs(5))
+                        .build();
+                    SdkMeterProvider::builder()
+                        .with_reader(reader)
+                        .with_resource(resource)
+                        .build()
+                });
+            match (tracer_result, meter_result) {
+                (Ok(tracer_provider), Ok(meter_provider)) => {
+                    global::set_tracer_provider(tracer_provider.clone());
+                    global::set_meter_provider(meter_provider);
+                    let tracer = tracer_provider.tracer("orchd");
+                    let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+                    let _ = tracing_subscriber::registry()
+                        .with(env_filter)
+                        .with(fmt_layer)
+                        .with(otel_layer)
+                        .try_init();
+                    return;
+                }
+                (Err(trace_err), Ok(_)) => {
+                    eprintln!(
+                        "failed to initialize OTLP tracer, falling back to fmt logs: {trace_err}"
+                    );
+                }
+                (Ok(_), Err(metric_err)) => {
+                    eprintln!(
+                        "failed to initialize OTLP metrics exporter, falling back to fmt logs: {metric_err}"
+                    );
+                }
+                (Err(trace_err), Err(metric_err)) => {
+                    eprintln!(
+                        "failed to initialize OTLP telemetry, falling back to fmt logs: trace={trace_err}; metrics={metric_err}"
+                    );
+                }
+            }
+        }
+
+        let _ = tracing_subscriber::registry()
+            .with(env_filter)
+            .with(fmt_layer)
+            .try_init();
+    });
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "orchd")]
@@ -67,10 +198,55 @@ struct Cli {
     reconcile_repo: Option<RepoRef>,
     #[arg(long, value_enum, default_value_t = DispatchMode::TmuxTui)]
     dispatch_mode: DispatchMode,
+    #[arg(long, value_enum, default_value_t = DispatchBackend::Tmux)]
+    dispatch_backend: DispatchBackend,
     #[arg(long, default_value = "config/orchd-dispatch.toml")]
     dispatch_config: String,
     #[arg(long)]
     no_comment_echo: bool,
+    #[command(subcommand)]
+    command: Option<OrchdCommand>,
+}
+
+#[derive(Subcommand, Debug)]
+enum OrchdCommand {
+    FinalizeDispatch(FinalizeDispatchArgs),
+}
+
+#[derive(Args, Debug)]
+struct FinalizeDispatchArgs {
+    #[arg(long)]
+    db_path: PathBuf,
+    #[arg(long)]
+    dispatch_id: i64,
+    #[arg(long)]
+    status: String,
+    #[arg(long = "reason-code")]
+    reason_code: String,
+    #[arg(long = "exit-code")]
+    exit_code: i64,
+    #[arg(long = "session-id", default_value = "")]
+    session_id: String,
+    #[arg(long = "issue-ref")]
+    issue_ref: IssueRef,
+    #[arg(long)]
+    directive: String,
+    #[arg(long = "role-name")]
+    role_name: String,
+    #[arg(long = "tmux-locator")]
+    tmux_locator: String,
+    #[arg(long = "run-dir")]
+    run_dir: PathBuf,
+    #[arg(long = "log-file")]
+    log_file: PathBuf,
+    #[arg(long = "completion-file")]
+    completion_file: PathBuf,
+    #[arg(long = "forgejoctl-bin")]
+    forgejoctl_bin: PathBuf,
+    #[arg(long = "forgejo-config")]
+    forgejo_config: Option<PathBuf>,
+    #[arg(long = "token-file")]
+    token_file: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -86,6 +262,21 @@ impl DispatchMode {
             Self::DryRun => "dry-run",
             Self::TmuxExec => "tmux-exec",
             Self::TmuxTui => "tmux-tui",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum DispatchBackend {
+    Tmux,
+    Local,
+}
+
+impl DispatchBackend {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tmux => "tmux",
+            Self::Local => "local",
         }
     }
 }
@@ -274,6 +465,7 @@ enum DispatchReservation {
 #[derive(Clone)]
 struct CommentIdentity {
     forgejoctl_bin: PathBuf,
+    config_file: Option<PathBuf>,
     token_file: PathBuf,
 }
 
@@ -292,6 +484,8 @@ struct InflightDispatch {
     id: i64,
     status: String,
     started_at: String,
+    backend_kind: Option<String>,
+    backend_ref: Option<String>,
     tmux_session: Option<String>,
     tmux_window: Option<String>,
     lock_path: Option<String>,
@@ -309,7 +503,9 @@ struct TmuxRunScriptInputs<'a> {
     codex_log_path: &'a Path,
     marker_path: &'a Path,
     issue_ref_text: &'a str,
+    orchd_bin: &'a Path,
     forgejoctl_bin: &'a Path,
+    forgejo_config_file: Option<&'a Path>,
     token_file: &'a Path,
     workdir: &'a Path,
     codex_bin: &'a Path,
@@ -321,14 +517,151 @@ struct TmuxRunScriptInputs<'a> {
     timeout_sec: u64,
 }
 
+#[derive(Debug, Clone)]
+struct DispatchPlan {
+    actor: String,
+    event_type: String,
+    directive: DispatchDirectiveConfig,
+    role: DispatchRoleConfig,
+    intent: DispatchIntentV1,
+    issue_ref: IssueRef,
+    issue_title: String,
+    issue_body: String,
+    issue_url: String,
+    issue_session_id: Option<String>,
+    issue_delta_summary: String,
+    dispatch_id: i64,
+    lock_path: PathBuf,
+    run_dir: PathBuf,
+    tmux_window: String,
+}
+
+#[derive(Debug, Clone)]
+struct DispatchRunArtifacts {
+    script_path: PathBuf,
+}
+
+trait DispatchBackendAdapter {
+    fn launch(
+        &self,
+        dispatch_config: &DispatchConfig,
+        plan: &DispatchPlan,
+        artifacts: &DispatchRunArtifacts,
+    ) -> Result<RunHandle, DispatchError>;
+
+    fn probe(
+        &self,
+        dispatch: &InflightDispatch,
+        repo_full_name: &str,
+        issue_number: u64,
+    ) -> Result<bool, DispatchError>;
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TmuxBackendAdapter;
+
+impl DispatchBackendAdapter for TmuxBackendAdapter {
+    fn launch(
+        &self,
+        dispatch_config: &DispatchConfig,
+        plan: &DispatchPlan,
+        artifacts: &DispatchRunArtifacts,
+    ) -> Result<RunHandle, DispatchError> {
+        tmux_spawn_or_respawn_window(
+            &dispatch_config.tmux.session,
+            &plan.tmux_window,
+            &artifacts.script_path,
+            dispatch_config.tmux.remain_on_exit,
+        )?;
+        Ok(RunHandle {
+            backend_kind: DispatchBackendKind::Tmux,
+            backend_ref: format!("{}:{}", dispatch_config.tmux.session, plan.tmux_window),
+        })
+    }
+
+    fn probe(
+        &self,
+        dispatch: &InflightDispatch,
+        repo_full_name: &str,
+        issue_number: u64,
+    ) -> Result<bool, DispatchError> {
+        let session = dispatch.tmux_session.as_deref().ok_or_else(|| {
+            DispatchError::Tmux("missing tmux session for tmux-backed dispatch".to_string())
+        })?;
+        let window = dispatch
+            .tmux_window
+            .clone()
+            .unwrap_or_else(|| issue_tmux_window_name(repo_full_name, issue_number));
+        tmux_window_has_live_pane(session, &window)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LocalBackendAdapter;
+
+impl DispatchBackendAdapter for LocalBackendAdapter {
+    fn launch(
+        &self,
+        _dispatch_config: &DispatchConfig,
+        _plan: &DispatchPlan,
+        artifacts: &DispatchRunArtifacts,
+    ) -> Result<RunHandle, DispatchError> {
+        let log_path = artifacts.script_path.parent().map_or_else(
+            || PathBuf::from("local-backend.log"),
+            |parent| parent.join("local-backend.log"),
+        );
+        let stdout = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .map_err(|err| DispatchError::Io(format!("failed opening local backend log: {err}")))?;
+        let stderr = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .map_err(|err| DispatchError::Io(format!("failed opening local backend log: {err}")))?;
+        let child = Command::new("/usr/bin/env")
+            .arg("bash")
+            .arg(&artifacts.script_path)
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr))
+            .spawn()
+            .map_err(|err| DispatchError::Io(format!("failed launching local backend: {err}")))?;
+        Ok(RunHandle {
+            backend_kind: DispatchBackendKind::Local,
+            backend_ref: child.id().to_string(),
+        })
+    }
+
+    fn probe(
+        &self,
+        dispatch: &InflightDispatch,
+        _repo_full_name: &str,
+        _issue_number: u64,
+    ) -> Result<bool, DispatchError> {
+        let pid = dispatch
+            .backend_ref
+            .as_deref()
+            .ok_or_else(|| DispatchError::Io("missing local backend pid ref".to_string()))?;
+        let status = Command::new("kill")
+            .arg("-0")
+            .arg(pid)
+            .status()
+            .map_err(|err| DispatchError::Io(format!("failed probing local backend pid: {err}")))?;
+        Ok(status.success())
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     db_path: PathBuf,
     webhook_secret: Option<Vec<u8>>,
     cfg: AgentConfig,
+    forgejo_config_file: Option<PathBuf>,
     reconcile_repo: RepoRef,
     comment_echo: bool,
     dispatch_mode: DispatchMode,
+    dispatch_backend: DispatchBackend,
     dispatch_config: Option<DispatchConfig>,
 }
 
@@ -453,7 +786,12 @@ fn run_entry() -> Result<()> {
 }
 
 async fn run() -> Result<()> {
+    init_telemetry();
     let cli = Cli::parse();
+    if let Some(command) = cli.command {
+        return run_command(command);
+    }
+    let config_override = cli.config.clone();
     let cfg = AgentConfig::load(cli.config, cli.token_file)?;
     let dispatch_config_path = expand_tilde_path(&cli.dispatch_config)?;
     let dispatch_config = match cli.dispatch_mode {
@@ -474,12 +812,15 @@ async fn run() -> Result<()> {
         db_path,
         webhook_secret,
         cfg,
+        forgejo_config_file: config_override,
         reconcile_repo,
         comment_echo: !cli.no_comment_echo,
         dispatch_mode: cli.dispatch_mode,
+        dispatch_backend: cli.dispatch_backend,
         dispatch_config,
     };
     let mode_name = state.dispatch_mode.as_str();
+    let backend_name = state.dispatch_backend.as_str();
 
     let heartbeat_state = state.clone();
     tokio::spawn(async move {
@@ -510,6 +851,7 @@ async fn run() -> Result<()> {
             "heartbeat_sec": cli.heartbeat_sec,
             "reconcile_sec": cli.reconcile_sec,
             "mode": mode_name,
+            "backend": backend_name,
             "dispatch_config": dispatch_config_path.to_string_lossy(),
         }),
     );
@@ -519,7 +861,14 @@ async fn run() -> Result<()> {
         .await
         .context("orchd server failed")?;
 
+    global::shutdown_tracer_provider();
     Ok(())
+}
+
+fn run_command(command: OrchdCommand) -> Result<()> {
+    match command {
+        OrchdCommand::FinalizeDispatch(args) => finalize_dispatch_command(args),
+    }
 }
 
 async fn shutdown_signal() {
@@ -662,7 +1011,7 @@ async fn process_webhook(
                     }
                 }
                 DispatchMode::TmuxExec | DispatchMode::TmuxTui => {
-                    match dispatch_tmux(state.clone(), decision_id, event_id, &record, &decision)
+                    match dispatch_issue(state.clone(), decision_id, event_id, &record, &decision)
                         .await
                     {
                         Ok(()) => {
@@ -838,10 +1187,13 @@ async fn project_issue_runtime_state_as_role(
     let issue_ref = format!("{repo_full_name}#{issue_number}");
     let runtime_state_name = runtime_state.as_str().to_string();
     tokio::task::spawn_blocking(move || -> Result<()> {
-        let output = Command::new(&identity.forgejoctl_bin)
+        let mut cmd = Command::new(&identity.forgejoctl_bin);
+        if let Some(config_file) = identity.config_file.as_ref() {
+            cmd.arg("--config").arg(config_file);
+        }
+        let output = cmd
+            .args(["--token-file", &identity.token_file.to_string_lossy()])
             .args([
-                "--token-file",
-                &identity.token_file.to_string_lossy(),
                 "issue",
                 "orchd-state",
                 &issue_ref,
@@ -1037,6 +1389,7 @@ fn dispatch_comment_identity(
     let role = dispatch_config.roles.get(role_name)?;
     Some(CommentIdentity {
         forgejoctl_bin: dispatch_config.forgejoctl_bin.clone(),
+        config_file: state.forgejo_config_file.clone(),
         token_file: role.token_file.clone(),
     })
 }
@@ -1347,6 +1700,9 @@ fn tmux_spawn_or_respawn_window(
 }
 
 fn build_tmux_exec_run_script(inputs: &TmuxRunScriptInputs<'_>) -> String {
+    let forgejo_config_file = inputs
+        .forgejo_config_file
+        .map_or(Cow::Borrowed(""), |path| path.to_string_lossy());
     format!(
         r#"#!/usr/bin/env bash
 set -euo pipefail
@@ -1362,7 +1718,9 @@ LAST_MESSAGE_FILE={last_message_file}
 CODEX_LOG_FILE={codex_log_file}
 MARKER_FILE={marker_file}
 ISSUE_REF={issue_ref}
+ORCHD_BIN={orchd_bin}
 FORGEJOCTL_BIN={forgejoctl_bin}
+FORGEJO_CONFIG_FILE={forgejo_config_file}
 TOKEN_FILE={token_file}
 WORKDIR={workdir}
 CODEX_BIN={codex_bin}
@@ -1440,17 +1798,13 @@ if [[ "$DIRECTIVE" == "impl" ]]; then
   else
     work_state_target="blocked"
   fi
-  "$FORGEJOCTL_BIN" --token-file "$TOKEN_FILE" issue transition "$ISSUE_REF" --to "$work_state_target" --force || true
 fi
 
 if [[ -n "$session_id" ]]; then
-  session_sql="'${{session_id//\'/\'\'}}'"
+  session_for_finalize="$session_id"
 else
-  session_sql="NULL"
+  session_for_finalize=""
 fi
-ended_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-sqlite3 "$DB_PATH" "UPDATE dispatches SET status='$status', reason_code='$reason_code', codex_session_id=$session_sql, exit_code=$exit_code, ended_at='$ended_at' WHERE id=$DISPATCH_ID;"
-"$FORGEJOCTL_BIN" --token-file "$TOKEN_FILE" issue orchd-state "$ISSUE_REF" --to "$runtime_state" || true
 
 {{
   echo "orchd: dispatch completed id=$DISPATCH_ID status=$status reason=$reason_code"
@@ -1466,7 +1820,27 @@ sqlite3 "$DB_PATH" "UPDATE dispatches SET status='$status', reason_code='$reason
   echo '```'
 }} > "$COMPLETION_FILE"
 
-"$FORGEJOCTL_BIN" --token-file "$TOKEN_FILE" issue comment "$ISSUE_REF" --body-file "$COMPLETION_FILE" || true
+config_args=()
+if [[ -n "$FORGEJO_CONFIG_FILE" ]]; then
+  config_args+=(--forgejo-config "$FORGEJO_CONFIG_FILE")
+fi
+
+"$ORCHD_BIN" finalize-dispatch "${{config_args[@]}}" \
+  --db-path "$DB_PATH" \
+  --dispatch-id "$DISPATCH_ID" \
+  --status "$status" \
+  --reason-code "$reason_code" \
+  --exit-code "$exit_code" \
+  --session-id "$session_for_finalize" \
+  --issue-ref "$ISSUE_REF" \
+  --directive "$DIRECTIVE" \
+  --role-name "$ROLE_NAME" \
+  --tmux-locator "$TMUX_LOCATOR" \
+  --run-dir "$RUN_DIR" \
+  --log-file "$CODEX_LOG_FILE" \
+  --completion-file "$COMPLETION_FILE" \
+  --forgejoctl-bin "$FORGEJOCTL_BIN" \
+  --token-file "$TOKEN_FILE" || true
 "#,
         dispatch_id = inputs.dispatch_id,
         db_path = shell_quote(&inputs.db_path.to_string_lossy()),
@@ -1479,7 +1853,9 @@ sqlite3 "$DB_PATH" "UPDATE dispatches SET status='$status', reason_code='$reason
         codex_log_file = shell_quote(&inputs.codex_log_path.to_string_lossy()),
         marker_file = shell_quote(&inputs.marker_path.to_string_lossy()),
         issue_ref = shell_quote(inputs.issue_ref_text),
+        orchd_bin = shell_quote(&inputs.orchd_bin.to_string_lossy()),
         forgejoctl_bin = shell_quote(&inputs.forgejoctl_bin.to_string_lossy()),
+        forgejo_config_file = shell_quote(forgejo_config_file.as_ref()),
         token_file = shell_quote(&inputs.token_file.to_string_lossy()),
         workdir = shell_quote(&inputs.workdir.to_string_lossy()),
         codex_bin = shell_quote(&inputs.codex_bin.to_string_lossy()),
@@ -1497,6 +1873,9 @@ fn build_tmux_tui_run_script(
     bootstrap_prompt_path: &Path,
     session_jsonl_path: &Path,
 ) -> String {
+    let forgejo_config_file = inputs
+        .forgejo_config_file
+        .map_or(Cow::Borrowed(""), |path| path.to_string_lossy());
     format!(
         r#"#!/usr/bin/env bash
 set -euo pipefail
@@ -1514,7 +1893,9 @@ LAST_MESSAGE_FILE={last_message_file}
 CODEX_LOG_FILE={codex_log_file}
 MARKER_FILE={marker_file}
 ISSUE_REF={issue_ref}
+ORCHD_BIN={orchd_bin}
 FORGEJOCTL_BIN={forgejoctl_bin}
+FORGEJO_CONFIG_FILE={forgejo_config_file}
 TOKEN_FILE={token_file}
 WORKDIR={workdir}
 CODEX_BIN={codex_bin}
@@ -1725,17 +2106,13 @@ if [[ "$DIRECTIVE" == "impl" ]]; then
   else
     work_state_target="blocked"
   fi
-  "$FORGEJOCTL_BIN" --token-file "$TOKEN_FILE" issue transition "$ISSUE_REF" --to "$work_state_target" --force || true
 fi
 
 if [[ -n "$session_id" ]]; then
-  session_sql="'${{session_id//\'/\'\'}}'"
+  session_for_finalize="$session_id"
 else
-  session_sql="NULL"
+  session_for_finalize=""
 fi
-ended_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-sqlite3 "$DB_PATH" "UPDATE dispatches SET status='$status', reason_code='$reason_code', codex_session_id=$session_sql, exit_code=$exit_code, ended_at='$ended_at' WHERE id=$DISPATCH_ID;"
-"$FORGEJOCTL_BIN" --token-file "$TOKEN_FILE" issue orchd-state "$ISSUE_REF" --to "$runtime_state" || true
 
 {{
   echo "orchd: dispatch completed id=$DISPATCH_ID status=$status reason=$reason_code"
@@ -1762,7 +2139,27 @@ sqlite3 "$DB_PATH" "UPDATE dispatches SET status='$status', reason_code='$reason
   echo "exit_code=$exit_code"
 }} > "$CODEX_LOG_FILE"
 
-"$FORGEJOCTL_BIN" --token-file "$TOKEN_FILE" issue comment "$ISSUE_REF" --body-file "$COMPLETION_FILE" || true
+config_args=()
+if [[ -n "$FORGEJO_CONFIG_FILE" ]]; then
+  config_args+=(--forgejo-config "$FORGEJO_CONFIG_FILE")
+fi
+
+"$ORCHD_BIN" finalize-dispatch "${{config_args[@]}}" \
+  --db-path "$DB_PATH" \
+  --dispatch-id "$DISPATCH_ID" \
+  --status "$status" \
+  --reason-code "$reason_code" \
+  --exit-code "$exit_code" \
+  --session-id "$session_for_finalize" \
+  --issue-ref "$ISSUE_REF" \
+  --directive "$DIRECTIVE" \
+  --role-name "$ROLE_NAME" \
+  --tmux-locator "$TMUX_LOCATOR" \
+  --run-dir "$RUN_DIR" \
+  --log-file "$CODEX_LOG_FILE" \
+  --completion-file "$COMPLETION_FILE" \
+  --forgejoctl-bin "$FORGEJOCTL_BIN" \
+  --token-file "$TOKEN_FILE" || true
 "#,
         dispatch_id = inputs.dispatch_id,
         db_path = shell_quote(&inputs.db_path.to_string_lossy()),
@@ -1777,7 +2174,9 @@ sqlite3 "$DB_PATH" "UPDATE dispatches SET status='$status', reason_code='$reason
         codex_log_file = shell_quote(&inputs.codex_log_path.to_string_lossy()),
         marker_file = shell_quote(&inputs.marker_path.to_string_lossy()),
         issue_ref = shell_quote(inputs.issue_ref_text),
+        orchd_bin = shell_quote(&inputs.orchd_bin.to_string_lossy()),
         forgejoctl_bin = shell_quote(&inputs.forgejoctl_bin.to_string_lossy()),
+        forgejo_config_file = shell_quote(forgejo_config_file.as_ref()),
         token_file = shell_quote(&inputs.token_file.to_string_lossy()),
         workdir = shell_quote(&inputs.workdir.to_string_lossy()),
         codex_bin = shell_quote(&inputs.codex_bin.to_string_lossy()),
@@ -1790,17 +2189,14 @@ sqlite3 "$DB_PATH" "UPDATE dispatches SET status='$status', reason_code='$reason
     )
 }
 
-async fn dispatch_tmux(
-    state: AppState,
+async fn plan_dispatch(
+    state: &AppState,
+    dispatch_config: &DispatchConfig,
     decision_id: i64,
     current_event_id: i64,
     record: &EventRecord,
     decision: &DecisionRecord,
-) -> Result<(), DispatchError> {
-    let dispatch_config = state
-        .dispatch_config
-        .as_ref()
-        .ok_or(DispatchError::ConfigNotLoaded)?;
+) -> Result<DispatchPlan, DispatchError> {
     let actor = record
         .actor_login
         .clone()
@@ -1826,11 +2222,13 @@ async fn dispatch_tmux(
     let directive = dispatch_config
         .directives
         .get(directive_name)
-        .ok_or_else(|| DispatchError::DirectiveNotConfigured(directive_name.to_string()))?;
+        .ok_or_else(|| DispatchError::DirectiveNotConfigured(directive_name.to_string()))?
+        .clone();
     let role = dispatch_config
         .roles
         .get(&directive.role)
-        .ok_or_else(|| DispatchError::RoleNotConfigured(directive.role.clone()))?;
+        .ok_or_else(|| DispatchError::RoleNotConfigured(directive.role.clone()))?
+        .clone();
 
     let issue_number = record
         .issue_number
@@ -1845,8 +2243,9 @@ async fn dispatch_tmux(
         delivery_id: record.delivery_id.clone(),
         parent_dispatch_id: None,
         created_at: Utc::now(),
-        policy_snapshot: Some("cp0".to_string()),
+        policy_snapshot: Some("cp2".to_string()),
     };
+
     if let Some(dispatch_id) = find_issue_inflight_dispatch_with_healing(
         &state.db_path,
         &intent.repo_full_name,
@@ -1860,10 +2259,10 @@ async fn dispatch_tmux(
             dispatch_id,
         });
     }
+
     let issue_session_id =
         latest_issue_codex_session_id(&state.db_path, &intent.repo_full_name, intent.issue_number)
             .map_err(|err| DispatchError::Db(err.to_string()))?;
-
     let lock_path = acquire_repo_lock(&state.db_path, &intent.repo_full_name)?;
 
     let repo = RepoRef::parse(&intent.repo_full_name)
@@ -1916,41 +2315,64 @@ async fn dispatch_tmux(
         }
     };
 
-    let tmux_window = issue_tmux_window_name(&intent.repo_full_name, intent.issue_number);
     let run_dir = run_root(&state.db_path)?.join(format!("dispatch-{dispatch_id}"));
     fs::create_dir_all(&run_dir)
         .map_err(|err| DispatchError::Io(format!("failed to create run dir: {err}")))?;
-
-    let directive_template = fs::read_to_string(&directive.prompt_file).map_err(|err| {
-        DispatchError::Io(format!(
-            "failed reading prompt {}: {err}",
-            directive.prompt_file.display()
-        ))
-    })?;
     let issue_title = issue.title;
     let issue_body = issue.body.unwrap_or_default();
     let issue_url = issue.html_url;
+
+    Ok(DispatchPlan {
+        actor,
+        event_type: record.event_type.clone(),
+        directive,
+        role,
+        intent,
+        issue_ref,
+        issue_title,
+        issue_body,
+        issue_url,
+        issue_session_id,
+        issue_delta_summary,
+        dispatch_id,
+        lock_path,
+        run_dir,
+        tmux_window: issue_tmux_window_name(&record.repo_full_name, issue_number),
+    })
+}
+
+fn materialize_run_artifacts(
+    state: &AppState,
+    dispatch_config: &DispatchConfig,
+    plan: &DispatchPlan,
+) -> Result<DispatchRunArtifacts, DispatchError> {
+    let directive_template = fs::read_to_string(&plan.directive.prompt_file).map_err(|err| {
+        DispatchError::Io(format!(
+            "failed reading prompt {}: {err}",
+            plan.directive.prompt_file.display()
+        ))
+    })?;
     let directive_prompt = render_prompt(
         &directive_template,
         &[
-            ("issue_ref", issue_ref.to_string()),
-            ("repo", intent.repo_full_name.clone()),
-            ("issue_number", intent.issue_number.to_string()),
-            ("directive", intent.directive.clone()),
-            ("target_role", intent.role.clone()),
-            ("actor", actor.clone()),
-            ("issue_title", issue_title.clone()),
-            ("issue_body", issue_body.clone()),
-            ("issue_url", issue_url.clone()),
-            ("event_type", record.event_type.clone()),
-            ("delivery_id", record.delivery_id.clone()),
+            ("issue_ref", plan.issue_ref.to_string()),
+            ("repo", plan.intent.repo_full_name.clone()),
+            ("issue_number", plan.intent.issue_number.to_string()),
+            ("directive", plan.intent.directive.clone()),
+            ("target_role", plan.intent.role.clone()),
+            ("actor", plan.actor.clone()),
+            ("issue_title", plan.issue_title.clone()),
+            ("issue_body", plan.issue_body.clone()),
+            ("issue_url", plan.issue_url.clone()),
+            ("event_type", plan.event_type.clone()),
+            ("delivery_id", plan.intent.delivery_id.clone()),
         ],
     );
-    let (prompt_mode, envelope_path, issue_delta) = if issue_session_id.is_some() {
+    let (prompt_mode, envelope_path, issue_delta) = if plan.issue_session_id.is_some() {
         (
             "followup",
             &dispatch_config.prompt_envelopes.followup_envelope_file,
-            issue_delta_summary,
+            plan.issue_delta_summary.clone(),
         )
     } else {
         (
@@ -1968,43 +2390,48 @@ async fn dispatch_tmux(
     let prompt = render_prompt(
         &envelope_template,
         &[
-            ("issue_ref", issue_ref.to_string()),
-            ("repo", intent.repo_full_name.clone()),
-            ("issue_number", intent.issue_number.to_string()),
-            ("directive", intent.directive.clone()),
-            ("target_role", intent.role.clone()),
-            ("actor", actor.clone()),
-            ("issue_title", issue_title),
-            ("issue_body", issue_body),
-            ("issue_url", issue_url),
-            ("event_type", record.event_type.clone()),
-            ("delivery_id", record.delivery_id.clone()),
+            ("issue_ref", plan.issue_ref.to_string()),
+            ("repo", plan.intent.repo_full_name.clone()),
+            ("issue_number", plan.intent.issue_number.to_string()),
+            ("directive", plan.intent.directive.clone()),
+            ("target_role", plan.intent.role.clone()),
+            ("actor", plan.actor.clone()),
+            ("issue_title", plan.issue_title.clone()),
+            ("issue_body", plan.issue_body.clone()),
+            ("issue_url", plan.issue_url.clone()),
+            ("event_type", plan.event_type.clone()),
+            ("delivery_id", plan.intent.delivery_id.clone()),
             ("session_mode", prompt_mode.to_string()),
             ("issue_delta", issue_delta),
             ("directive_prompt", directive_prompt),
         ],
     );
 
-    let prompt_path = run_dir.join("prompt.md");
+    let prompt_path = plan.run_dir.join("prompt.md");
     fs::write(&prompt_path, prompt)
         .map_err(|err| DispatchError::Io(format!("failed writing prompt: {err}")))?;
-    fs::write(run_dir.join("prompt_mode.txt"), prompt_mode)
+    fs::write(plan.run_dir.join("prompt_mode.txt"), prompt_mode)
         .map_err(|err| DispatchError::Io(format!("failed writing prompt mode: {err}")))?;
 
-    let script_path = run_dir.join("run.sh");
-    let summary_path = run_dir.join("summary.md");
-    let completion_path = run_dir.join("completion.md");
-    let last_message_path = run_dir.join("last_message.md");
-    let codex_log_path = run_dir.join("codex.log");
-    let marker_path = run_dir.join("start.marker");
-    let issue_ref_text = format!("{}#{}", intent.repo_full_name, intent.issue_number);
-    let tmux_locator = format!("{}:{}", dispatch_config.tmux.session, tmux_window);
+    let script_path = plan.run_dir.join("run.sh");
+    let summary_path = plan.run_dir.join("summary.md");
+    let completion_path = plan.run_dir.join("completion.md");
+    let last_message_path = plan.run_dir.join("last_message.md");
+    let codex_log_path = plan.run_dir.join("codex.log");
+    let marker_path = plan.run_dir.join("start.marker");
+    let issue_ref_text = format!(
+        "{}#{}",
+        plan.intent.repo_full_name, plan.intent.issue_number
+    );
+    let tmux_locator = format!("{}:{}", dispatch_config.tmux.session, plan.tmux_window);
+    let orchd_bin = std::env::current_exe()
+        .map_err(|err| DispatchError::Io(format!("failed resolving orchd executable: {err}")))?;
 
     let script_inputs = TmuxRunScriptInputs {
-        dispatch_id,
+        dispatch_id: plan.dispatch_id,
         db_path: &state.db_path,
-        lock_path: &lock_path,
-        run_dir: &run_dir,
+        lock_path: &plan.lock_path,
+        run_dir: &plan.run_dir,
         prompt_path: &prompt_path,
         summary_path: &summary_path,
         completion_path: &completion_path,
@@ -2012,71 +2439,397 @@ async fn dispatch_tmux(
         codex_log_path: &codex_log_path,
         marker_path: &marker_path,
         issue_ref_text: &issue_ref_text,
+        orchd_bin: &orchd_bin,
         forgejoctl_bin: &dispatch_config.forgejoctl_bin,
-        token_file: &role.token_file,
-        workdir: &role.workdir,
-        codex_bin: &role.codex_bin,
-        codex_role_arg: &role.codex_role_arg,
-        issue_session_id: issue_session_id.as_deref(),
-        directive_name: &intent.directive,
-        role_name: &intent.role,
+        forgejo_config_file: state.forgejo_config_file.as_deref(),
+        token_file: &plan.role.token_file,
+        workdir: &plan.role.workdir,
+        codex_bin: &plan.role.codex_bin,
+        codex_role_arg: &plan.role.codex_role_arg,
+        issue_session_id: plan.issue_session_id.as_deref(),
+        directive_name: &plan.intent.directive,
+        role_name: &plan.intent.role,
         tmux_locator: &tmux_locator,
-        timeout_sec: directive.timeout_sec,
+        timeout_sec: plan.directive.timeout_sec,
     };
 
-    let script = match state.dispatch_mode {
-        DispatchMode::TmuxExec => build_tmux_exec_run_script(&script_inputs),
-        DispatchMode::TmuxTui => {
-            let bootstrap_prompt_path = run_dir.join("bootstrap_prompt.md");
+    let script = match (state.dispatch_mode, state.dispatch_backend) {
+        (DispatchMode::TmuxExec, _) => build_tmux_exec_run_script(&script_inputs),
+        (DispatchMode::TmuxTui, DispatchBackend::Tmux) => {
+            let bootstrap_prompt_path = plan.run_dir.join("bootstrap_prompt.md");
             let bootstrap_prompt = format!(
                 "You are {} running under orchd dispatch.\n\nBefore taking any action, read and follow the full task instructions in this file:\n{}\n\nTreat that file as canonical for this dispatch.",
-                intent.role,
+                plan.intent.role,
                 prompt_path.display()
             );
             fs::write(&bootstrap_prompt_path, bootstrap_prompt).map_err(|err| {
                 DispatchError::Io(format!("failed writing bootstrap prompt: {err}"))
             })?;
-            let session_jsonl_path = run_dir.join("session.jsonl.path");
+            let session_jsonl_path = plan.run_dir.join("session.jsonl.path");
             build_tmux_tui_run_script(&script_inputs, &bootstrap_prompt_path, &session_jsonl_path)
         }
-        DispatchMode::DryRun => {
-            return Err(DispatchError::ConfigNotLoaded);
+        (DispatchMode::TmuxTui, DispatchBackend::Local) => {
+            return Err(DispatchError::Io(
+                "dispatch backend local does not support dispatch mode tmux-tui".to_string(),
+            ));
         }
+        (DispatchMode::DryRun, _) => return Err(DispatchError::ConfigNotLoaded),
     };
 
     fs::write(&script_path, script)
         .map_err(|err| DispatchError::Io(format!("failed writing run script: {err}")))?;
+    Ok(DispatchRunArtifacts { script_path })
+}
 
-    let spawn_result = tmux_spawn_or_respawn_window(
-        &dispatch_config.tmux.session,
-        &tmux_window,
-        &script_path,
-        dispatch_config.tmux.remain_on_exit,
-    );
-    if let Err(err) = spawn_result {
-        let _ = update_dispatch_failed_start(
-            &state.db_path,
-            dispatch_id,
-            err.reason_code(),
-            &err.to_string(),
-        );
-        let _ = fs::remove_file(&lock_path);
-        return Err(err);
+fn launch_dispatch_backend(
+    state: &AppState,
+    dispatch_config: &DispatchConfig,
+    plan: &DispatchPlan,
+    artifacts: &DispatchRunArtifacts,
+) -> Result<RunHandle, DispatchError> {
+    match state.dispatch_backend {
+        DispatchBackend::Tmux => TmuxBackendAdapter.launch(dispatch_config, plan, artifacts),
+        DispatchBackend::Local => LocalBackendAdapter.launch(dispatch_config, plan, artifacts),
     }
+}
 
-    let run_handle = RunHandle {
-        backend_kind: DispatchBackendKind::Tmux,
-        backend_ref: tmux_locator,
+async fn dispatch_issue(
+    state: AppState,
+    decision_id: i64,
+    current_event_id: i64,
+    record: &EventRecord,
+    decision: &DecisionRecord,
+) -> Result<(), DispatchError> {
+    let span = info_span!(
+        "dispatch_issue",
+        repo = %record.repo_full_name,
+        issue = record.issue_number.unwrap_or_default(),
+        event_id = current_event_id,
+        decision_id = decision_id,
+        backend = state.dispatch_backend.as_str(),
+        mode = state.dispatch_mode.as_str(),
+    );
+    let _entered = span.enter();
+    let dispatch_config = state
+        .dispatch_config
+        .as_ref()
+        .ok_or(DispatchError::ConfigNotLoaded)?;
+    let phase_plan_start = Instant::now();
+    let plan = plan_dispatch(
+        &state,
+        dispatch_config,
+        decision_id,
+        current_event_id,
+        record,
+        decision,
+    )
+    .await?;
+    record_phase_latency_ms(
+        "plan",
+        phase_plan_start.elapsed().as_secs_f64() * 1000.0,
+        "ok",
+    );
+
+    let phase_materialize_start = Instant::now();
+    let artifacts = materialize_run_artifacts(&state, dispatch_config, &plan)?;
+    record_phase_latency_ms(
+        "materialize",
+        phase_materialize_start.elapsed().as_secs_f64() * 1000.0,
+        "ok",
+    );
+
+    let phase_launch_start = Instant::now();
+    let launch_result = launch_dispatch_backend(&state, dispatch_config, &plan, &artifacts);
+    let run_handle = match launch_result {
+        Ok(handle) => handle,
+        Err(err) => {
+            record_phase_latency_ms(
+                "launch",
+                phase_launch_start.elapsed().as_secs_f64() * 1000.0,
+                "error",
+            );
+            let _ = update_dispatch_failed_start(
+                &state.db_path,
+                plan.dispatch_id,
+                err.reason_code(),
+                &err.to_string(),
+            );
+            let _ = fs::remove_file(&plan.lock_path);
+            return Err(err);
+        }
     };
+    record_phase_latency_ms(
+        "launch",
+        phase_launch_start.elapsed().as_secs_f64() * 1000.0,
+        "ok",
+    );
+    let phase_finalize_start = Instant::now();
     update_dispatch_running(
         &state.db_path,
-        dispatch_id,
+        plan.dispatch_id,
         &run_handle,
-        &run_dir,
-        &lock_path,
+        &plan.run_dir,
+        &plan.lock_path,
     )
     .map_err(|err| DispatchError::Db(err.to_string()))?;
+    record_phase_latency_ms(
+        "mark_running",
+        phase_finalize_start.elapsed().as_secs_f64() * 1000.0,
+        "ok",
+    );
+    info!(
+        dispatch_id = plan.dispatch_id,
+        repo = %plan.intent.repo_full_name,
+        issue = plan.intent.issue_number,
+        directive = %plan.intent.directive,
+        role = %plan.intent.role,
+        "dispatch launch complete"
+    );
+    Ok(())
+}
 
+#[derive(Debug, Clone, Copy)]
+struct TerminalStatusSpec {
+    event_kind: DispatchEventKind,
+    runtime_state: OrchdRuntimeState,
+    state_literal: DispatchState,
+}
+
+fn parse_terminal_status_spec(status: &str) -> Result<TerminalStatusSpec> {
+    match status {
+        "completed" => Ok(TerminalStatusSpec {
+            event_kind: DispatchEventKind::Complete,
+            runtime_state: OrchdRuntimeState::Completed,
+            state_literal: DispatchState::Completed,
+        }),
+        "timed_out" => Ok(TerminalStatusSpec {
+            event_kind: DispatchEventKind::Timeout,
+            runtime_state: OrchdRuntimeState::Failed,
+            state_literal: DispatchState::TimedOut,
+        }),
+        "failed_runtime" | "stopped_no_final_answer" => Ok(TerminalStatusSpec {
+            event_kind: DispatchEventKind::FailRuntime,
+            runtime_state: OrchdRuntimeState::Failed,
+            state_literal: DispatchState::FailedRuntime,
+        }),
+        other => Err(anyhow!("unsupported finalize status '{other}'")),
+    }
+}
+
+fn update_dispatch_terminal(
+    db_path: &Path,
+    dispatch_id: i64,
+    status_spec: TerminalStatusSpec,
+    reason_code: &str,
+    exit_code: i64,
+    session_id: Option<&str>,
+) -> Result<()> {
+    let mut conn = open_db(db_path)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let Some(current_status) = tx
+        .query_row(
+            "SELECT status FROM dispatches WHERE id = ?1",
+            params![dispatch_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    else {
+        return Ok(());
+    };
+    let Some(current_state) = DispatchState::parse_db(&current_status) else {
+        return Ok(());
+    };
+    if current_state.is_terminal() {
+        return Ok(());
+    }
+    let next_state =
+        reduce_dispatch_state(current_state, status_spec.event_kind).map_err(|err| {
+            anyhow!(
+                "terminal transition rejected for dispatch {}: {err}",
+                dispatch_id
+            )
+        })?;
+    let ended_at = Utc::now().to_rfc3339();
+    let session_id = session_id.filter(|sid| !sid.trim().is_empty());
+    let rows = tx.execute(
+        r"
+        UPDATE dispatches
+        SET status = ?2,
+            reason_code = ?3,
+            codex_session_id = ?4,
+            exit_code = ?5,
+            ended_at = ?6
+        WHERE id = ?1
+          AND status = ?7
+        ",
+        params![
+            dispatch_id,
+            next_state.as_db_str(),
+            reason_code,
+            session_id,
+            exit_code,
+            ended_at,
+            current_status,
+        ],
+    )?;
+    if rows == 0 {
+        return Ok(());
+    }
+    append_dispatch_event_tx(
+        &tx,
+        dispatch_id,
+        status_spec.event_kind,
+        Some(&current_status),
+        next_state.as_db_str(),
+        Some(reason_code),
+        None,
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn run_forgejoctl(
+    forgejoctl_bin: &Path,
+    config_file: Option<&Path>,
+    token_file: &Path,
+    args: &[&str],
+) -> Result<()> {
+    let mut cmd = Command::new(forgejoctl_bin);
+    if let Some(config_file) = config_file {
+        cmd.arg("--config").arg(config_file);
+    }
+    let status = cmd
+        .arg("--token-file")
+        .arg(token_file)
+        .args(args)
+        .status()
+        .with_context(|| format!("failed invoking forgejoctl {}", forgejoctl_bin.display()))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "forgejoctl command failed (exit={:?}) args={:?}",
+            status.code(),
+            args
+        ))
+    }
+}
+
+fn finalize_dispatch_command(args: FinalizeDispatchArgs) -> Result<()> {
+    let span = info_span!(
+        "finalize_dispatch",
+        dispatch_id = args.dispatch_id,
+        issue = %args.issue_ref,
+        directive = %args.directive,
+        role = %args.role_name,
+        status = %args.status,
+    );
+    let _entered = span.enter();
+    let status_spec = parse_terminal_status_spec(&args.status)?;
+    let phase_update_start = Instant::now();
+    update_dispatch_terminal(
+        &args.db_path,
+        args.dispatch_id,
+        status_spec,
+        &args.reason_code,
+        args.exit_code,
+        Some(&args.session_id),
+    )?;
+    record_phase_latency_ms(
+        "finalize_update_db",
+        phase_update_start.elapsed().as_secs_f64() * 1000.0,
+        "ok",
+    );
+
+    if args.directive == "impl" {
+        let work_state_target = if status_spec.state_literal == DispatchState::Completed {
+            "review"
+        } else {
+            "blocked"
+        };
+        let phase_transition_start = Instant::now();
+        if let Err(err) = run_forgejoctl(
+            &args.forgejoctl_bin,
+            args.forgejo_config.as_deref(),
+            &args.token_file,
+            &[
+                "issue",
+                "transition",
+                &args.issue_ref.to_string(),
+                "--to",
+                work_state_target,
+                "--force",
+            ],
+        ) {
+            eprintln!("finalize-dispatch: work-state transition failed: {err}");
+            record_phase_latency_ms(
+                "finalize_transition",
+                phase_transition_start.elapsed().as_secs_f64() * 1000.0,
+                "error",
+            );
+        } else {
+            record_phase_latency_ms(
+                "finalize_transition",
+                phase_transition_start.elapsed().as_secs_f64() * 1000.0,
+                "ok",
+            );
+        }
+    }
+
+    let phase_state_start = Instant::now();
+    if let Err(err) = run_forgejoctl(
+        &args.forgejoctl_bin,
+        args.forgejo_config.as_deref(),
+        &args.token_file,
+        &[
+            "issue",
+            "orchd-state",
+            &args.issue_ref.to_string(),
+            "--to",
+            status_spec.runtime_state.as_str(),
+        ],
+    ) {
+        eprintln!("finalize-dispatch: orchd-state projection failed: {err}");
+        record_phase_latency_ms(
+            "finalize_orchd_state",
+            phase_state_start.elapsed().as_secs_f64() * 1000.0,
+            "error",
+        );
+    } else {
+        record_phase_latency_ms(
+            "finalize_orchd_state",
+            phase_state_start.elapsed().as_secs_f64() * 1000.0,
+            "ok",
+        );
+    }
+
+    let phase_comment_start = Instant::now();
+    if let Err(err) = run_forgejoctl(
+        &args.forgejoctl_bin,
+        args.forgejo_config.as_deref(),
+        &args.token_file,
+        &[
+            "issue",
+            "comment",
+            &args.issue_ref.to_string(),
+            "--body-file",
+            &args.completion_file.to_string_lossy(),
+        ],
+    ) {
+        eprintln!("finalize-dispatch: issue comment post failed: {err}");
+        record_phase_latency_ms(
+            "finalize_comment",
+            phase_comment_start.elapsed().as_secs_f64() * 1000.0,
+            "error",
+        );
+    } else {
+        record_phase_latency_ms(
+            "finalize_comment",
+            phase_comment_start.elapsed().as_secs_f64() * 1000.0,
+            "ok",
+        );
+    }
+    info!("finalize dispatch completed");
     Ok(())
 }
 
@@ -2209,6 +2962,8 @@ fn init_db(db_path: &Path) -> Result<()> {
             directive TEXT NOT NULL,
             target_role TEXT NOT NULL,
             status TEXT NOT NULL,
+            backend_kind TEXT,
+            backend_ref TEXT,
             reason_code TEXT,
             error_text TEXT,
             tmux_session TEXT,
@@ -2251,6 +3006,8 @@ fn init_db(db_path: &Path) -> Result<()> {
     ensure_column_exists(&conn, "events", "event_text", "TEXT")?;
     ensure_column_exists(&conn, "events", "source_comment_id", "INTEGER")?;
     ensure_column_exists(&conn, "events", "source_created_at", "TEXT")?;
+    ensure_column_exists(&conn, "dispatches", "backend_kind", "TEXT")?;
+    ensure_column_exists(&conn, "dispatches", "backend_ref", "TEXT")?;
     Ok(())
 }
 
@@ -2519,6 +3276,15 @@ fn append_dispatch_event_tx(
             Utc::now().to_rfc3339(),
         ],
     )?;
+    record_dispatch_transition_metric(event_kind, to_state);
+    info!(
+        dispatch_id = dispatch_id,
+        event_kind = event_kind.as_db_str(),
+        from_state = from_state.unwrap_or(""),
+        to_state = to_state,
+        reason_code = reason_code.unwrap_or(""),
+        "dispatch transition recorded"
+    );
     Ok(())
 }
 
@@ -2631,33 +3397,40 @@ fn update_dispatch_running(
     else {
         return Err(anyhow!("dispatch {dispatch_id} not found"));
     };
-    let tmux_ref = match run_handle.backend_kind {
-        DispatchBackendKind::Tmux => run_handle.backend_ref.as_str(),
-        DispatchBackendKind::Local => {
-            return Err(anyhow!(
-                "dispatch {dispatch_id} cannot be marked running with local backend handle in tmux update path"
-            ));
+    let (tmux_session, tmux_window): (Option<String>, Option<String>) = match run_handle
+        .backend_kind
+    {
+        DispatchBackendKind::Tmux => {
+            let (session, window) = run_handle.backend_ref.split_once(':').ok_or_else(|| {
+                anyhow!("invalid tmux run handle ref '{}'", run_handle.backend_ref)
+            })?;
+            (Some(session.to_string()), Some(window.to_string()))
         }
+        DispatchBackendKind::Local => (None, None),
     };
-    let (tmux_session, tmux_window) = tmux_ref
-        .split_once(':')
-        .ok_or_else(|| anyhow!("invalid tmux run handle ref '{}'", run_handle.backend_ref))?;
     let rows = tx.execute(
         r"
         UPDATE dispatches
         SET status = ?2,
             tmux_session = ?3,
             tmux_window = ?4,
-            run_dir = ?5,
-            lock_path = ?6
+            backend_kind = ?5,
+            backend_ref = ?6,
+            run_dir = ?7,
+            lock_path = ?8
         WHERE id = ?1
-          AND status = ?7
+          AND status = ?9
         ",
         params![
             dispatch_id,
             plan.next_state.as_db_str(),
-            tmux_session,
-            tmux_window,
+            tmux_session.as_deref(),
+            tmux_window.as_deref(),
+            match run_handle.backend_kind {
+                DispatchBackendKind::Tmux => "tmux",
+                DispatchBackendKind::Local => "local",
+            },
+            run_handle.backend_ref.as_str(),
             run_dir.to_string_lossy(),
             lock_path.to_string_lossy(),
             plan.current_status,
@@ -2744,7 +3517,7 @@ fn latest_issue_inflight_dispatch(
     let dispatch = conn
         .query_row(
             r"
-            SELECT id, status, started_at, tmux_session, tmux_window, lock_path
+            SELECT id, status, started_at, backend_kind, backend_ref, tmux_session, tmux_window, lock_path
             FROM dispatches
             WHERE repo_full_name = ?1
               AND issue_number = ?2
@@ -2763,14 +3536,31 @@ fn latest_issue_inflight_dispatch(
                     id: row.get(0)?,
                     status: row.get(1)?,
                     started_at: row.get(2)?,
-                    tmux_session: row.get(3)?,
-                    tmux_window: row.get(4)?,
-                    lock_path: row.get(5)?,
+                    backend_kind: row.get(3)?,
+                    backend_ref: row.get(4)?,
+                    tmux_session: row.get(5)?,
+                    tmux_window: row.get(6)?,
+                    lock_path: row.get(7)?,
                 })
             },
         )
         .optional()?;
     Ok(dispatch)
+}
+
+fn probe_dispatch_liveness(
+    dispatch: &InflightDispatch,
+    repo_full_name: &str,
+    issue_number: u64,
+) -> Result<bool, DispatchError> {
+    match dispatch.backend_kind.as_deref().unwrap_or("tmux") {
+        "tmux" => TmuxBackendAdapter.probe(dispatch, repo_full_name, issue_number),
+        "local" => LocalBackendAdapter.probe(dispatch, repo_full_name, issue_number),
+        other => Err(DispatchError::Io(format!(
+            "unknown backend kind '{other}' on dispatch {}",
+            dispatch.id
+        ))),
+    }
 }
 
 fn is_stale_starting_dispatch(
@@ -2785,14 +3575,21 @@ fn is_stale_starting_dispatch(
     if age < ChronoDuration::seconds(STARTING_DISPATCH_STALE_AFTER_SEC) {
         return false;
     }
-    let Some(session) = dispatch.tmux_session.as_deref() else {
+    if dispatch.backend_kind.is_none()
+        && dispatch.tmux_session.is_none()
+        && dispatch.backend_ref.is_none()
+    {
         return true;
-    };
-    let window = dispatch
-        .tmux_window
-        .clone()
-        .unwrap_or_else(|| issue_tmux_window_name(repo_full_name, issue_number));
-    match tmux_window_has_live_pane(session, &window) {
+    }
+    if dispatch.backend_kind.as_deref() == Some("local") && dispatch.backend_ref.is_none() {
+        return true;
+    }
+    if dispatch.backend_kind.as_deref().unwrap_or("tmux") == "tmux"
+        && dispatch.tmux_session.is_none()
+    {
+        return true;
+    }
+    match probe_dispatch_liveness(dispatch, repo_full_name, issue_number) {
         Ok(has_live_pane) => !has_live_pane,
         Err(err) => {
             log_line(
@@ -2820,14 +3617,8 @@ fn should_heal_dispatch_stale(
     };
     match dispatch_state {
         DispatchState::Running => {
-            let Some(session) = dispatch.tmux_session.as_deref() else {
-                return true;
-            };
-            let Some(window) = dispatch.tmux_window.as_deref() else {
-                return true;
-            };
-            match tmux_window_has_live_pane(session, window) {
-                Ok(has_live_pane) => !has_live_pane,
+            match probe_dispatch_liveness(dispatch, repo_full_name, issue_number) {
+                Ok(alive) => !alive,
                 Err(err) => {
                     log_line(
                         "dispatch_heal_probe_failed",
@@ -3069,6 +3860,7 @@ async fn reconcile_once(state: &AppState) -> Result<()> {
 }
 
 fn log_line(event: &str, payload: serde_json::Value) {
+    info!(event_name = event, payload = %payload, "orchd log event");
     let line = json!({
         "ts": Utc::now().to_rfc3339(),
         "event": event,
@@ -3090,6 +3882,8 @@ mod tests {
             id: 1,
             status: status.to_string(),
             started_at,
+            backend_kind: Some("tmux".to_string()),
+            backend_ref: Some("codex-orch:rmain-orchd-debug-i1".to_string()),
             tmux_session: tmux_session.map(str::to_string),
             tmux_window: None,
             lock_path: None,
