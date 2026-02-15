@@ -49,6 +49,9 @@ mod tmux;
 // Logging + tracing initialization. Read when debugging orchd logs or adding new observability.
 mod telemetry;
 
+// Axum server (webhook ingress) + background loops. Read when changing runtime wiring or webhook handling.
+mod server;
+
 pub fn run_entry() -> anyhow::Result<()> {
     legacy::run_entry()
 }
