@@ -230,6 +230,8 @@ Installed hooks:
 
 - `pre-commit`: runs `scripts/check.py`
 - `pre-push`: runs `scripts/check.py`
+- `post-commit`: runs `scripts/deploy-local.sh` (builds + installs `forgejoctl` + `orchd`)
+- `post-merge`: runs `scripts/deploy-local.sh` (keeps artifacts deployed after pulls/merges)
 
 `check.py` includes a skill/API sync enforcement hook:
 
