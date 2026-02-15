@@ -96,7 +96,11 @@ pub(super) fn extract_event_context(
     })
 }
 
-pub(super) fn decide(event_type: &str, context: Option<&EventContext>) -> DecisionRecord {
+pub(super) fn decide(
+    event_type: &str,
+    action: Option<&str>,
+    context: Option<&EventContext>,
+) -> DecisionRecord {
     let Some(context) = context else {
         return DecisionRecord {
             decision: DECISION_IGNORED.to_string(),
@@ -113,6 +117,16 @@ pub(super) fn decide(event_type: &str, context: Option<&EventContext>) -> Decisi
         return DecisionRecord {
             decision: DECISION_IGNORED.to_string(),
             reason_code: "orchd_echo_comment".to_string(),
+            directive: None,
+            target_role: None,
+            would_dispatch: false,
+        };
+    }
+
+    if !action_is_actionable(event_type, action) {
+        return DecisionRecord {
+            decision: DECISION_IGNORED.to_string(),
+            reason_code: "unactionable_action".to_string(),
             directive: None,
             target_role: None,
             would_dispatch: false,
@@ -137,6 +151,14 @@ pub(super) fn decide(event_type: &str, context: Option<&EventContext>) -> Decisi
         directive: None,
         target_role: None,
         would_dispatch: false,
+    }
+}
+
+fn action_is_actionable(event_type: &str, action: Option<&str>) -> bool {
+    match event_type {
+        EVENT_ISSUES => matches!(action, Some("opened" | "edited")),
+        EVENT_ISSUE_COMMENT => matches!(action, Some("created" | "edited")),
+        _ => false,
     }
 }
 
@@ -191,7 +213,8 @@ pub(super) fn extract_header(headers: &HeaderMap, names: &[&str]) -> Option<Stri
 #[cfg(test)]
 mod tests {
     use crate::orchd::lexicon::{
-        DECISION_ACCEPTED, DECISION_IGNORED, DIRECTIVE_POKE, EVENT_ISSUE_COMMENT,
+        DECISION_ACCEPTED, DECISION_IGNORED, DIRECTIVE_DESIGN, DIRECTIVE_POKE, EVENT_ISSUE_COMMENT,
+        EVENT_ISSUES,
     };
     use crate::orchd::state::EventContext;
 
@@ -207,7 +230,7 @@ mod tests {
             source_comment_id: None,
             source_created_at: None,
         };
-        let decision = decide(EVENT_ISSUE_COMMENT, Some(&context));
+        let decision = decide(EVENT_ISSUE_COMMENT, Some("created"), Some(&context));
         assert_eq!(decision.decision, DECISION_IGNORED);
         assert_eq!(decision.reason_code, "no_directive");
         assert!(!decision.would_dispatch);
@@ -223,7 +246,7 @@ mod tests {
             source_comment_id: None,
             source_created_at: None,
         };
-        let decision = decide(EVENT_ISSUE_COMMENT, Some(&context));
+        let decision = decide(EVENT_ISSUE_COMMENT, Some("created"), Some(&context));
         assert_eq!(decision.decision, DECISION_ACCEPTED);
         assert_eq!(decision.reason_code, "explicit_directive");
         assert_eq!(decision.directive.as_deref(), Some(DIRECTIVE_POKE));
@@ -236,5 +259,39 @@ mod tests {
         let parsed = parse_directive("@codex poke").expect("directive should parse");
         assert_eq!(parsed.role, "codex-orch");
         assert_eq!(parsed.directive, DIRECTIVE_POKE);
+    }
+
+    #[test]
+    fn issue_body_directive_is_ignored_for_label_updates() {
+        let context = EventContext {
+            repo_full_name: "main/forgejo-work".to_string(),
+            issue_number: Some(16),
+            actor_login: Some("codex-orch".to_string()),
+            text: Some("@codex-orch design".to_string()),
+            source_comment_id: None,
+            source_created_at: None,
+        };
+        let decision = decide(EVENT_ISSUES, Some("label_updated"), Some(&context));
+        assert_eq!(decision.decision, DECISION_IGNORED);
+        assert_eq!(decision.reason_code, "unactionable_action");
+        assert!(!decision.would_dispatch);
+    }
+
+    #[test]
+    fn issue_body_directive_is_accepted_on_open() {
+        let context = EventContext {
+            repo_full_name: "main/forgejo-work".to_string(),
+            issue_number: Some(16),
+            actor_login: Some("main".to_string()),
+            text: Some("@codex-orch design".to_string()),
+            source_comment_id: None,
+            source_created_at: None,
+        };
+        let decision = decide(EVENT_ISSUES, Some("opened"), Some(&context));
+        assert_eq!(decision.decision, DECISION_ACCEPTED);
+        assert_eq!(decision.reason_code, "explicit_directive");
+        assert_eq!(decision.directive.as_deref(), Some(DIRECTIVE_DESIGN));
+        assert_eq!(decision.target_role.as_deref(), Some("codex-orch"));
+        assert!(decision.would_dispatch);
     }
 }

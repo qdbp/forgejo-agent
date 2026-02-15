@@ -294,7 +294,7 @@ async fn process_webhook(
     };
     let _ = db::upsert_repo_seen(&state.db_path, &record.repo_full_name);
 
-    let decision = decide(&event_type, context.as_ref());
+    let decision = decide(&event_type, record.action.as_deref(), context.as_ref());
     let decision_id = db::insert_decision(&state.db_path, event_id, &record, &decision)?;
 
     let mut status_projected = false;
@@ -457,6 +457,7 @@ async fn process_webhook(
         json!({
             "delivery_id": record.delivery_id,
             "event_type": record.event_type,
+            "action": record.action,
             "repo": record.repo_full_name,
             "issue_number": record.issue_number,
             "actor": record.actor_login,
