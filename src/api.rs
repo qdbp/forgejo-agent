@@ -64,6 +64,11 @@ struct PatchIssueBody<'a> {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct PatchIssueAssigneesBody {
+    assignees: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct CommentBody<'a> {
     body: &'a str,
 }
@@ -470,6 +475,20 @@ impl ForgejoClient {
             issue.repo.owner, issue.repo.repo, issue.number
         );
         let payload = PatchIssueBody { title, body };
+        self.send_json(cfg, &Method::PATCH, &path, Some(&payload))
+    }
+
+    pub fn set_issue_assignees(
+        &self,
+        cfg: &AgentConfig,
+        issue: &IssueRef,
+        assignees: Vec<String>,
+    ) -> Result<ApiIssue> {
+        let path = format!(
+            "/api/v1/repos/{}/{}/issues/{}",
+            issue.repo.owner, issue.repo.repo, issue.number
+        );
+        let payload = PatchIssueAssigneesBody { assignees };
         self.send_json(cfg, &Method::PATCH, &path, Some(&payload))
     }
 

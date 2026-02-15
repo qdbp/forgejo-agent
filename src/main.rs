@@ -73,6 +73,7 @@ enum IssueCommand {
     Comment(IssueCommentArgs),
     OrchdState(IssueOrchdStateArgs),
     Transition(IssueTransitionArgs),
+    Assign(IssueAssignArgs),
     Claim(IssueClaimArgs),
     Release(IssueReleaseArgs),
     Blocker(IssueBlockerArgs),
@@ -159,6 +160,19 @@ struct IssueOrchdStateArgs {
     issue: IssueRef,
     #[arg(long)]
     to: OrchdRuntimeState,
+}
+
+#[derive(Args, Debug)]
+struct IssueAssignArgs {
+    issue: IssueRef,
+    #[arg(long, conflicts_with_all = ["self_assign", "clear"])]
+    to: Option<String>,
+    #[arg(long = "self", conflicts_with_all = ["to", "clear"])]
+    self_assign: bool,
+    #[arg(long, conflicts_with_all = ["to", "self_assign"])]
+    clear: bool,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -264,6 +278,7 @@ fn run() -> Result<()> {
             IssueCommand::Comment(args) => cmd_issue_comment(&api, &cfg, args)?,
             IssueCommand::OrchdState(args) => cmd_issue_orchd_state(&api, &cfg, args)?,
             IssueCommand::Transition(args) => cmd_issue_transition(&api, &cfg, args)?,
+            IssueCommand::Assign(args) => cmd_issue_assign(&api, &cfg, args)?,
             IssueCommand::Claim(args) => cmd_issue_claim(&api, &cfg, args)?,
             IssueCommand::Release(args) => cmd_issue_release(&api, &cfg, args)?,
             IssueCommand::Blocker(args) => cmd_issue_blocker(&api, &cfg, args)?,
@@ -510,6 +525,12 @@ fn cmd_issue_show(api: &ForgejoClient, cfg: &AgentConfig, args: IssueShowArgs) -
         return Ok(());
     }
 
+    let assignees = issue
+        .assignees
+        .iter()
+        .map(|user| user.login.as_str())
+        .collect::<Vec<_>>();
+
     println!("ref: {}", args.issue);
     println!("state: {}", issue.state);
     println!(
@@ -519,12 +540,58 @@ fn cmd_issue_show(api: &ForgejoClient, cfg: &AgentConfig, args: IssueShowArgs) -
             .map(|state| state.to_string())
             .unwrap_or_else(|| "-".to_string())
     );
+    println!(
+        "assignees: {}",
+        if assignees.is_empty() {
+            "-".to_string()
+        } else {
+            assignees.join(",")
+        }
+    );
     println!("title: {}", issue.title);
     println!("url: {}", issue.html_url);
     println!("labels: {}", join_label_names(&issue));
     println!("---");
     println!("{}", issue.body.unwrap_or_default());
 
+    Ok(())
+}
+
+fn cmd_issue_assign(api: &ForgejoClient, cfg: &AgentConfig, args: IssueAssignArgs) -> Result<()> {
+    let assignees = if args.clear {
+        Vec::new()
+    } else if args.self_assign {
+        let who = api.whoami(cfg)?;
+        let login = who
+            .get("login")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow!("Forgejo whoami response missing login"))?;
+        vec![login.to_ascii_lowercase()]
+    } else if let Some(to) = args.to.as_ref() {
+        vec![to.to_ascii_lowercase()]
+    } else {
+        bail!("provide exactly one of: --to <login>, --self, or --clear");
+    };
+
+    let updated = api.set_issue_assignees(cfg, &args.issue, assignees)?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&updated)?);
+        return Ok(());
+    }
+
+    let logins = updated
+        .assignees
+        .iter()
+        .map(|user| user.login.as_str())
+        .collect::<Vec<_>>();
+    println!(
+        "assignees: {}",
+        if logins.is_empty() {
+            "-".to_string()
+        } else {
+            logins.join(",")
+        }
+    );
     Ok(())
 }
 
@@ -1037,6 +1104,7 @@ mod tests {
                     name: (*name).to_string(),
                 })
                 .collect(),
+            assignees: Vec::new(),
             pull_request: None,
             repository: None,
         }

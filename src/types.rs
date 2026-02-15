@@ -274,6 +274,19 @@ pub struct ApiLabel {
     pub name: String,
 }
 
+fn deserialize_vec_or_empty<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<Vec<T>>::deserialize(deserializer).map(Option::unwrap_or_default)
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ApiUser {
+    pub login: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ApiIssue {
     pub number: u64,
@@ -284,6 +297,8 @@ pub struct ApiIssue {
     pub html_url: String,
     #[serde(default)]
     pub labels: Vec<ApiLabel>,
+    #[serde(default, deserialize_with = "deserialize_vec_or_empty")]
+    pub assignees: Vec<ApiUser>,
     #[serde(default)]
     pub pull_request: Option<serde_json::Value>,
     pub repository: Option<ApiRepo>,
