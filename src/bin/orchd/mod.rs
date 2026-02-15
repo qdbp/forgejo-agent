@@ -34,6 +34,9 @@ mod repo;
 // forgejoctl subprocess wrapper. Read when debugging control-plane side effects (labels/state/comments) from orchd.
 mod forgejoctl_cmd;
 
+// Dispatch finalization (db terminal transitions, landing/autoland/PR). Read when changing completion semantics.
+mod finalize;
+
 // tmux integration: naming, window/pane liveness probing, and run-script generation. Read when debugging operator UX.
 mod tmux;
 
