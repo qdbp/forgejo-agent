@@ -4,8 +4,8 @@
 // - what the submodule does
 // - when you should read it (vs. safely skip it)
 
-// Legacy monolith (transitional). Read only while shattering it into focused modules.
-mod legacy;
+// orchd entrypoint wiring (CLI parse, server runtime, subcommands). Read when changing startup.
+mod entry;
 
 // CLI flags/subcommands for orchd. Read when changing invocation or dispatch mode/backends.
 mod cli;
@@ -53,5 +53,5 @@ mod telemetry;
 mod server;
 
 pub fn run_entry() -> anyhow::Result<()> {
-    legacy::run_entry()
+    entry::run_entry()
 }
