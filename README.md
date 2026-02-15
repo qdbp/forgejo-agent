@@ -184,6 +184,10 @@ Health check:
 curl -fsS http://127.0.0.1:7878/healthz | jq .
 ```
 
+The `/healthz` response includes the running build identifier (`git describe`
+when available), so you can quickly tell whether the user service is running
+the latest installed binary.
+
 ## Quality Gate
 
 For Rust changes in this repo, run:

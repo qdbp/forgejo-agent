@@ -6,6 +6,7 @@ use forgejo_agent::types::{IssueRef, RepoRef};
 
 #[derive(Parser, Debug)]
 #[command(name = "orchd")]
+#[command(version = env!("FORGEJO_AGENT_BUILD"))]
 #[command(about = "Dev-mode reactive orchestrator")]
 pub(super) struct Cli {
     #[arg(long)]

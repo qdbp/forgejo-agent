@@ -125,4 +125,6 @@ pub(super) struct ErrorEnvelope {
 #[derive(Debug, Serialize)]
 pub(super) struct HealthEnvelope {
     pub(super) status: &'static str,
+    pub(super) build: &'static str,
+    pub(super) git_sha: Option<&'static str>,
 }

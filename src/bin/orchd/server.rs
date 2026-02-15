@@ -153,7 +153,11 @@ async fn shutdown_signal() {
 }
 
 async fn healthz_handler() -> Json<HealthEnvelope> {
-    Json(HealthEnvelope { status: "ok" })
+    Json(HealthEnvelope {
+        status: "ok",
+        build: env!("FORGEJO_AGENT_BUILD"),
+        git_sha: option_env!("FORGEJO_AGENT_GIT_SHA").filter(|s| !s.is_empty()),
+    })
 }
 
 fn hook_url(hook: &serde_json::Value) -> Option<&str> {

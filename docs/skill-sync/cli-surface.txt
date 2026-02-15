@@ -18,6 +18,7 @@ Options:
       --config <CONFIG>          
       --token-file <TOKEN_FILE>  
   -h, --help                     Print help
+  -V, --version                  Print version
 ```
 
 ## forgejoctl repo --help

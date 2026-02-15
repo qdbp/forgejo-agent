@@ -1,6 +1,6 @@
 # Skill/API Surface Sync Checklist
 
-CLI_SURFACE_SHA256: 89f0101443949bd7342d3a00400e73857d6d7a207e40055899c24c962ca98266
+CLI_SURFACE_SHA256: 19a57bba6a5478709067ed0b4010f9ac0e67c4c0d91d500db33d43272128d3ed
 
 - [x] Verified skill command reference against docs/skill-sync/cli-surface.txt.
 - [x] Updated skill procedural guidance for any CLI/workflow changes.

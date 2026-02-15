@@ -23,6 +23,7 @@ use forgejo_agent::types::{
 
 #[derive(Parser, Debug)]
 #[command(name = "forgejo-agent")]
+#[command(version = env!("FORGEJO_AGENT_BUILD"))]
 #[command(about = "Typed Forgejo control plane for agent swarms")]
 struct Cli {
     #[arg(long)]
