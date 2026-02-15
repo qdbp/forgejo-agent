@@ -31,6 +31,9 @@ mod db;
 // Repo/worktree management + git plumbing (with token injection). Read when touching checkouts, worktrees, or locks.
 mod repo;
 
+// forgejoctl subprocess wrapper. Read when debugging control-plane side effects (labels/state/comments) from orchd.
+mod forgejoctl_cmd;
+
 // tmux integration: naming, window/pane liveness probing, and run-script generation. Read when debugging operator UX.
 mod tmux;
 

@@ -34,6 +34,7 @@ use super::dispatch_config::{
     DispatchConfig, DispatchDirectiveConfig, DispatchRoleConfig, load_dispatch_config,
 };
 use super::errors::{DispatchError, runtime_state_for_dispatch_error};
+use super::forgejoctl_cmd;
 use super::paths::expand_tilde_path;
 use super::repo;
 use super::state::{
@@ -1015,7 +1016,7 @@ async fn plan_dispatch(
         let config_file = state.forgejo_config_file.clone();
         let token_file = role.token_file.clone();
         let ensure_outcome = tokio::task::spawn_blocking(move || {
-            run_forgejoctl(
+            forgejoctl_cmd::run_forgejoctl(
                 &forgejoctl_bin,
                 config_file.as_deref(),
                 &token_file,
@@ -1407,33 +1408,6 @@ fn parse_terminal_status_spec(status: &str) -> Result<TerminalStatusSpec> {
     }
 }
 
-fn run_forgejoctl(
-    forgejoctl_bin: &Path,
-    config_file: Option<&Path>,
-    token_file: &Path,
-    args: &[&str],
-) -> Result<()> {
-    let mut cmd = Command::new(forgejoctl_bin);
-    if let Some(config_file) = config_file {
-        cmd.arg("--config").arg(config_file);
-    }
-    let status = cmd
-        .arg("--token-file")
-        .arg(token_file)
-        .args(args)
-        .status()
-        .with_context(|| format!("failed invoking forgejoctl {}", forgejoctl_bin.display()))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "forgejoctl command failed (exit={:?}) args={:?}",
-            status.code(),
-            args
-        ))
-    }
-}
-
 fn append_completion_section(completion_file: &Path, header: &str, lines: &[String]) -> Result<()> {
     if lines.is_empty() {
         return Ok(());
@@ -1601,7 +1575,7 @@ fn finalize_dispatch_command(args: FinalizeDispatchArgs) -> Result<()> {
 
     if let Some(work_state_target) = work_state_target {
         let phase_transition_start = Instant::now();
-        if let Err(err) = run_forgejoctl(
+        if let Err(err) = forgejoctl_cmd::run_forgejoctl(
             &args.forgejoctl_bin,
             args.forgejo_config.as_deref(),
             &args.token_file,
@@ -1630,7 +1604,7 @@ fn finalize_dispatch_command(args: FinalizeDispatchArgs) -> Result<()> {
     }
 
     let phase_state_start = Instant::now();
-    if let Err(err) = run_forgejoctl(
+    if let Err(err) = forgejoctl_cmd::run_forgejoctl(
         &args.forgejoctl_bin,
         args.forgejo_config.as_deref(),
         &args.token_file,
@@ -1657,7 +1631,7 @@ fn finalize_dispatch_command(args: FinalizeDispatchArgs) -> Result<()> {
     }
 
     let phase_comment_start = Instant::now();
-    if let Err(err) = run_forgejoctl(
+    if let Err(err) = forgejoctl_cmd::run_forgejoctl(
         &args.forgejoctl_bin,
         args.forgejo_config.as_deref(),
         &args.token_file,
