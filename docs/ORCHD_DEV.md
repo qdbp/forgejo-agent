@@ -13,6 +13,8 @@ Core behavior:
 - accepts webhook events at `POST /webhook`
 - parses directives (`@codex-orch design`, `@codex-orch impl`, `@codex poke`)
 - persists `events`, `decisions`, and `dispatches` in sqlite
+- ensures a Forgejo admin/system webhook exists pointing to orchd (best-effort)
+- ensures per-repo policy labels exist (best-effort) and maintains per-role local checkouts under the orchd state dir
 - emits heartbeat + reconcile logs periodically
 - ignores self-generated `orchd:` comments to avoid echo loops
 
@@ -20,7 +22,7 @@ Dispatch behavior is configured in `config/orchd-dispatch.toml`:
 
 - actor allowlist (`allowed_actors`)
 - directive -> role mapping
-- role -> codex binary / token file / workdir mapping
+- role -> codex binary / token file / Forgejo login mapping
 - prompt envelopes (`prompt_envelopes.fresh_envelope_file`, `prompt_envelopes.followup_envelope_file`)
 - tmux session naming and remain-on-exit policy
 
