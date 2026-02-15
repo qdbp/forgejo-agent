@@ -108,8 +108,8 @@ EOF
 Current mode supports both:
 
 - `dry-run`: parse directives and post intent comments only
-- `tmux-tui` (default): spawn Codex TUI in issue-scoped tmux windows and auto-stop on first `final_answer` so completion is echoed back promptly
-- `tmux-exec`: non-interactive dispatch for fully automated runs
+- `tmux-tui` (default): tmux-backed dispatch. Currently implemented via `codex exec` for stability; produces a `codex_session_id` you can later open with `codex resume <id>` if you want an interactive TUI.
+- `tmux-exec`: explicit non-interactive dispatch (same underlying `codex exec` path)
 
 Core behavior:
 
@@ -118,8 +118,7 @@ Core behavior:
 - sqlite event/decision/dispatch persistence
 - runtime dispatch status projected to `orchd/state/*` labels (`queued|running|blocked|failed|completed`)
 - one active dispatch per issue (duplicates blocked while running)
-- issue-scoped codex session reuse (`resume` in `tmux-tui`, `exec resume` in `tmux-exec`) from latest `codex_session_id`
-- tmux-tui auto-reaps after first `final_answer` unless held (`tmux set-option -w -t <session:window> @orchd_hold 1`) or currently focused
+- issue-scoped codex session reuse (`codex exec resume`) from latest `codex_session_id`
 - periodic heartbeat + reconcile scan logs
 
 Role launch wrapper:

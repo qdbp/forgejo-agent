@@ -5,8 +5,8 @@
 Current implementation supports two dispatch modes:
 
 - `dry-run`: parse directives, persist decisions, comment intent only.
-- `tmux-tui` (default): create a dispatch record and spawn Codex TUI inside tmux; dispatch auto-stops after first `final_answer` so issue completion comments are not delayed behind long-lived interactive sessions.
-- `tmux-exec`: create a dispatch record and run Codex non-interactively.
+- `tmux-tui` (default): tmux-backed dispatch. Currently implemented via `codex exec` for stability; produces a `codex_session_id` you can later open with `codex resume <id>` if you want an interactive TUI.
+- `tmux-exec`: create a dispatch record and run Codex non-interactively (`codex exec`).
 
 Core behavior:
 
@@ -155,22 +155,9 @@ Expected in `tmux-tui` mode:
 - issue runtime labels: `orchd/state/queued` then `orchd/state/running`
 - sqlite `dispatches` row with `status=running` then terminal status
 - tmux window `r<repo_slug>-i<issue_number>` created (or respawned) under the configured session
-- tmux-tui run watcher monitors session JSONL and sends `Ctrl-C` after first `final_answer` to close the turn promptly
-- auto-reap is skipped while the window is held (`@orchd_hold=1`) or actively focused in an attached tmux client
 - completion status is projected to `orchd/state/completed` on success or `orchd/state/failed` otherwise
 - for `impl` directive runs, orchd applies work-plane transitions (`state/review` on success, `state/blocked` on non-success) via `forgejoctl issue transition --force`
-- completion in sqlite/comment is keyed off a `final_answer` message found in session JSONL when present
 - generated run artifacts include `prompt.md` and `prompt_mode.txt` (`fresh` or `followup`)
 - follow-up prompts include an issue delta block derived from events newer than the role cursor
 - stale in-flight rows are lazily healed on the next launch attempt (status set to `failed_runtime`, reason `stale_dispatch_autohealed`) when tmux no longer has a live pane for that issue
 - repo lockfiles under `locks/` are metadata only; dispatch gating is driven by sqlite `dispatches` state
-
-Manual hold controls:
-
-```bash
-# pin window (do not auto-reap after final_answer)
-tmux set-option -w -t codex-orch:rmain-orchd-debug-i2 @orchd_hold 1
-
-# unpin window (allow auto-reap)
-tmux set-option -u -w -t codex-orch:rmain-orchd-debug-i2 @orchd_hold
-```

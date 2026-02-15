@@ -11,7 +11,7 @@ This is the operator view of dispatched Codex runs.
   lives in tmux.
 - Run artifacts are written under:
   `~/.local/state/orchd-dev/dispatch-runs/dispatch-<id>/`.
-- `codex_session_id` is reused per issue when available (`codex resume` in `tmux-tui`, `codex exec resume` in `tmux-exec`).
+- `codex_session_id` is reused per issue when available (`codex exec resume`).
 
 ## Fast path: "what is running right now?"
 
@@ -45,8 +45,15 @@ tmux attach -r -t codex-orch
 
 Expected behavior:
 
-- `tmux-tui`: Codex output streams live in the pane (native interactive TUI).
-- `tmux-exec`: Codex output streams live in the pane and is mirrored to `dispatch-<id>/codex.log`.
+- `tmux-tui`: currently implemented via `codex exec` (line-oriented output).
+- `tmux-exec`: line-oriented output (same underlying `codex exec` path).
+
+If you want a native interactive Codex UI for a finished dispatch, use the
+recorded `codex_session_id`:
+
+```bash
+codex resume <codex_session_id>
+```
 
 ## Inspect finished runs
 
@@ -79,7 +86,7 @@ tmux capture-pane -pt codex-orch:0 | tail -n 120
 
 Unexpected non-interactive-looking pane:
 
-- Verify dispatch mode. `tmux-tui` should show a native Codex interface; `tmux-exec` is line-oriented.
+- Current behavior: `tmux-tui` and `tmux-exec` are both line-oriented `codex exec` runs.
 
 ## Session lifecycle patterns
 
