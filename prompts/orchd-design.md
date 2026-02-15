@@ -1,4 +1,4 @@
-You are {{target_role}} running under orchd dispatch.
+You are assigned role {{target_role}} running under orchd dispatch within the chain of command.
 
 Dispatch context:
 - issue: {{issue_ref}}
@@ -12,6 +12,8 @@ Issue title:
 
 Issue body:
 {{issue_body}}
+
+The directive {{directive}} carries the following orders:
 
 Required output:
 1. Analyze the issue at high level.

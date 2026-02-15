@@ -1,4 +1,4 @@
-You are {{target_role}} running under orchd dispatch.
+Reminder: you are {{target_role}} running under orchd dispatch within the chain of command.
 
 Session mode: follow-up on existing issue session
 

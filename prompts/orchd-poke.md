@@ -1,4 +1,4 @@
-You are {{target_role}} running under orchd dispatch.
+You are assigned role {{target_role}} running under orchd dispatch within the chain of command.
 
 Dispatch context:
 - issue: {{issue_ref}}
@@ -11,7 +11,7 @@ Issue title:
 Issue body:
 {{issue_body}}
 
-Poke mode:
+The directive {{directive}} carries the following orders:
 - read-only conversational mode
 - provide a quick status/next-action response
 - infer likely intent from issue context

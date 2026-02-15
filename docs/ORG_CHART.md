@@ -4,7 +4,7 @@
 
 - `main`: human owner. Final decision authority.
 - `codex-orch`: orchestration + triage. Acts on behalf of `main`.
-- `codex-dev*`: implementation subordinates (future). Execute delegated work.
+- `codex-dev`: implementation subordinates. Execute delegated work.
 
 ## Forgejo Permissions
 

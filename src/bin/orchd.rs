@@ -193,8 +193,9 @@ struct DispatchTmuxConfig {
 
 #[derive(Clone, Debug)]
 struct DispatchPromptEnvelopeConfig {
-    fresh_envelope_file: PathBuf,
-    followup_envelope_file: PathBuf,
+    fresh_envelope: PathBuf,
+    followup_envelope: PathBuf,
+    tmux_tui_bootstrap: PathBuf,
 }
 
 #[derive(Clone, Debug)]
@@ -239,9 +240,11 @@ struct DispatchTmuxConfigFile {
 #[serde(deny_unknown_fields)]
 struct DispatchPromptEnvelopeConfigFile {
     #[serde(default = "default_fresh_envelope_file")]
-    fresh_envelope_file: String,
+    fresh_envelope: String,
     #[serde(default = "default_followup_envelope_file")]
-    followup_envelope_file: String,
+    followup_envelope: String,
+    #[serde(default = "default_tmux_tui_bootstrap_file")]
+    tmux_tui_bootstrap: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -281,6 +284,10 @@ fn default_fresh_envelope_file() -> String {
 
 fn default_followup_envelope_file() -> String {
     "../prompts/orchd-envelope-followup.md".to_string()
+}
+
+fn default_tmux_tui_bootstrap_file() -> String {
+    "../prompts/orchd-tui-bootstrap.md".to_string()
 }
 
 const fn default_timeout_sec() -> u64 {
@@ -1512,13 +1519,14 @@ fn load_dispatch_config(path: &Path) -> Result<DispatchConfig> {
             remain_on_exit: raw.tmux.remain_on_exit,
         },
         prompt_envelopes: DispatchPromptEnvelopeConfig {
-            fresh_envelope_file: resolve_config_path(
+            fresh_envelope: resolve_config_path(&base_dir, &raw.prompt_envelopes.fresh_envelope)?,
+            followup_envelope: resolve_config_path(
                 &base_dir,
-                &raw.prompt_envelopes.fresh_envelope_file,
+                &raw.prompt_envelopes.followup_envelope,
             )?,
-            followup_envelope_file: resolve_config_path(
+            tmux_tui_bootstrap: resolve_config_path(
                 &base_dir,
-                &raw.prompt_envelopes.followup_envelope_file,
+                &raw.prompt_envelopes.tmux_tui_bootstrap,
             )?,
         },
         roles,
@@ -2800,13 +2808,13 @@ fn materialize_run_artifacts(
     let (prompt_mode, envelope_path, issue_delta) = if plan.issue_session_id.is_some() {
         (
             "followup",
-            &dispatch_config.prompt_envelopes.followup_envelope_file,
+            &dispatch_config.prompt_envelopes.followup_envelope,
             plan.issue_delta_summary.clone(),
         )
     } else {
         (
             "fresh",
-            &dispatch_config.prompt_envelopes.fresh_envelope_file,
+            &dispatch_config.prompt_envelopes.fresh_envelope,
             "(fresh session; no prior issue delta context)".to_string(),
         )
     };
@@ -2892,10 +2900,33 @@ fn materialize_run_artifacts(
         (DispatchMode::TmuxExec, _) => build_tmux_exec_run_script(&script_inputs),
         (DispatchMode::TmuxTui, DispatchBackend::Tmux) => {
             let bootstrap_prompt_path = plan.run_dir.join("bootstrap_prompt.md");
-            let bootstrap_prompt = format!(
-                "You are {} running under orchd dispatch.\n\nBefore taking any action, read and follow the full task instructions in this file:\n{}\n\nTreat that file as canonical for this dispatch.",
-                plan.intent.role,
-                prompt_path.display()
+            let bootstrap_template = fs::read_to_string(
+                &dispatch_config.prompt_envelopes.tmux_tui_bootstrap,
+            )
+            .map_err(|err| {
+                DispatchError::Io(format!(
+                    "failed reading tmux-tui bootstrap prompt {}: {err}",
+                    dispatch_config
+                        .prompt_envelopes
+                        .tmux_tui_bootstrap
+                        .display()
+                ))
+            })?;
+            let bootstrap_prompt = render_prompt(
+                &bootstrap_template,
+                &[
+                    ("issue_ref", plan.issue_ref.to_string()),
+                    ("repo", plan.intent.repo_full_name.clone()),
+                    ("issue_number", plan.intent.issue_number.to_string()),
+                    ("directive", plan.intent.directive.clone()),
+                    ("target_role", plan.intent.role.clone()),
+                    ("actor", plan.actor.clone()),
+                    ("issue_title", plan.issue_title.clone()),
+                    ("issue_url", plan.issue_url.clone()),
+                    ("event_type", plan.event_type.clone()),
+                    ("delivery_id", plan.intent.delivery_id.clone()),
+                    ("prompt_path", prompt_path.display().to_string()),
+                ],
             );
             fs::write(&bootstrap_prompt_path, bootstrap_prompt).map_err(|err| {
                 DispatchError::Io(format!("failed writing bootstrap prompt: {err}"))
