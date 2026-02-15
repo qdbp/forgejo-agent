@@ -22,6 +22,9 @@ mod errors;
 // Shared in-memory types (webhook payloads, decision records, app state). Read when wiring event->dispatch flow.
 mod state;
 
+// Issue/label/comment projection into Forgejo (API + forgejoctl). Read when changing how orchd reflects state back to issues.
+mod projection;
+
 // Webhook signature verification + directive parsing/decision. Read when changing how comments trigger dispatch.
 mod webhook;
 
