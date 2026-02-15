@@ -25,6 +25,9 @@ mod state;
 // Webhook signature verification + directive parsing/decision. Read when changing how comments trigger dispatch.
 mod webhook;
 
+// SQLite schema + queries + dispatch state transitions. Read when changing locking, queues, or persistence.
+mod db;
+
 // tmux integration: naming, window/pane liveness probing, and run-script generation. Read when debugging operator UX.
 mod tmux;
 

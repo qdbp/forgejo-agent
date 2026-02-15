@@ -16,7 +16,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use clap::Parser;
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, params};
 use serde_json::json;
 use tracing::{info, info_span};
 
@@ -24,19 +24,20 @@ use forgejo_agent::api::ForgejoClient;
 use forgejo_agent::config::AgentConfig;
 use forgejo_agent::orchd_dispatch_core::{
     DispatchBackendKind, DispatchEventKind, DispatchIntentV1, DispatchPolicyOutcome, DispatchState,
-    PolicyDecision as DispatchPolicyDecision, RunHandle, reduce_dispatch_state,
+    PolicyDecision as DispatchPolicyDecision, RunHandle,
 };
 use forgejo_agent::types::{ApiIssue, IssueRef, OrchdRuntimeState, RepoRef};
 
 use super::cli::{Cli, DispatchBackend, DispatchMode, FinalizeDispatchArgs, OrchdCommand};
+use super::db;
 use super::dispatch_config::{
     DispatchConfig, DispatchDirectiveConfig, DispatchRoleConfig, load_dispatch_config,
 };
 use super::errors::{DispatchError, runtime_state_for_dispatch_error};
 use super::paths::expand_tilde_path;
 use super::state::{
-    AppState, DecisionRecord, ErrorEnvelope, EventRecord, HealthEnvelope, IssueEventDeltaRow,
-    WebhookOutcome, WebhookPayload,
+    AppState, DecisionRecord, ErrorEnvelope, EventRecord, HealthEnvelope, WebhookOutcome,
+    WebhookPayload,
 };
 use super::telemetry::{init_telemetry, log_line, record_phase_latency_ms};
 use super::tmux::{
@@ -50,39 +51,11 @@ use super::webhook::{
 
 const STARTING_DISPATCH_STALE_AFTER_SEC: i64 = 120;
 
-enum DispatchReservation {
-    Started(i64),
-    InFlightIssue(i64),
-    InFlightRepo(i64),
-}
-
 #[derive(Clone)]
 struct CommentIdentity {
     forgejoctl_bin: PathBuf,
     config_file: Option<PathBuf>,
     token_file: PathBuf,
-}
-
-struct DispatchInsert {
-    decision_id: i64,
-    repo_full_name: String,
-    issue_number: u64,
-    actor_login: Option<String>,
-    directive: String,
-    target_role: String,
-    started_at: String,
-}
-
-#[derive(Debug)]
-struct InflightDispatch {
-    id: i64,
-    status: String,
-    started_at: String,
-    backend_kind: Option<String>,
-    backend_ref: Option<String>,
-    tmux_session: Option<String>,
-    tmux_window: Option<String>,
-    lock_path: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -123,7 +96,7 @@ trait DispatchBackendAdapter {
 
     fn probe(
         &self,
-        dispatch: &InflightDispatch,
+        dispatch: &db::InflightDispatch,
         repo_full_name: &str,
         issue_number: u64,
     ) -> Result<bool, DispatchError>;
@@ -153,7 +126,7 @@ impl DispatchBackendAdapter for TmuxBackendAdapter {
 
     fn probe(
         &self,
-        dispatch: &InflightDispatch,
+        dispatch: &db::InflightDispatch,
         repo_full_name: &str,
         issue_number: u64,
     ) -> Result<bool, DispatchError> {
@@ -207,7 +180,7 @@ impl DispatchBackendAdapter for LocalBackendAdapter {
 
     fn probe(
         &self,
-        dispatch: &InflightDispatch,
+        dispatch: &db::InflightDispatch,
         _repo_full_name: &str,
         _issue_number: u64,
     ) -> Result<bool, DispatchError> {
@@ -264,7 +237,7 @@ async fn run_server(cli: Cli) -> Result<()> {
     };
 
     let db_path = expand_tilde_path(&cli.db_path)?;
-    init_db(&db_path)?;
+    db::init_db(&db_path)?;
     let webhook_secret = load_secret(cli.webhook_secret_file.as_deref())?;
     let reconcile_repo = cli
         .reconcile_repo
@@ -397,7 +370,7 @@ async fn ensure_repo_webhooks_for_default_owner(state: &AppState) -> Result<()> 
             else {
                 continue;
             };
-            let _ = upsert_repo_seen(&db_path, repo_full_name);
+            let _ = db::upsert_repo_seen(&db_path, repo_full_name);
 
             let Ok(repo_ref) = RepoRef::parse(repo_full_name) else {
                 continue;
@@ -489,7 +462,7 @@ async fn process_webhook(
         raw_json: String::from_utf8_lossy(body).to_string(),
     };
 
-    let Some(event_id) = insert_event(&state.db_path, &record)? else {
+    let Some(event_id) = db::insert_event(&state.db_path, &record)? else {
         return Ok(WebhookOutcome {
             status: "duplicate".to_string(),
             delivery_id,
@@ -499,10 +472,10 @@ async fn process_webhook(
             duplicate: true,
         });
     };
-    let _ = upsert_repo_seen(&state.db_path, &record.repo_full_name);
+    let _ = db::upsert_repo_seen(&state.db_path, &record.repo_full_name);
 
     let decision = decide(&event_type, context.as_ref());
-    let decision_id = insert_decision(&state.db_path, event_id, &record, &decision)?;
+    let decision_id = db::insert_decision(&state.db_path, event_id, &record, &decision)?;
 
     let mut status_projected = false;
     let mut status_error: Option<String> = None;
@@ -551,7 +524,7 @@ async fn process_webhook(
                 }
                 DispatchMode::TmuxExec | DispatchMode::TmuxTui => {
                     let defer_impl = match decision.directive.as_deref() {
-                        Some("impl") => match latest_repo_inflight_impl_dispatch_id(
+                        Some("impl") => match db::latest_repo_inflight_impl_dispatch_id(
                             &state.db_path,
                             &record.repo_full_name,
                         ) {
@@ -605,7 +578,7 @@ async fn process_webhook(
                                     status_projected = true;
                                 }
                                 if let Some(role_name) = decision.target_role.as_deref()
-                                    && let Err(err) = upsert_issue_role_cursor_event_id(
+                                    && let Err(err) = db::upsert_issue_role_cursor_event_id(
                                         &state.db_path,
                                         &record.repo_full_name,
                                         issue_number,
@@ -652,7 +625,12 @@ async fn process_webhook(
         }
     }
 
-    update_decision_comment_status(&state.db_path, decision_id, status_projected, status_error)?;
+    db::update_decision_comment_status(
+        &state.db_path,
+        decision_id,
+        status_projected,
+        status_error,
+    )?;
 
     log_line(
         "decision",
@@ -1159,7 +1137,7 @@ fn ensure_repo_checkout(
             Some(&checkout),
             &["fetch", DEFAULT_GIT_REMOTE, DEFAULT_GIT_BASE_BRANCH],
         );
-        let _ = update_repo_local_path(&state.db_path, repo_full_name, &checkout);
+        let _ = db::update_repo_local_path(&state.db_path, repo_full_name, &checkout);
         return Ok(checkout);
     }
     if checkout.exists() {
@@ -1189,7 +1167,7 @@ fn ensure_repo_checkout(
             &checkout.to_string_lossy(),
         ],
     )?;
-    let _ = update_repo_local_path(&state.db_path, repo_full_name, &checkout);
+    let _ = db::update_repo_local_path(&state.db_path, repo_full_name, &checkout);
     Ok(checkout)
 }
 
@@ -1284,9 +1262,12 @@ async fn plan_dispatch(
         });
     }
 
-    let issue_session_id =
-        latest_issue_codex_session_id(&state.db_path, &intent.repo_full_name, intent.issue_number)
-            .map_err(|err| DispatchError::Db(err.to_string()))?;
+    let issue_session_id = db::latest_issue_codex_session_id(
+        &state.db_path,
+        &intent.repo_full_name,
+        intent.issue_number,
+    )
+    .map_err(|err| DispatchError::Db(err.to_string()))?;
     let lock_path = acquire_repo_lock(&state.db_path, &intent.repo_full_name)?;
 
     let repo = RepoRef::parse(&intent.repo_full_name)
@@ -1296,14 +1277,14 @@ async fn plan_dispatch(
         number: intent.issue_number,
     };
     let issue = fetch_issue(state.clone(), issue_ref.clone()).await?;
-    let previous_event_cursor = issue_role_cursor_event_id(
+    let previous_event_cursor = db::issue_role_cursor_event_id(
         &state.db_path,
         &intent.repo_full_name,
         intent.issue_number,
         &intent.role,
     )
     .map_err(|err| DispatchError::Db(err.to_string()))?;
-    let delta_rows = issue_delta_rows(
+    let delta_rows = db::issue_delta_rows(
         &state.db_path,
         &intent.repo_full_name,
         intent.issue_number,
@@ -1311,25 +1292,25 @@ async fn plan_dispatch(
         current_event_id,
     )
     .map_err(|err| DispatchError::Db(err.to_string()))?;
-    let issue_delta_summary = summarize_issue_delta(&delta_rows);
+    let issue_delta_summary = db::summarize_issue_delta(&delta_rows);
 
     let now = Utc::now().to_rfc3339();
-    let dispatch_id = match reserve_dispatch_starting(
+    let dispatch_id = match db::reserve_dispatch_starting(
         &state.db_path,
-        &DispatchInsert {
+        db::DispatchInsert {
             decision_id,
-            repo_full_name: intent.repo_full_name.clone(),
+            repo_full_name: &intent.repo_full_name,
             issue_number: intent.issue_number,
-            actor_login: record.actor_login.clone(),
-            directive: intent.directive.clone(),
-            target_role: intent.role.clone(),
-            started_at: now,
+            actor_login: record.actor_login.as_deref(),
+            directive: &intent.directive,
+            target_role: &intent.role,
+            started_at: &now,
         },
     )
     .map_err(|err| DispatchError::Db(err.to_string()))?
     {
-        DispatchReservation::Started(dispatch_id) => dispatch_id,
-        DispatchReservation::InFlightIssue(dispatch_id) => {
+        db::DispatchReservation::Started(dispatch_id) => dispatch_id,
+        db::DispatchReservation::InFlightIssue(dispatch_id) => {
             let _ = fs::remove_file(&lock_path);
             return Err(DispatchError::IssueDispatchInFlight {
                 repo_full_name: intent.repo_full_name.clone(),
@@ -1337,7 +1318,7 @@ async fn plan_dispatch(
                 dispatch_id,
             });
         }
-        DispatchReservation::InFlightRepo(dispatch_id) => {
+        db::DispatchReservation::InFlightRepo(dispatch_id) => {
             let _ = fs::remove_file(&lock_path);
             return Err(DispatchError::RepoImplDispatchInFlight {
                 repo_full_name: intent.repo_full_name.clone(),
@@ -1354,7 +1335,7 @@ async fn plan_dispatch(
     let issue_url = issue.html_url;
 
     let base_repo_checkout = ensure_repo_checkout(state, &role, &intent.repo_full_name)?;
-    if repo_labels_ensured_at(&state.db_path, &intent.repo_full_name)
+    if db::repo_labels_ensured_at(&state.db_path, &intent.repo_full_name)
         .unwrap_or(None)
         .is_none()
     {
@@ -1373,11 +1354,15 @@ async fn plan_dispatch(
         .await;
         match ensure_outcome {
             Ok(Ok(())) => {
-                let _ =
-                    update_repo_labels_ensured(&state.db_path, &intent.repo_full_name, true, None);
+                let _ = db::update_repo_labels_ensured(
+                    &state.db_path,
+                    &intent.repo_full_name,
+                    true,
+                    None,
+                );
             }
             Ok(Err(err)) => {
-                let _ = update_repo_labels_ensured(
+                let _ = db::update_repo_labels_ensured(
                     &state.db_path,
                     &intent.repo_full_name,
                     false,
@@ -1385,7 +1370,7 @@ async fn plan_dispatch(
                 );
             }
             Err(err) => {
-                let _ = update_repo_labels_ensured(
+                let _ = db::update_repo_labels_ensured(
                     &state.db_path,
                     &intent.repo_full_name,
                     false,
@@ -1683,7 +1668,7 @@ async fn dispatch_issue(
                 phase_launch_start.elapsed().as_secs_f64() * 1000.0,
                 "error",
             );
-            let _ = update_dispatch_failed_start(
+            let _ = db::update_dispatch_failed_start(
                 &state.db_path,
                 plan.dispatch_id,
                 err.reason_code(),
@@ -1699,7 +1684,7 @@ async fn dispatch_issue(
         "ok",
     );
     let phase_finalize_start = Instant::now();
-    update_dispatch_running(
+    db::update_dispatch_running(
         &state.db_path,
         plan.dispatch_id,
         &run_handle,
@@ -1749,78 +1734,6 @@ fn parse_terminal_status_spec(status: &str) -> Result<TerminalStatusSpec> {
         }),
         other => Err(anyhow!("unsupported finalize status '{other}'")),
     }
-}
-
-fn update_dispatch_terminal(
-    db_path: &Path,
-    dispatch_id: i64,
-    status_spec: TerminalStatusSpec,
-    reason_code: &str,
-    exit_code: i64,
-    session_id: Option<&str>,
-) -> Result<bool> {
-    let mut conn = open_db(db_path)?;
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let Some(current_status) = tx
-        .query_row(
-            "SELECT status FROM dispatches WHERE id = ?1",
-            params![dispatch_id],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?
-    else {
-        return Ok(false);
-    };
-    let Some(current_state) = DispatchState::parse_db(&current_status) else {
-        return Ok(false);
-    };
-    if current_state.is_terminal() {
-        return Ok(false);
-    }
-    let next_state =
-        reduce_dispatch_state(current_state, status_spec.event_kind).map_err(|err| {
-            anyhow!(
-                "terminal transition rejected for dispatch {}: {err}",
-                dispatch_id
-            )
-        })?;
-    let ended_at = Utc::now().to_rfc3339();
-    let session_id = session_id.filter(|sid| !sid.trim().is_empty());
-    let rows = tx.execute(
-        r"
-        UPDATE dispatches
-        SET status = ?2,
-            reason_code = ?3,
-            codex_session_id = ?4,
-            exit_code = ?5,
-            ended_at = ?6
-        WHERE id = ?1
-          AND status = ?7
-        ",
-        params![
-            dispatch_id,
-            next_state.as_db_str(),
-            reason_code,
-            session_id,
-            exit_code,
-            ended_at,
-            current_status,
-        ],
-    )?;
-    if rows == 0 {
-        return Ok(false);
-    }
-    append_dispatch_event_tx(
-        &tx,
-        dispatch_id,
-        status_spec.event_kind,
-        Some(&current_status),
-        next_state.as_db_str(),
-        Some(reason_code),
-        None,
-    )?;
-    tx.commit()?;
-    Ok(true)
 }
 
 fn run_forgejoctl(
@@ -1996,10 +1909,10 @@ fn finalize_dispatch_command(args: FinalizeDispatchArgs) -> Result<()> {
     let _entered = span.enter();
     let status_spec = parse_terminal_status_spec(&args.status)?;
     let phase_update_start = Instant::now();
-    let did_transition = update_dispatch_terminal(
+    let did_transition = db::update_dispatch_terminal(
         &args.db_path,
         args.dispatch_id,
-        status_spec,
+        status_spec.event_kind,
         &args.reason_code,
         args.exit_code,
         Some(&args.session_id),
@@ -2169,777 +2082,8 @@ fn finalize_dispatch_command(args: FinalizeDispatchArgs) -> Result<()> {
     Ok(())
 }
 
-fn init_db(db_path: &Path) -> Result<()> {
-    if let Some(parent) = db_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create db directory: {}", parent.display()))?;
-    }
-    let conn = open_db(db_path)?;
-    conn.execute_batch(
-        r"
-        CREATE TABLE IF NOT EXISTS events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            delivery_id TEXT NOT NULL,
-            event_type TEXT NOT NULL,
-            repo_full_name TEXT NOT NULL,
-            issue_number INTEGER,
-            action TEXT,
-            actor_login TEXT,
-            event_text TEXT,
-            source_comment_id INTEGER,
-            source_created_at TEXT,
-            raw_json TEXT NOT NULL,
-            received_at TEXT NOT NULL,
-            UNIQUE(delivery_id, event_type)
-        );
-        CREATE TABLE IF NOT EXISTS decisions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            event_id INTEGER NOT NULL,
-            repo_full_name TEXT NOT NULL,
-            issue_number INTEGER,
-            actor_login TEXT,
-            directive TEXT,
-            target_role TEXT,
-            decision TEXT NOT NULL,
-            reason_code TEXT NOT NULL,
-            would_dispatch INTEGER NOT NULL,
-            comment_posted INTEGER NOT NULL DEFAULT 0,
-            comment_error TEXT,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY(event_id) REFERENCES events(id)
-        );
-        CREATE TABLE IF NOT EXISTS heartbeats (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            recorded_at TEXT NOT NULL,
-            queue_depth INTEGER NOT NULL,
-            events_total INTEGER NOT NULL,
-            decisions_total INTEGER NOT NULL,
-            last_delivery_id TEXT
-        );
-        CREATE TABLE IF NOT EXISTS reconciles (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            recorded_at TEXT NOT NULL,
-            repo_full_name TEXT NOT NULL,
-            scanned_open INTEGER NOT NULL,
-            status TEXT NOT NULL,
-            error_text TEXT
-        );
-        CREATE TABLE IF NOT EXISTS dispatches (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            decision_id INTEGER NOT NULL,
-            repo_full_name TEXT NOT NULL,
-            issue_number INTEGER NOT NULL,
-            actor_login TEXT,
-            directive TEXT NOT NULL,
-            target_role TEXT NOT NULL,
-            status TEXT NOT NULL,
-            backend_kind TEXT,
-            backend_ref TEXT,
-            reason_code TEXT,
-            error_text TEXT,
-            tmux_session TEXT,
-            tmux_window TEXT,
-            run_dir TEXT,
-            lock_path TEXT,
-            codex_session_id TEXT,
-            exit_code INTEGER,
-            started_at TEXT NOT NULL,
-            ended_at TEXT,
-            FOREIGN KEY(decision_id) REFERENCES decisions(id)
-        );
-        CREATE INDEX IF NOT EXISTS idx_dispatches_repo_status
-            ON dispatches (repo_full_name, status);
-        CREATE INDEX IF NOT EXISTS idx_dispatches_repo_issue
-            ON dispatches (repo_full_name, issue_number, id DESC);
-        CREATE TABLE IF NOT EXISTS dispatch_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            dispatch_id INTEGER NOT NULL,
-            event_kind TEXT NOT NULL,
-            from_state TEXT,
-            to_state TEXT NOT NULL,
-            reason_code TEXT,
-            error_text TEXT,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY(dispatch_id) REFERENCES dispatches(id)
-        );
-        CREATE INDEX IF NOT EXISTS idx_dispatch_events_dispatch
-            ON dispatch_events (dispatch_id, id);
-        CREATE TABLE IF NOT EXISTS issue_role_cursors (
-            repo_full_name TEXT NOT NULL,
-            issue_number INTEGER NOT NULL,
-            role_name TEXT NOT NULL,
-            last_event_id INTEGER NOT NULL,
-            updated_at TEXT NOT NULL,
-            PRIMARY KEY (repo_full_name, issue_number, role_name)
-        );
-        CREATE TABLE IF NOT EXISTS repos (
-            repo_full_name TEXT PRIMARY KEY,
-            first_seen_at TEXT NOT NULL,
-            last_seen_at TEXT NOT NULL,
-            labels_ensured_at TEXT,
-            local_path TEXT,
-            last_error TEXT
-        );
-        ",
-    )?;
-    ensure_column_exists(&conn, "events", "event_text", "TEXT")?;
-    ensure_column_exists(&conn, "events", "source_comment_id", "INTEGER")?;
-    ensure_column_exists(&conn, "events", "source_created_at", "TEXT")?;
-    ensure_column_exists(&conn, "dispatches", "backend_kind", "TEXT")?;
-    ensure_column_exists(&conn, "dispatches", "backend_ref", "TEXT")?;
-    Ok(())
-}
-
-fn ensure_column_exists(
-    conn: &Connection,
-    table_name: &str,
-    column_name: &str,
-    column_type: &str,
-) -> Result<()> {
-    let pragma = format!("PRAGMA table_info({table_name})");
-    let mut stmt = conn.prepare(&pragma)?;
-    let column_names = stmt
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    if column_names.iter().any(|name| name == column_name) {
-        return Ok(());
-    }
-
-    let alter = format!("ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}");
-    conn.execute(&alter, [])?;
-    Ok(())
-}
-
-fn open_db(path: &Path) -> Result<Connection> {
-    let conn =
-        Connection::open(path).with_context(|| format!("failed to open db: {}", path.display()))?;
-    conn.busy_timeout(StdDuration::from_secs(5))?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
-    Ok(conn)
-}
-
-fn upsert_repo_seen(db_path: &Path, repo_full_name: &str) -> Result<()> {
-    let conn = open_db(db_path)?;
-    let now = Utc::now().to_rfc3339();
-    conn.execute(
-        r"
-        INSERT INTO repos (repo_full_name, first_seen_at, last_seen_at, labels_ensured_at, local_path, last_error)
-        VALUES (?1, ?2, ?3, NULL, NULL, NULL)
-        ON CONFLICT(repo_full_name) DO UPDATE SET last_seen_at = excluded.last_seen_at
-        ",
-        params![repo_full_name, now, now],
-    )?;
-    Ok(())
-}
-
-fn repo_labels_ensured_at(db_path: &Path, repo_full_name: &str) -> Result<Option<String>> {
-    let conn = open_db(db_path)?;
-    let row: Option<Option<String>> = conn
-        .query_row(
-            "SELECT labels_ensured_at FROM repos WHERE repo_full_name = ?1",
-            params![repo_full_name],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .optional()?;
-    Ok(row.flatten())
-}
-
-fn update_repo_labels_ensured(
-    db_path: &Path,
-    repo_full_name: &str,
-    ok: bool,
-    err: Option<&str>,
-) -> Result<()> {
-    let conn = open_db(db_path)?;
-    let now = Utc::now().to_rfc3339();
-    conn.execute(
-        r"
-        UPDATE repos
-        SET labels_ensured_at = CASE WHEN ?2 THEN ?3 ELSE labels_ensured_at END,
-            last_error = ?4,
-            last_seen_at = ?3
-        WHERE repo_full_name = ?1
-        ",
-        params![repo_full_name, ok, now, err],
-    )?;
-    Ok(())
-}
-
-fn update_repo_local_path(db_path: &Path, repo_full_name: &str, local_path: &Path) -> Result<()> {
-    let conn = open_db(db_path)?;
-    let now = Utc::now().to_rfc3339();
-    conn.execute(
-        r"
-        UPDATE repos
-        SET local_path = ?2,
-            last_seen_at = ?3
-        WHERE repo_full_name = ?1
-        ",
-        params![repo_full_name, local_path.to_string_lossy(), now],
-    )?;
-    Ok(())
-}
-
-fn insert_event(db_path: &Path, event: &EventRecord) -> Result<Option<i64>> {
-    let conn = open_db(db_path)?;
-    let now = Utc::now().to_rfc3339();
-    let inserted = conn.execute(
-        r"
-        INSERT INTO events (delivery_id, event_type, repo_full_name, issue_number, action, actor_login, event_text, source_comment_id, source_created_at, raw_json, received_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-        ",
-        params![
-            event.delivery_id,
-            event.event_type,
-            event.repo_full_name,
-            event.issue_number,
-            event.action,
-            event.actor_login,
-            event.event_text,
-            event.source_comment_id,
-            event.source_created_at,
-            event.raw_json,
-            now,
-        ],
-    );
-
-    match inserted {
-        Ok(_) => Ok(Some(conn.last_insert_rowid())),
-        Err(err) => {
-            let duplicate = matches!(
-                err,
-                rusqlite::Error::SqliteFailure(sqlite_err, _)
-                    if sqlite_err.extended_code == 2067
-            );
-            if duplicate { Ok(None) } else { Err(err.into()) }
-        }
-    }
-}
-
-fn insert_decision(
-    db_path: &Path,
-    event_id: i64,
-    event: &EventRecord,
-    decision: &DecisionRecord,
-) -> Result<i64> {
-    let conn = open_db(db_path)?;
-    let now = Utc::now().to_rfc3339();
-    conn.execute(
-        r"
-        INSERT INTO decisions
-        (event_id, repo_full_name, issue_number, actor_login, directive, target_role, decision, reason_code, would_dispatch, created_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-        ",
-        params![
-            event_id,
-            event.repo_full_name,
-            event.issue_number,
-            event.actor_login,
-            decision.directive,
-            decision.target_role,
-            decision.decision,
-            decision.reason_code,
-            i64::from(decision.would_dispatch),
-            now
-        ],
-    )?;
-    Ok(conn.last_insert_rowid())
-}
-
-fn update_decision_comment_status(
-    db_path: &Path,
-    decision_id: i64,
-    comment_posted: bool,
-    comment_error: Option<String>,
-) -> Result<()> {
-    let conn = open_db(db_path)?;
-    conn.execute(
-        r"
-        UPDATE decisions
-        SET comment_posted = ?2, comment_error = ?3
-        WHERE id = ?1
-        ",
-        params![decision_id, i64::from(comment_posted), comment_error],
-    )?;
-    Ok(())
-}
-
-fn issue_role_cursor_event_id(
-    db_path: &Path,
-    repo_full_name: &str,
-    issue_number: u64,
-    role_name: &str,
-) -> Result<Option<i64>> {
-    let conn = open_db(db_path)?;
-    let issue_number = i64::try_from(issue_number)?;
-    conn.query_row(
-        r"
-        SELECT last_event_id
-        FROM issue_role_cursors
-        WHERE repo_full_name = ?1
-          AND issue_number = ?2
-          AND role_name = ?3
-        ",
-        params![repo_full_name, issue_number, role_name],
-        |row| row.get::<_, i64>(0),
-    )
-    .optional()
-    .map_err(Into::into)
-}
-
-fn upsert_issue_role_cursor_event_id(
-    db_path: &Path,
-    repo_full_name: &str,
-    issue_number: u64,
-    role_name: &str,
-    last_event_id: i64,
-) -> Result<()> {
-    let conn = open_db(db_path)?;
-    let now = Utc::now().to_rfc3339();
-    conn.execute(
-        r"
-        INSERT INTO issue_role_cursors (repo_full_name, issue_number, role_name, last_event_id, updated_at)
-        VALUES (?1, ?2, ?3, ?4, ?5)
-        ON CONFLICT(repo_full_name, issue_number, role_name)
-        DO UPDATE SET
-            last_event_id = excluded.last_event_id,
-            updated_at = excluded.updated_at
-        ",
-        params![
-            repo_full_name,
-            i64::try_from(issue_number)?,
-            role_name,
-            last_event_id,
-            now
-        ],
-    )?;
-    Ok(())
-}
-
-fn issue_delta_rows(
-    db_path: &Path,
-    repo_full_name: &str,
-    issue_number: u64,
-    after_event_id: Option<i64>,
-    up_to_event_id: i64,
-) -> Result<Vec<IssueEventDeltaRow>> {
-    let conn = open_db(db_path)?;
-    let start_event_id = after_event_id.unwrap_or(0_i64);
-    let issue_number = i64::try_from(issue_number)?;
-    let mut stmt = conn.prepare(
-        r"
-        SELECT event_type, actor_login, event_text, received_at, source_created_at
-        FROM events
-        WHERE repo_full_name = ?1
-          AND issue_number = ?2
-          AND id > ?3
-          AND id <= ?4
-          AND event_type IN ('issue_comment', 'issues')
-          AND event_text IS NOT NULL
-          AND event_text != ''
-        ORDER BY id ASC
-        LIMIT 200
-        ",
-    )?;
-    let rows = stmt
-        .query_map(
-            params![repo_full_name, issue_number, start_event_id, up_to_event_id],
-            |row| {
-                Ok(IssueEventDeltaRow {
-                    event_type: row.get(0)?,
-                    actor_login: row.get(1)?,
-                    event_text: row.get(2)?,
-                    received_at: row.get(3)?,
-                    source_created_at: row.get(4)?,
-                })
-            },
-        )?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
-}
-
-fn summarize_issue_delta(rows: &[IssueEventDeltaRow]) -> String {
-    if rows.is_empty() {
-        return "(no new issue events since last handled dispatch)".to_string();
-    }
-
-    rows.iter()
-        .map(|row| {
-            let timestamp = row
-                .source_created_at
-                .as_deref()
-                .filter(|text| !text.trim().is_empty())
-                .unwrap_or(row.received_at.as_str());
-            let actor = row
-                .actor_login
-                .as_deref()
-                .filter(|text| !text.trim().is_empty())
-                .unwrap_or("unknown");
-            let mut text = row.event_text.as_deref().unwrap_or("").replace('\n', " ");
-            text = text.trim().to_string();
-            if text.chars().count() > 220 {
-                text = format!("{}...", text.chars().take(220).collect::<String>());
-            }
-            format!("- [{}] {} {}: {}", timestamp, actor, row.event_type, text)
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-struct DispatchTransitionPlan {
-    current_status: String,
-    next_state: DispatchState,
-}
-
-fn append_dispatch_event_tx(
-    tx: &Transaction<'_>,
-    dispatch_id: i64,
-    event_kind: DispatchEventKind,
-    from_state: Option<&str>,
-    to_state: &str,
-    reason_code: Option<&str>,
-    error_text: Option<&str>,
-) -> Result<()> {
-    tx.execute(
-        r"
-        INSERT INTO dispatch_events
-            (dispatch_id, event_kind, from_state, to_state, reason_code, error_text, created_at)
-        VALUES
-            (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-        ",
-        params![
-            dispatch_id,
-            event_kind.as_db_str(),
-            from_state,
-            to_state,
-            reason_code,
-            error_text,
-            Utc::now().to_rfc3339(),
-        ],
-    )?;
-    info!(
-        dispatch_id = dispatch_id,
-        event_kind = event_kind.as_db_str(),
-        from_state = from_state.unwrap_or(""),
-        to_state = to_state,
-        reason_code = reason_code.unwrap_or(""),
-        "dispatch transition recorded"
-    );
-    Ok(())
-}
-
-fn plan_dispatch_transition(
-    conn: &Connection,
-    dispatch_id: i64,
-    event: DispatchEventKind,
-) -> Result<Option<DispatchTransitionPlan>> {
-    let Some(current_status) = conn
-        .query_row(
-            "SELECT status FROM dispatches WHERE id = ?1",
-            params![dispatch_id],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?
-    else {
-        return Ok(None);
-    };
-    let current_state = DispatchState::parse_db(&current_status).ok_or_else(|| {
-        anyhow!(
-            "dispatch {} has unknown status literal '{}'",
-            dispatch_id,
-            current_status
-        )
-    })?;
-    let next_state = reduce_dispatch_state(current_state, event)
-        .map_err(|err| anyhow!("dispatch {dispatch_id} transition rejected: {err}"))?;
-    Ok(Some(DispatchTransitionPlan {
-        current_status,
-        next_state,
-    }))
-}
-
-fn reserve_dispatch_starting(
-    db_path: &Path,
-    dispatch: &DispatchInsert,
-) -> Result<DispatchReservation> {
-    let mut conn = open_db(db_path)?;
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let issue_number = i64::try_from(dispatch.issue_number)?;
-    let starting_status = DispatchState::Starting.as_db_str();
-    let running_status = DispatchState::Running.as_db_str();
-
-    let inflight_id = tx
-        .query_row(
-            r"
-            SELECT id
-            FROM dispatches
-            WHERE repo_full_name = ?1
-              AND issue_number = ?2
-              AND status IN (?3, ?4)
-            ORDER BY id DESC
-            LIMIT 1
-            ",
-            params![
-                dispatch.repo_full_name.as_str(),
-                issue_number,
-                starting_status,
-                running_status
-            ],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()?;
-    if let Some(dispatch_id) = inflight_id {
-        tx.commit()?;
-        return Ok(DispatchReservation::InFlightIssue(dispatch_id));
-    }
-
-    if dispatch.directive == "impl" {
-        let repo_inflight = tx
-            .query_row(
-                r"
-                SELECT id
-                FROM dispatches
-                WHERE repo_full_name = ?1
-                  AND directive = 'impl'
-                  AND status IN (?2, ?3)
-                ORDER BY id DESC
-                LIMIT 1
-                ",
-                params![
-                    dispatch.repo_full_name.as_str(),
-                    starting_status,
-                    running_status
-                ],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?;
-        if let Some(dispatch_id) = repo_inflight {
-            tx.commit()?;
-            return Ok(DispatchReservation::InFlightRepo(dispatch_id));
-        }
-    }
-
-    tx.execute(
-        r"
-        INSERT INTO dispatches
-        (decision_id, repo_full_name, issue_number, actor_login, directive, target_role, status, started_at, tmux_session)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)
-        ",
-        params![
-            dispatch.decision_id,
-            dispatch.repo_full_name.as_str(),
-            issue_number,
-            dispatch.actor_login.as_deref(),
-            dispatch.directive.as_str(),
-            dispatch.target_role.as_str(),
-            DispatchState::Starting.as_db_str(),
-            dispatch.started_at.as_str(),
-        ],
-    )?;
-    let dispatch_id = tx.last_insert_rowid();
-    append_dispatch_event_tx(
-        &tx,
-        dispatch_id,
-        DispatchEventKind::MarkStarting,
-        None,
-        DispatchState::Starting.as_db_str(),
-        Some("reserved_dispatch"),
-        None,
-    )?;
-    tx.commit()?;
-    Ok(DispatchReservation::Started(dispatch_id))
-}
-
-fn update_dispatch_running(
-    db_path: &Path,
-    dispatch_id: i64,
-    run_handle: &RunHandle,
-    run_dir: &Path,
-    lock_path: &Path,
-) -> Result<()> {
-    let mut conn = open_db(db_path)?;
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let Some(plan) = plan_dispatch_transition(&tx, dispatch_id, DispatchEventKind::MarkRunning)?
-    else {
-        return Err(anyhow!("dispatch {dispatch_id} not found"));
-    };
-    let (tmux_session, tmux_window): (Option<String>, Option<String>) = match run_handle
-        .backend_kind
-    {
-        DispatchBackendKind::Tmux => {
-            let (session, window) = run_handle.backend_ref.split_once(':').ok_or_else(|| {
-                anyhow!("invalid tmux run handle ref '{}'", run_handle.backend_ref)
-            })?;
-            (Some(session.to_string()), Some(window.to_string()))
-        }
-        DispatchBackendKind::Local => (None, None),
-    };
-    let rows = tx.execute(
-        r"
-        UPDATE dispatches
-        SET status = ?2,
-            tmux_session = ?3,
-            tmux_window = ?4,
-            backend_kind = ?5,
-            backend_ref = ?6,
-            run_dir = ?7,
-            lock_path = ?8
-        WHERE id = ?1
-          AND status = ?9
-        ",
-        params![
-            dispatch_id,
-            plan.next_state.as_db_str(),
-            tmux_session.as_deref(),
-            tmux_window.as_deref(),
-            match run_handle.backend_kind {
-                DispatchBackendKind::Tmux => "tmux",
-                DispatchBackendKind::Local => "local",
-            },
-            run_handle.backend_ref.as_str(),
-            run_dir.to_string_lossy(),
-            lock_path.to_string_lossy(),
-            plan.current_status,
-        ],
-    )?;
-    if rows == 0 {
-        return Err(anyhow!(
-            "dispatch {} state changed concurrently before running transition",
-            dispatch_id
-        ));
-    }
-    append_dispatch_event_tx(
-        &tx,
-        dispatch_id,
-        DispatchEventKind::MarkRunning,
-        Some(&plan.current_status),
-        plan.next_state.as_db_str(),
-        Some("launch_ok"),
-        None,
-    )?;
-    tx.commit()?;
-    Ok(())
-}
-
-fn update_dispatch_failed_start(
-    db_path: &Path,
-    dispatch_id: i64,
-    reason_code: &str,
-    error_text: &str,
-) -> Result<()> {
-    let mut conn = open_db(db_path)?;
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let Some(plan) = plan_dispatch_transition(&tx, dispatch_id, DispatchEventKind::FailStart)?
-    else {
-        return Err(anyhow!("dispatch {dispatch_id} not found"));
-    };
-    let now = Utc::now().to_rfc3339();
-    let rows = tx.execute(
-        r"
-        UPDATE dispatches
-        SET status = ?2,
-            reason_code = ?3,
-            error_text = ?4,
-            ended_at = ?5
-        WHERE id = ?1
-          AND status = ?6
-        ",
-        params![
-            dispatch_id,
-            plan.next_state.as_db_str(),
-            reason_code,
-            error_text,
-            now,
-            plan.current_status,
-        ],
-    )?;
-    if rows == 0 {
-        return Err(anyhow!(
-            "dispatch {} state changed concurrently before failed_start transition",
-            dispatch_id
-        ));
-    }
-    append_dispatch_event_tx(
-        &tx,
-        dispatch_id,
-        DispatchEventKind::FailStart,
-        Some(&plan.current_status),
-        plan.next_state.as_db_str(),
-        Some(reason_code),
-        Some(error_text),
-    )?;
-    tx.commit()?;
-    Ok(())
-}
-
-fn latest_issue_inflight_dispatch(
-    db_path: &Path,
-    repo_full_name: &str,
-    issue_number: u64,
-) -> Result<Option<InflightDispatch>> {
-    let conn = open_db(db_path)?;
-    let starting_status = DispatchState::Starting.as_db_str();
-    let running_status = DispatchState::Running.as_db_str();
-    let dispatch = conn
-        .query_row(
-            r"
-            SELECT id, status, started_at, backend_kind, backend_ref, tmux_session, tmux_window, lock_path
-            FROM dispatches
-            WHERE repo_full_name = ?1
-              AND issue_number = ?2
-              AND status IN (?3, ?4)
-            ORDER BY id DESC
-            LIMIT 1
-            ",
-            params![
-                repo_full_name,
-                i64::try_from(issue_number)?,
-                starting_status,
-                running_status
-            ],
-            |row| {
-                Ok(InflightDispatch {
-                    id: row.get(0)?,
-                    status: row.get(1)?,
-                    started_at: row.get(2)?,
-                    backend_kind: row.get(3)?,
-                    backend_ref: row.get(4)?,
-                    tmux_session: row.get(5)?,
-                    tmux_window: row.get(6)?,
-                    lock_path: row.get(7)?,
-                })
-            },
-        )
-        .optional()?;
-    Ok(dispatch)
-}
-
-fn latest_repo_inflight_impl_dispatch_id(
-    db_path: &Path,
-    repo_full_name: &str,
-) -> Result<Option<i64>> {
-    let conn = open_db(db_path)?;
-    let starting_status = DispatchState::Starting.as_db_str();
-    let running_status = DispatchState::Running.as_db_str();
-    conn.query_row(
-        r"
-        SELECT id
-        FROM dispatches
-        WHERE repo_full_name = ?1
-          AND directive = 'impl'
-          AND status IN (?2, ?3)
-        ORDER BY id DESC
-        LIMIT 1
-        ",
-        params![repo_full_name, starting_status, running_status],
-        |row| row.get::<_, i64>(0),
-    )
-    .optional()
-    .map_err(Into::into)
-}
-
 fn probe_dispatch_liveness(
-    dispatch: &InflightDispatch,
+    dispatch: &db::InflightDispatch,
     repo_full_name: &str,
     issue_number: u64,
 ) -> Result<bool, DispatchError> {
@@ -2954,7 +2098,7 @@ fn probe_dispatch_liveness(
 }
 
 fn is_stale_starting_dispatch(
-    dispatch: &InflightDispatch,
+    dispatch: &db::InflightDispatch,
     repo_full_name: &str,
     issue_number: u64,
 ) -> bool {
@@ -2998,7 +2142,7 @@ fn is_stale_starting_dispatch(
 }
 
 fn should_heal_dispatch_stale(
-    dispatch: &InflightDispatch,
+    dispatch: &db::InflightDispatch,
     repo_full_name: &str,
     issue_number: u64,
 ) -> bool {
@@ -3031,71 +2175,21 @@ fn should_heal_dispatch_stale(
     }
 }
 
-fn mark_dispatch_failed_runtime(
-    db_path: &Path,
-    dispatch_id: i64,
-    reason_code: &str,
-    error_text: &str,
-) -> Result<()> {
-    let mut conn = open_db(db_path)?;
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let event_kind = if reason_code == "stale_dispatch_autohealed" {
-        DispatchEventKind::HealStale
-    } else {
-        DispatchEventKind::FailRuntime
-    };
-    let Some(plan) = plan_dispatch_transition(&tx, dispatch_id, event_kind)? else {
-        return Ok(());
-    };
-    let ended_at = Utc::now().to_rfc3339();
-    let rows = tx.execute(
-        r"
-        UPDATE dispatches
-        SET status = ?2,
-            reason_code = ?3,
-            error_text = ?4,
-            ended_at = ?5
-        WHERE id = ?1
-          AND status = ?6
-        ",
-        params![
-            dispatch_id,
-            plan.next_state.as_db_str(),
-            reason_code,
-            error_text,
-            ended_at,
-            plan.current_status,
-        ],
-    )?;
-    if rows > 0 {
-        append_dispatch_event_tx(
-            &tx,
-            dispatch_id,
-            event_kind,
-            Some(&plan.current_status),
-            plan.next_state.as_db_str(),
-            Some(reason_code),
-            Some(error_text),
-        )?;
-    }
-    tx.commit()?;
-    Ok(())
-}
-
 fn find_issue_inflight_dispatch_with_healing(
     db_path: &Path,
     repo_full_name: &str,
     issue_number: u64,
 ) -> Result<Option<i64>> {
     loop {
-        let Some(dispatch) = latest_issue_inflight_dispatch(db_path, repo_full_name, issue_number)?
+        let Some(dispatch) =
+            db::latest_issue_inflight_dispatch(db_path, repo_full_name, issue_number)?
         else {
             return Ok(None);
         };
         if !should_heal_dispatch_stale(&dispatch, repo_full_name, issue_number) {
             return Ok(Some(dispatch.id));
         }
-        mark_dispatch_failed_runtime(
+        db::mark_dispatch_failed_runtime(
             db_path,
             dispatch.id,
             "stale_dispatch_autohealed",
@@ -3117,31 +2211,6 @@ fn find_issue_inflight_dispatch_with_healing(
     }
 }
 
-fn latest_issue_codex_session_id(
-    db_path: &Path,
-    repo_full_name: &str,
-    issue_number: u64,
-) -> Result<Option<String>> {
-    let conn = open_db(db_path)?;
-    let session_id = conn
-        .query_row(
-            r"
-            SELECT codex_session_id
-            FROM dispatches
-            WHERE repo_full_name = ?1
-              AND issue_number = ?2
-              AND codex_session_id IS NOT NULL
-              AND codex_session_id != ''
-            ORDER BY id DESC
-            LIMIT 1
-            ",
-            params![repo_full_name, i64::try_from(issue_number)?],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
-    Ok(session_id)
-}
-
 async fn run_heartbeat_loop(state: AppState, interval_sec: u64) {
     let interval = StdDuration::from_secs(interval_sec.max(1));
     loop {
@@ -3155,91 +2224,6 @@ async fn run_heartbeat_loop(state: AppState, interval_sec: u64) {
         }
         tokio::time::sleep(interval).await;
     }
-}
-
-#[derive(Debug, Clone)]
-struct QueuedDecision {
-    decision_id: i64,
-    event_id: i64,
-    record: EventRecord,
-    decision: DecisionRecord,
-}
-
-fn queued_impl_decisions(db_path: &Path, limit: u32) -> Result<Vec<QueuedDecision>> {
-    let conn = open_db(db_path)?;
-    let mut stmt = conn.prepare(
-        r"
-        WITH latest AS (
-            SELECT repo_full_name, issue_number, target_role, MAX(id) AS decision_id
-            FROM decisions
-            WHERE decision = 'accepted'
-              AND would_dispatch = 1
-              AND directive = 'impl'
-              AND issue_number IS NOT NULL
-              AND target_role IS NOT NULL
-            GROUP BY repo_full_name, issue_number, target_role
-        )
-        SELECT
-            d.id,
-            d.event_id,
-            e.delivery_id,
-            e.event_type,
-            e.repo_full_name,
-            e.issue_number,
-            e.action,
-            e.actor_login,
-            e.event_text,
-            e.source_comment_id,
-            e.source_created_at,
-            e.raw_json,
-            d.decision,
-            d.reason_code,
-            d.directive,
-            d.target_role,
-            d.would_dispatch
-        FROM latest l
-        JOIN decisions d ON d.id = l.decision_id
-        JOIN events e ON e.id = d.event_id
-        WHERE NOT EXISTS (SELECT 1 FROM dispatches x WHERE x.decision_id = d.id)
-        ORDER BY d.id ASC
-        LIMIT ?1
-        ",
-    )?;
-    let rows = stmt
-        .query_map(params![i64::from(limit)], |row| {
-            let decision_id: i64 = row.get(0)?;
-            let event_id: i64 = row.get(1)?;
-            let record = EventRecord {
-                delivery_id: row.get(2)?,
-                event_type: row.get(3)?,
-                repo_full_name: row.get(4)?,
-                issue_number: row
-                    .get::<_, Option<i64>>(5)?
-                    .and_then(|n| u64::try_from(n).ok()),
-                action: row.get(6)?,
-                actor_login: row.get(7)?,
-                event_text: row.get(8)?,
-                source_comment_id: row.get(9)?,
-                source_created_at: row.get(10)?,
-                raw_json: row.get(11)?,
-            };
-            let would_dispatch_int: i64 = row.get(16)?;
-            let decision = DecisionRecord {
-                decision: row.get(12)?,
-                reason_code: row.get(13)?,
-                directive: row.get(14)?,
-                target_role: row.get(15)?,
-                would_dispatch: would_dispatch_int != 0,
-            };
-            Ok(QueuedDecision {
-                decision_id,
-                event_id,
-                record,
-                decision,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
 }
 
 async fn run_dispatch_queue_loop(state: AppState, interval_sec: u64) {
@@ -3261,11 +2245,11 @@ async fn dispatch_queue_once(state: &AppState) -> Result<()> {
     if matches!(state.dispatch_mode, DispatchMode::DryRun) {
         return Ok(());
     }
-    let items = queued_impl_decisions(&state.db_path, 10)?;
+    let items = db::queued_impl_decisions(&state.db_path, 10)?;
     for item in items {
         let repo_full_name = item.record.repo_full_name.clone();
         if let Ok(Some(inflight)) =
-            latest_repo_inflight_impl_dispatch_id(&state.db_path, &repo_full_name)
+            db::latest_repo_inflight_impl_dispatch_id(&state.db_path, &repo_full_name)
         {
             log_line(
                 "dispatch_queue_repo_busy",
@@ -3302,7 +2286,7 @@ async fn dispatch_queue_once(state: &AppState) -> Result<()> {
                 )
                 .await;
                 if let Some(role_name) = item.decision.target_role.as_deref() {
-                    let _ = upsert_issue_role_cursor_event_id(
+                    let _ = db::upsert_issue_role_cursor_event_id(
                         &state.db_path,
                         &item.record.repo_full_name,
                         issue_number,
@@ -3330,7 +2314,7 @@ async fn dispatch_queue_once(state: &AppState) -> Result<()> {
 }
 
 fn heartbeat_once(state: &AppState) -> Result<()> {
-    let conn = open_db(&state.db_path)?;
+    let conn = db::open_db(&state.db_path)?;
     let queue_depth: i64 = conn.query_row(
         "SELECT COUNT(*) FROM decisions WHERE decision = 'accepted' AND would_dispatch = 1 AND comment_posted = 0",
         [],
@@ -3406,7 +2390,7 @@ async fn reconcile_once(state: &AppState) -> Result<()> {
     .await
     .context("reconcile join failure")??;
 
-    let conn = open_db(&state.db_path)?;
+    let conn = db::open_db(&state.db_path)?;
     let now = Utc::now().to_rfc3339();
     conn.execute(
         r"
@@ -3441,8 +2425,8 @@ mod tests {
         status: &str,
         started_at: String,
         tmux_session: Option<&str>,
-    ) -> InflightDispatch {
-        InflightDispatch {
+    ) -> db::InflightDispatch {
+        db::InflightDispatch {
             id: 1,
             status: status.to_string(),
             started_at,
@@ -3491,20 +2475,30 @@ mod tests {
         ))
     }
 
-    fn sample_dispatch(decision_id: i64, issue_number: u64) -> DispatchInsert {
-        DispatchInsert {
-            decision_id,
-            repo_full_name: "main/orchd-debug".to_string(),
-            issue_number,
-            actor_login: Some("main".to_string()),
-            directive: "poke".to_string(),
-            target_role: "codex-orch".to_string(),
-            started_at: Utc::now().to_rfc3339(),
-        }
+    fn reserve_sample_dispatch(
+        db_path: &Path,
+        decision_id: i64,
+        issue_number: u64,
+        directive: &str,
+    ) -> db::DispatchReservation {
+        let started_at = Utc::now().to_rfc3339();
+        db::reserve_dispatch_starting(
+            db_path,
+            db::DispatchInsert {
+                decision_id,
+                repo_full_name: "main/orchd-debug",
+                issue_number,
+                actor_login: Some("main"),
+                directive,
+                target_role: "codex-orch",
+                started_at: &started_at,
+            },
+        )
+        .expect("reserve dispatch")
     }
 
     fn seed_decision_id(db_path: &Path) -> i64 {
-        let conn = open_db(db_path).expect("open db");
+        let conn = db::open_db(db_path).expect("open db");
         let now = Utc::now().to_rfc3339();
         conn.execute(
             r"
@@ -3548,7 +2542,7 @@ mod tests {
     }
 
     fn dispatch_event_kinds(db_path: &Path, dispatch_id: i64) -> Vec<String> {
-        let conn = open_db(db_path).expect("open db for event scan");
+        let conn = db::open_db(db_path).expect("open db for event scan");
         let mut stmt = conn
             .prepare(
                 "SELECT event_kind FROM dispatch_events WHERE dispatch_id = ?1 ORDER BY id ASC",
@@ -3563,15 +2557,15 @@ mod tests {
     #[test]
     fn reserve_dispatch_blocks_second_inflight_for_issue() {
         let db_path = temp_db_path("dispatch-reserve");
-        init_db(&db_path).expect("db init");
+        db::init_db(&db_path).expect("db init");
         let first_decision_id = seed_decision_id(&db_path);
         let second_decision_id = seed_decision_id(&db_path);
 
-        let first = reserve_dispatch_starting(&db_path, &sample_dispatch(first_decision_id, 7))
-            .expect("first");
+        let first = reserve_sample_dispatch(&db_path, first_decision_id, 7, "poke");
         let first_id = match first {
-            DispatchReservation::Started(id) => id,
-            DispatchReservation::InFlightIssue(_) | DispatchReservation::InFlightRepo(_) => {
+            db::DispatchReservation::Started(id) => id,
+            db::DispatchReservation::InFlightIssue(_)
+            | db::DispatchReservation::InFlightRepo(_) => {
                 panic!("expected first reservation to start")
             }
         };
@@ -3580,12 +2574,13 @@ mod tests {
             vec!["mark_starting".to_string()]
         );
 
-        let second = reserve_dispatch_starting(&db_path, &sample_dispatch(second_decision_id, 7))
-            .expect("second");
+        let second = reserve_sample_dispatch(&db_path, second_decision_id, 7, "poke");
         match second {
-            DispatchReservation::InFlightIssue(id) => assert_eq!(id, first_id),
-            DispatchReservation::Started(_) => panic!("expected second reservation to be blocked"),
-            DispatchReservation::InFlightRepo(_) => {
+            db::DispatchReservation::InFlightIssue(id) => assert_eq!(id, first_id),
+            db::DispatchReservation::Started(_) => {
+                panic!("expected second reservation to be blocked")
+            }
+            db::DispatchReservation::InFlightRepo(_) => {
                 panic!("expected issue-level inflight, not repo-level inflight")
             }
         }
@@ -3596,28 +2591,26 @@ mod tests {
     #[test]
     fn reserve_dispatch_blocks_second_inflight_impl_for_repo() {
         let db_path = temp_db_path("dispatch-reserve-repo");
-        init_db(&db_path).expect("db init");
+        db::init_db(&db_path).expect("db init");
         let first_decision_id = seed_decision_id(&db_path);
         let second_decision_id = seed_decision_id(&db_path);
 
-        let mut first_insert = sample_dispatch(first_decision_id, 7);
-        first_insert.directive = "impl".to_string();
-        let mut second_insert = sample_dispatch(second_decision_id, 8);
-        second_insert.directive = "impl".to_string();
-
-        let first = reserve_dispatch_starting(&db_path, &first_insert).expect("first");
+        let first = reserve_sample_dispatch(&db_path, first_decision_id, 7, "impl");
         let first_id = match first {
-            DispatchReservation::Started(id) => id,
-            DispatchReservation::InFlightIssue(_) | DispatchReservation::InFlightRepo(_) => {
+            db::DispatchReservation::Started(id) => id,
+            db::DispatchReservation::InFlightIssue(_)
+            | db::DispatchReservation::InFlightRepo(_) => {
                 panic!("expected first reservation to start")
             }
         };
 
-        let second = reserve_dispatch_starting(&db_path, &second_insert).expect("second");
+        let second = reserve_sample_dispatch(&db_path, second_decision_id, 8, "impl");
         match second {
-            DispatchReservation::InFlightRepo(id) => assert_eq!(id, first_id),
-            DispatchReservation::Started(_) => panic!("expected repo-level inflight block"),
-            DispatchReservation::InFlightIssue(_) => {
+            db::DispatchReservation::InFlightRepo(id) => assert_eq!(id, first_id),
+            db::DispatchReservation::Started(_) => {
+                panic!("expected repo-level inflight block")
+            }
+            db::DispatchReservation::InFlightIssue(_) => {
                 panic!("expected repo-level inflight, not issue-level inflight")
             }
         }
@@ -3628,17 +2621,16 @@ mod tests {
     #[test]
     fn stale_autoheal_records_heal_event() {
         let db_path = temp_db_path("dispatch-autoheal");
-        init_db(&db_path).expect("db init");
+        db::init_db(&db_path).expect("db init");
         let decision_id = seed_decision_id(&db_path);
-        let started_id = match reserve_dispatch_starting(&db_path, &sample_dispatch(decision_id, 9))
-            .expect("reserve")
-        {
-            DispatchReservation::Started(id) => id,
-            DispatchReservation::InFlightIssue(_) | DispatchReservation::InFlightRepo(_) => {
+        let started_id = match reserve_sample_dispatch(&db_path, decision_id, 9, "poke") {
+            db::DispatchReservation::Started(id) => id,
+            db::DispatchReservation::InFlightIssue(_)
+            | db::DispatchReservation::InFlightRepo(_) => {
                 panic!("expected started dispatch")
             }
         };
-        mark_dispatch_failed_runtime(
+        db::mark_dispatch_failed_runtime(
             &db_path,
             started_id,
             "stale_dispatch_autohealed",
@@ -3652,7 +2644,7 @@ mod tests {
             vec!["mark_starting".to_string(), "heal_stale".to_string()]
         );
 
-        let conn = open_db(&db_path).expect("open db");
+        let conn = db::open_db(&db_path).expect("open db");
         let status: String = conn
             .query_row(
                 "SELECT status FROM dispatches WHERE id = ?1",
