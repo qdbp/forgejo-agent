@@ -11,6 +11,9 @@ if [[ ! -f "$SERVICE_SRC" ]]; then
   exit 1
 fi
 
+echo "building + installing orchd + forgejoctl..."
+"$ROOT_DIR/scripts/install.sh"
+
 mkdir -p "$SERVICE_DIR"
 install -m 0644 "$SERVICE_SRC" "$SERVICE_DST"
 
