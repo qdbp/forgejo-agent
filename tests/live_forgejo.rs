@@ -21,6 +21,15 @@ const FORGEJO_BIN_ENV: &str = "FORGEJO_BIN";
 
 static TIMINGS_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+struct ChildGuard(Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 fn live_tests_enabled() -> bool {
     match std::env::var(LIVE_TESTS_ENV) {
         Ok(value) => matches!(
@@ -445,6 +454,57 @@ fn forgejo_agent_bin() -> Result<PathBuf> {
 
     bail!(
         "failed to locate forgejo-agent binary; checked env vars {CANDIDATE_ENV:?} and {}",
+        path.display()
+    );
+}
+
+fn orchd_bin() -> Result<PathBuf> {
+    const CANDIDATE_ENV: [&str; 1] = ["CARGO_BIN_EXE_orchd"];
+    for key in CANDIDATE_ENV {
+        if let Ok(value) = std::env::var(key) {
+            return Ok(PathBuf::from(value));
+        }
+    }
+
+    let mut path = std::env::current_exe().context("failed to inspect current test executable")?;
+    path.pop();
+    if path.ends_with("deps") {
+        path.pop();
+    }
+    path.push(format!("orchd{}", std::env::consts::EXE_SUFFIX));
+    if path.is_file() {
+        return Ok(path);
+    }
+
+    bail!(
+        "failed to locate orchd binary; checked env vars {CANDIDATE_ENV:?} and {}",
+        path.display()
+    );
+}
+
+fn fake_codex_bin() -> Result<PathBuf> {
+    const CANDIDATE_ENV: [&str; 2] = ["CARGO_BIN_EXE_fake-codex", "CARGO_BIN_EXE_fake_codex"];
+    for key in CANDIDATE_ENV {
+        if let Ok(value) = std::env::var(key) {
+            let path = PathBuf::from(value);
+            if path.is_file() {
+                return Ok(path);
+            }
+        }
+    }
+
+    let mut path = std::env::current_exe().context("failed to inspect current test executable")?;
+    path.pop();
+    if path.ends_with("deps") {
+        path.pop();
+    }
+    path.push(format!("fake-codex{}", std::env::consts::EXE_SUFFIX));
+    if path.is_file() {
+        return Ok(path);
+    }
+
+    bail!(
+        "failed to locate fake-codex binary; checked env vars {CANDIDATE_ENV:?} and {}",
         path.display()
     );
 }
@@ -908,6 +968,172 @@ fn live_issue_blocker_and_orchd_state_round_trip() -> Result<()> {
     }
     if issue_label_prefix_count(&parent_running, "orchd/state/")? != 1 {
         bail!("expected exactly one orchd/state/* label after running transition");
+    }
+
+    Ok(())
+}
+
+#[test]
+#[serial(live_forgejo)]
+fn live_orchd_local_backend_smoke() -> Result<()> {
+    if !live_tests_enabled() {
+        eprintln!(
+            "skipping live orchd integration test; enable with {}=1",
+            LIVE_TESTS_ENV
+        );
+        return Ok(());
+    }
+
+    let harness = LiveHarness::bootstrap("live_orchd_local_backend_smoke")?;
+
+    let issue_number = harness.create_issue("orchd smoke", "issue body", "ready")?;
+
+    let dispatch_cfg_path = harness.fixture.work_path.join("orchd-dispatch.toml");
+    let db_path = harness.fixture.work_path.join("orchd.sqlite");
+    let orchd_stdout = harness.fixture.work_path.join("orchd-stdout.log");
+    let orchd_stderr = harness.fixture.work_path.join("orchd-stderr.log");
+
+    let fake_codex = fake_codex_bin().or_else(|_| {
+        let status = Command::new("cargo")
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .args(["build", "--quiet", "--bin", "fake-codex"])
+            .status()
+            .context("failed to build fake-codex")?;
+        if !status.success() {
+            bail!("failed building fake-codex");
+        }
+        fake_codex_bin()
+    })?;
+    let forgejoctl = forgejo_agent_bin()?;
+
+    let prompts_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("prompts");
+    let dispatch_toml = format!(
+        r#"
+version = 1
+allowed_actors = ["{actor}"]
+
+[tmux]
+session = "itest"
+remain_on_exit = false
+
+[prompt_envelopes]
+fresh_envelope_file = "{fresh_env}"
+followup_envelope_file = "{follow_env}"
+
+[roles.codex-orch]
+codex_bin = "{codex_bin}"
+codex_role_arg = "orch"
+token_file = "{token_file}"
+workdir = "{workdir}"
+
+[directives.poke]
+role = "codex-orch"
+prompt_file = "{poke_prompt}"
+timeout_sec = 10
+
+forgejoctl_bin = "{forgejoctl}"
+"#,
+        actor = harness.fixture.owner.as_str(),
+        fresh_env = prompts_dir.join("orchd-envelope-fresh.md").display(),
+        follow_env = prompts_dir.join("orchd-envelope-followup.md").display(),
+        poke_prompt = prompts_dir.join("orchd-poke.md").display(),
+        codex_bin = fake_codex.display(),
+        token_file = harness.token_path.display(),
+        workdir = env!("CARGO_MANIFEST_DIR"),
+        forgejoctl = forgejoctl.display(),
+    );
+    fs::write(&dispatch_cfg_path, dispatch_toml)
+        .with_context(|| format!("failed writing {}", dispatch_cfg_path.display()))?;
+
+    let port = pick_unused_port().ok_or_else(|| anyhow!("failed to pick unused port"))?;
+    let base_url = format!("http://127.0.0.1:{port}");
+    let listen = format!("127.0.0.1:{port}");
+
+    let stdout = fs::File::create(&orchd_stdout)
+        .with_context(|| format!("failed creating {}", orchd_stdout.display()))?;
+    let stderr = fs::File::create(&orchd_stderr)
+        .with_context(|| format!("failed creating {}", orchd_stderr.display()))?;
+
+    let orchd = Command::new(orchd_bin()?)
+        .arg("--listen")
+        .arg(&listen)
+        .arg("--db-path")
+        .arg(&db_path)
+        .arg("--reconcile-repo")
+        .arg(&harness.repo_ref)
+        .arg("--dispatch-mode")
+        .arg("tmux-exec")
+        .arg("--dispatch-backend")
+        .arg("local")
+        .arg("--dispatch-config")
+        .arg(&dispatch_cfg_path)
+        .arg("--config")
+        .arg(&harness.config_path)
+        .arg("--token-file")
+        .arg(&harness.token_path)
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .context("failed spawning orchd")?;
+    let mut _orchd_guard = ChildGuard(orchd);
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .context("failed to build orchd HTTP client")?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if Instant::now() > deadline {
+            let stdout = fs::read_to_string(&orchd_stdout).unwrap_or_default();
+            let stderr = fs::read_to_string(&orchd_stderr).unwrap_or_default();
+            bail!("orchd did not become ready\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        }
+        if let Ok(resp) = client.get(format!("{base_url}/healthz")).send()
+            && resp.status() == StatusCode::OK
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(150));
+    }
+
+    let delivery_id = format!("itest-webhook-{}", unique_suffix()?);
+    let webhook_body = serde_json::json!({
+        "action": "created",
+        "repository": { "full_name": harness.repo_ref.as_str() },
+        "issue": { "number": issue_number },
+        "comment": { "body": "@codex-orch poke", "user": { "login": harness.fixture.owner.as_str() } },
+        "sender": { "login": harness.fixture.owner.as_str() },
+    });
+
+    let webhook_resp = client
+        .post(format!("{base_url}/webhook"))
+        .header("Content-Type", "application/json")
+        .header("X-Forgejo-Event", "issue_comment")
+        .header("X-Forgejo-Delivery", delivery_id)
+        .body(webhook_body.to_string())
+        .send()
+        .context("failed POSTing webhook to orchd")?;
+    let webhook_status = webhook_resp.status();
+    if webhook_status != StatusCode::ACCEPTED && webhook_status != StatusCode::OK {
+        let body = webhook_resp.text().unwrap_or_default();
+        bail!("orchd webhook returned {} body={body}", webhook_status);
+    }
+
+    let issue_ref = harness.issue_ref(issue_number);
+    let poll_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let issue = harness.get_issue(issue_number)?;
+        if issue_has_label(&issue, "orchd/state/completed")? {
+            break;
+        }
+        if Instant::now() > poll_deadline {
+            bail!(
+                "orchd dispatch did not complete; issue={} labels={:?}",
+                issue_ref,
+                issue_label_names(&issue)?
+            );
+        }
+        thread::sleep(Duration::from_millis(250));
     }
 
     Ok(())
