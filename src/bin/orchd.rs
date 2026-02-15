@@ -30,7 +30,7 @@ use axum::{Json, Router};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use clap::{Parser, ValueEnum};
 use hmac::{Hmac, Mac};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -2225,6 +2225,19 @@ fn init_db(db_path: &Path) -> Result<()> {
             ON dispatches (repo_full_name, status);
         CREATE INDEX IF NOT EXISTS idx_dispatches_repo_issue
             ON dispatches (repo_full_name, issue_number, id DESC);
+        CREATE TABLE IF NOT EXISTS dispatch_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            dispatch_id INTEGER NOT NULL,
+            event_kind TEXT NOT NULL,
+            from_state TEXT,
+            to_state TEXT NOT NULL,
+            reason_code TEXT,
+            error_text TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(dispatch_id) REFERENCES dispatches(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_dispatch_events_dispatch
+            ON dispatch_events (dispatch_id, id);
         CREATE TABLE IF NOT EXISTS issue_role_cursors (
             repo_full_name TEXT NOT NULL,
             issue_number INTEGER NOT NULL,
@@ -2480,6 +2493,35 @@ struct DispatchTransitionPlan {
     next_state: DispatchState,
 }
 
+fn append_dispatch_event_tx(
+    tx: &Transaction<'_>,
+    dispatch_id: i64,
+    event_kind: DispatchEventKind,
+    from_state: Option<&str>,
+    to_state: &str,
+    reason_code: Option<&str>,
+    error_text: Option<&str>,
+) -> Result<()> {
+    tx.execute(
+        r"
+        INSERT INTO dispatch_events
+            (dispatch_id, event_kind, from_state, to_state, reason_code, error_text, created_at)
+        VALUES
+            (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        ",
+        params![
+            dispatch_id,
+            event_kind.as_db_str(),
+            from_state,
+            to_state,
+            reason_code,
+            error_text,
+            Utc::now().to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
 fn plan_dispatch_transition(
     conn: &Connection,
     dispatch_id: i64,
@@ -2563,6 +2605,15 @@ fn reserve_dispatch_starting(
         ],
     )?;
     let dispatch_id = tx.last_insert_rowid();
+    append_dispatch_event_tx(
+        &tx,
+        dispatch_id,
+        DispatchEventKind::MarkStarting,
+        None,
+        DispatchState::Starting.as_db_str(),
+        Some("reserved_dispatch"),
+        None,
+    )?;
     tx.commit()?;
     Ok(DispatchReservation::Started(dispatch_id))
 }
@@ -2574,8 +2625,9 @@ fn update_dispatch_running(
     run_dir: &Path,
     lock_path: &Path,
 ) -> Result<()> {
-    let conn = open_db(db_path)?;
-    let Some(plan) = plan_dispatch_transition(&conn, dispatch_id, DispatchEventKind::MarkRunning)?
+    let mut conn = open_db(db_path)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let Some(plan) = plan_dispatch_transition(&tx, dispatch_id, DispatchEventKind::MarkRunning)?
     else {
         return Err(anyhow!("dispatch {dispatch_id} not found"));
     };
@@ -2590,7 +2642,7 @@ fn update_dispatch_running(
     let (tmux_session, tmux_window) = tmux_ref
         .split_once(':')
         .ok_or_else(|| anyhow!("invalid tmux run handle ref '{}'", run_handle.backend_ref))?;
-    let rows = conn.execute(
+    let rows = tx.execute(
         r"
         UPDATE dispatches
         SET status = ?2,
@@ -2617,6 +2669,16 @@ fn update_dispatch_running(
             dispatch_id
         ));
     }
+    append_dispatch_event_tx(
+        &tx,
+        dispatch_id,
+        DispatchEventKind::MarkRunning,
+        Some(&plan.current_status),
+        plan.next_state.as_db_str(),
+        Some("launch_ok"),
+        None,
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -2626,13 +2688,14 @@ fn update_dispatch_failed_start(
     reason_code: &str,
     error_text: &str,
 ) -> Result<()> {
-    let conn = open_db(db_path)?;
-    let Some(plan) = plan_dispatch_transition(&conn, dispatch_id, DispatchEventKind::FailStart)?
+    let mut conn = open_db(db_path)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let Some(plan) = plan_dispatch_transition(&tx, dispatch_id, DispatchEventKind::FailStart)?
     else {
         return Err(anyhow!("dispatch {dispatch_id} not found"));
     };
     let now = Utc::now().to_rfc3339();
-    let rows = conn.execute(
+    let rows = tx.execute(
         r"
         UPDATE dispatches
         SET status = ?2,
@@ -2657,6 +2720,16 @@ fn update_dispatch_failed_start(
             dispatch_id
         ));
     }
+    append_dispatch_event_tx(
+        &tx,
+        dispatch_id,
+        DispatchEventKind::FailStart,
+        Some(&plan.current_status),
+        plan.next_state.as_db_str(),
+        Some(reason_code),
+        Some(error_text),
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -2783,13 +2856,18 @@ fn mark_dispatch_failed_runtime(
     reason_code: &str,
     error_text: &str,
 ) -> Result<()> {
-    let conn = open_db(db_path)?;
-    let Some(plan) = plan_dispatch_transition(&conn, dispatch_id, DispatchEventKind::FailRuntime)?
-    else {
+    let mut conn = open_db(db_path)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let event_kind = if reason_code == "stale_dispatch_autohealed" {
+        DispatchEventKind::HealStale
+    } else {
+        DispatchEventKind::FailRuntime
+    };
+    let Some(plan) = plan_dispatch_transition(&tx, dispatch_id, event_kind)? else {
         return Ok(());
     };
     let ended_at = Utc::now().to_rfc3339();
-    let _ = conn.execute(
+    let rows = tx.execute(
         r"
         UPDATE dispatches
         SET status = ?2,
@@ -2808,6 +2886,18 @@ fn mark_dispatch_failed_runtime(
             plan.current_status,
         ],
     )?;
+    if rows > 0 {
+        append_dispatch_event_tx(
+            &tx,
+            dispatch_id,
+            event_kind,
+            Some(&plan.current_status),
+            plan.next_state.as_db_str(),
+            Some(reason_code),
+            Some(error_text),
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -3099,6 +3189,19 @@ mod tests {
         conn.last_insert_rowid()
     }
 
+    fn dispatch_event_kinds(db_path: &Path, dispatch_id: i64) -> Vec<String> {
+        let conn = open_db(db_path).expect("open db for event scan");
+        let mut stmt = conn
+            .prepare(
+                "SELECT event_kind FROM dispatch_events WHERE dispatch_id = ?1 ORDER BY id ASC",
+            )
+            .expect("prepare event query");
+        stmt.query_map(params![dispatch_id], |row| row.get::<_, String>(0))
+            .expect("query event rows")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect event rows")
+    }
+
     #[test]
     fn reserve_dispatch_blocks_second_inflight_for_issue() {
         let db_path = temp_db_path("dispatch-reserve");
@@ -3112,6 +3215,10 @@ mod tests {
             DispatchReservation::Started(id) => id,
             DispatchReservation::InFlight(_) => panic!("expected first reservation to start"),
         };
+        assert_eq!(
+            dispatch_event_kinds(&db_path, first_id),
+            vec!["mark_starting".to_string()]
+        );
 
         let second = reserve_dispatch_starting(&db_path, &sample_dispatch(second_decision_id, 7))
             .expect("second");
@@ -3119,6 +3226,44 @@ mod tests {
             DispatchReservation::InFlight(id) => assert_eq!(id, first_id),
             DispatchReservation::Started(_) => panic!("expected second reservation to be blocked"),
         }
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn stale_autoheal_records_heal_event() {
+        let db_path = temp_db_path("dispatch-autoheal");
+        init_db(&db_path).expect("db init");
+        let decision_id = seed_decision_id(&db_path);
+        let started_id = match reserve_dispatch_starting(&db_path, &sample_dispatch(decision_id, 9))
+            .expect("reserve")
+        {
+            DispatchReservation::Started(id) => id,
+            DispatchReservation::InFlight(_) => panic!("expected started dispatch"),
+        };
+        mark_dispatch_failed_runtime(
+            &db_path,
+            started_id,
+            "stale_dispatch_autohealed",
+            "stale dispatch test",
+        )
+        .expect("autoheal should succeed");
+
+        let kinds = dispatch_event_kinds(&db_path, started_id);
+        assert_eq!(
+            kinds,
+            vec!["mark_starting".to_string(), "heal_stale".to_string()]
+        );
+
+        let conn = open_db(&db_path).expect("open db");
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM dispatches WHERE id = ?1",
+                params![started_id],
+                |row| row.get(0),
+            )
+            .expect("fetch status");
+        assert_eq!(status, DispatchState::FailedRuntime.as_db_str());
 
         let _ = fs::remove_file(db_path);
     }

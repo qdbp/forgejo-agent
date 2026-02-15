@@ -147,6 +147,25 @@ pub enum DispatchEventKind {
     HealStale,
 }
 
+impl DispatchEventKind {
+    #[must_use]
+    pub const fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Reserve => "reserve",
+            Self::BeginLaunch => "begin_launch",
+            Self::MarkStarting => "mark_starting",
+            Self::MarkRunning => "mark_running",
+            Self::Complete => "complete",
+            Self::FailStart => "fail_start",
+            Self::FailRuntime => "fail_runtime",
+            Self::Block => "block",
+            Self::Timeout => "timeout",
+            Self::Cancel => "cancel",
+            Self::HealStale => "heal_stale",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DispatchEvent {
     pub dispatch_id: i64,

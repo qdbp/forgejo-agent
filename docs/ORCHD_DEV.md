@@ -91,6 +91,13 @@ sqlite3 ~/.local/state/orchd-dev/orchd.sqlite \
   "SELECT id,repo_full_name,issue_number,actor_login,directive,target_role,status,reason_code,tmux_session,tmux_window,codex_session_id,exit_code,started_at,ended_at FROM dispatches ORDER BY id DESC LIMIT 20;"
 ```
 
+Inspect dispatch transition events:
+
+```bash
+sqlite3 ~/.local/state/orchd-dev/orchd.sqlite \
+  "SELECT id,dispatch_id,event_kind,from_state,to_state,reason_code,created_at FROM dispatch_events ORDER BY id DESC LIMIT 50;"
+```
+
 Inspect role cursors used for follow-up deltas:
 
 ```bash
