@@ -16,7 +16,6 @@ pub(super) struct AppState {
     pub(super) cfg: AgentConfig,
     pub(super) forgejo_config_file: Option<PathBuf>,
     pub(super) reconcile_repo: RepoRef,
-    pub(super) comment_echo: bool,
     pub(super) dispatch_mode: DispatchMode,
     pub(super) dispatch_backend: DispatchBackend,
     pub(super) dispatch_config: Option<DispatchConfig>,
@@ -41,6 +40,10 @@ pub(super) struct WebhookIssue {
     pub(super) number: u64,
     #[serde(default)]
     pub(super) body: Option<String>,
+    #[serde(default)]
+    pub(super) assignee: Option<WebhookUser>,
+    #[serde(default)]
+    pub(super) assignees: Option<Vec<WebhookUser>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -81,6 +84,7 @@ pub(super) struct EventContext {
     pub(super) text: Option<String>,
     pub(super) source_comment_id: Option<u64>,
     pub(super) source_created_at: Option<String>,
+    pub(super) assignees: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

@@ -264,33 +264,6 @@ pub(super) fn finalize_dispatch_command(args: FinalizeDispatchArgs) -> Result<()
             "ok",
         );
     }
-
-    let phase_comment_start = Instant::now();
-    if let Err(err) = forgejoctl_cmd::run_forgejoctl(
-        &args.forgejoctl_bin,
-        args.forgejo_config.as_deref(),
-        &args.token_file,
-        &[
-            "issue",
-            "comment",
-            &args.issue_ref.to_string(),
-            "--body-file",
-            &args.completion_file.to_string_lossy(),
-        ],
-    ) {
-        eprintln!("finalize-dispatch: issue comment post failed: {err}");
-        record_phase_latency_ms(
-            "finalize_comment",
-            phase_comment_start.elapsed().as_secs_f64() * 1000.0,
-            "error",
-        );
-    } else {
-        record_phase_latency_ms(
-            "finalize_comment",
-            phase_comment_start.elapsed().as_secs_f64() * 1000.0,
-            "ok",
-        );
-    }
     info!("finalize dispatch completed");
     Ok(())
 }

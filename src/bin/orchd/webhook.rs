@@ -5,7 +5,8 @@ use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
 use super::lexicon::{
-    DECISION_ACCEPTED, DECISION_IGNORED, EVENT_ISSUE_COMMENT, EVENT_ISSUES, directive_is_known,
+    DECISION_ACCEPTED, DECISION_IGNORED, DIRECTIVE_REPLY, EVENT_ISSUE_COMMENT, EVENT_ISSUES,
+    directive_is_known,
 };
 use super::paths::expand_tilde_path;
 use super::state::{DecisionRecord, EventContext, ParsedDirective, WebhookPayload};
@@ -75,6 +76,23 @@ pub(super) fn extract_event_context(
                 .and_then(|comment| comment.user.as_ref().map(|user| user.login.clone()))
         });
 
+    let assignees = payload
+        .issue
+        .as_ref()
+        .map(|issue| {
+            if let Some(assignees) = issue.assignees.as_ref() {
+                assignees
+                    .iter()
+                    .map(|user| user.login.to_ascii_lowercase())
+                    .collect::<Vec<_>>()
+            } else if let Some(assignee) = issue.assignee.as_ref() {
+                vec![assignee.login.to_ascii_lowercase()]
+            } else {
+                Vec::new()
+            }
+        })
+        .unwrap_or_default();
+
     let text = match event_type {
         EVENT_ISSUE_COMMENT => payload.comment.as_ref().map(|comment| comment.body.clone()),
         EVENT_ISSUES => payload.issue.as_ref().and_then(|issue| issue.body.clone()),
@@ -93,6 +111,7 @@ pub(super) fn extract_event_context(
         text,
         source_comment_id,
         source_created_at,
+        assignees,
     })
 }
 
@@ -110,18 +129,6 @@ pub(super) fn decide(
             would_dispatch: false,
         };
     };
-
-    if event_type == EVENT_ISSUE_COMMENT
-        && context.text.as_deref().is_some_and(is_orchd_echo_comment)
-    {
-        return DecisionRecord {
-            decision: DECISION_IGNORED.to_string(),
-            reason_code: "orchd_echo_comment".to_string(),
-            directive: None,
-            target_role: None,
-            would_dispatch: false,
-        };
-    }
 
     if !action_is_actionable(event_type, action) {
         return DecisionRecord {
@@ -143,6 +150,24 @@ pub(super) fn decide(
             target_role: Some(parsed.role),
             would_dispatch: true,
         };
+    }
+
+    if event_type == EVENT_ISSUE_COMMENT && context.assignees.len() == 1 {
+        let assignee = context.assignees[0].as_str();
+        let actor = context
+            .actor_login
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !actor.is_empty() && actor != assignee && assignee.starts_with("codex-") {
+            return DecisionRecord {
+                decision: DECISION_ACCEPTED.to_string(),
+                reason_code: "assignee_reply".to_string(),
+                directive: Some(DIRECTIVE_REPLY.to_string()),
+                target_role: Some(assignee.to_string()),
+                would_dispatch: true,
+            };
+        }
     }
 
     DecisionRecord {
@@ -197,10 +222,6 @@ fn parse_directive_line(line: &str) -> Option<ParsedDirective> {
     Some(ParsedDirective { role, directive })
 }
 
-pub(super) fn is_orchd_echo_comment(text: &str) -> bool {
-    text.trim_start().starts_with("orchd:")
-}
-
 pub(super) fn extract_header(headers: &HeaderMap, names: &[&str]) -> Option<String> {
     names.iter().find_map(|name| {
         headers
@@ -213,8 +234,8 @@ pub(super) fn extract_header(headers: &HeaderMap, names: &[&str]) -> Option<Stri
 #[cfg(test)]
 mod tests {
     use crate::orchd::lexicon::{
-        DECISION_ACCEPTED, DECISION_IGNORED, DIRECTIVE_DESIGN, DIRECTIVE_POKE, EVENT_ISSUE_COMMENT,
-        EVENT_ISSUES,
+        DECISION_ACCEPTED, DECISION_IGNORED, DIRECTIVE_DESIGN, DIRECTIVE_POKE, DIRECTIVE_REPLY,
+        EVENT_ISSUE_COMMENT, EVENT_ISSUES,
     };
     use crate::orchd::state::EventContext;
 
@@ -229,6 +250,7 @@ mod tests {
             text: Some("just checking in".to_string()),
             source_comment_id: None,
             source_created_at: None,
+            assignees: Vec::new(),
         };
         let decision = decide(EVENT_ISSUE_COMMENT, Some("created"), Some(&context));
         assert_eq!(decision.decision, DECISION_IGNORED);
@@ -245,11 +267,31 @@ mod tests {
             text: Some("@codex-orch poke".to_string()),
             source_comment_id: None,
             source_created_at: None,
+            assignees: Vec::new(),
         };
         let decision = decide(EVENT_ISSUE_COMMENT, Some("created"), Some(&context));
         assert_eq!(decision.decision, DECISION_ACCEPTED);
         assert_eq!(decision.reason_code, "explicit_directive");
         assert_eq!(decision.directive.as_deref(), Some(DIRECTIVE_POKE));
+        assert_eq!(decision.target_role.as_deref(), Some("codex-orch"));
+        assert!(decision.would_dispatch);
+    }
+
+    #[test]
+    fn comment_without_directive_dispatches_reply_to_single_codex_assignee() {
+        let context = EventContext {
+            repo_full_name: "main/orchd-debug".to_string(),
+            issue_number: Some(1),
+            actor_login: Some("main".to_string()),
+            text: Some("please take a look".to_string()),
+            source_comment_id: None,
+            source_created_at: None,
+            assignees: vec!["codex-orch".to_string()],
+        };
+        let decision = decide(EVENT_ISSUE_COMMENT, Some("created"), Some(&context));
+        assert_eq!(decision.decision, DECISION_ACCEPTED);
+        assert_eq!(decision.reason_code, "assignee_reply");
+        assert_eq!(decision.directive.as_deref(), Some(DIRECTIVE_REPLY));
         assert_eq!(decision.target_role.as_deref(), Some("codex-orch"));
         assert!(decision.would_dispatch);
     }
@@ -270,6 +312,7 @@ mod tests {
             text: Some("@codex-orch design".to_string()),
             source_comment_id: None,
             source_created_at: None,
+            assignees: Vec::new(),
         };
         let decision = decide(EVENT_ISSUES, Some("label_updated"), Some(&context));
         assert_eq!(decision.decision, DECISION_IGNORED);
@@ -286,6 +329,7 @@ mod tests {
             text: Some("@codex-orch design".to_string()),
             source_comment_id: None,
             source_created_at: None,
+            assignees: Vec::new(),
         };
         let decision = decide(EVENT_ISSUES, Some("opened"), Some(&context));
         assert_eq!(decision.decision, DECISION_ACCEPTED);

@@ -72,7 +72,6 @@ pub(super) async fn run_server(cli: Cli) -> Result<()> {
         cfg,
         forgejo_config_file: config_override,
         reconcile_repo,
-        comment_echo: !cli.no_comment_echo,
         dispatch_mode: cli.dispatch_mode,
         dispatch_backend: cli.dispatch_backend,
         dispatch_config,
@@ -316,32 +315,7 @@ async fn process_webhook(
                 status_projected = true;
             }
             match state.dispatch_mode {
-                DispatchMode::DryRun => {
-                    if state.comment_echo {
-                        let comment_body = format!(
-                            "orchd: accepted (dry-run) directive={} role={} reason={} would_dispatch=true delivery={}",
-                            decision.directive.as_deref().unwrap_or("-"),
-                            decision.target_role.as_deref().unwrap_or("-"),
-                            decision.reason_code,
-                            record.delivery_id
-                        );
-                        match projection::post_issue_comment(
-                            state.clone(),
-                            &record.repo_full_name,
-                            issue_number,
-                            comment_body,
-                        )
-                        .await
-                        {
-                            Ok(()) => {}
-                            Err(err) => {
-                                if status_error.is_none() {
-                                    status_error = Some(err.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
+                DispatchMode::DryRun => {}
                 DispatchMode::TmuxExec | DispatchMode::TmuxTui => {
                     let defer_impl = match decision.directive.as_deref() {
                         Some(DIRECTIVE_IMPL) => match db::latest_repo_inflight_impl_dispatch_id(

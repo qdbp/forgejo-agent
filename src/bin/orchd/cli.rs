@@ -31,8 +31,6 @@ pub(super) struct Cli {
     pub(super) dispatch_backend: DispatchBackend,
     #[arg(long, default_value = "config/orchd-dispatch.toml")]
     pub(super) dispatch_config: String,
-    #[arg(long)]
-    pub(super) no_comment_echo: bool,
     #[command(subcommand)]
     pub(super) command: Option<OrchdCommand>,
 }

@@ -21,6 +21,7 @@ Required output:
 3. Call out blockers/unknowns explicitly.
 
 Design contract:
+- if you intend to own this issue, assign yourself: `forgejoctl issue assign {{issue_ref}} --self`
 - read-only: do not edit repository files, do not create commits
 - respond in the issue thread with design guidance only
 

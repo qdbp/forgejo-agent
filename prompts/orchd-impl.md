@@ -12,6 +12,7 @@ Issue body:
 {{issue_body}}
 
 The directive {{directive}} carries the following orders:
+- if you intend to own this issue, assign yourself: `forgejoctl issue assign {{issue_ref}} --self`
 - you are operating in an isolated git worktree/branch owned by orchd (not the main checkout)
 - execute the work end-to-end where possible
 - continue autonomously until completion; stop only for material underspecification, material ambiguity, or clear churn/confusion

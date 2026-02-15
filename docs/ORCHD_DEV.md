@@ -4,19 +4,25 @@
 
 Current implementation supports two dispatch modes:
 
-- `dry-run`: parse directives, persist decisions, comment intent only.
+- `dry-run`: parse directives, persist decisions. No metadata comments are posted to issues.
 - `tmux-tui` (default): tmux-backed dispatch. Currently implemented via `codex exec` for stability; produces a `codex_session_id` you can later open with `codex resume <id>` if you want an interactive TUI.
 - `tmux-exec`: create a dispatch record and run Codex non-interactively (`codex exec`).
+
+## Design Dogma
+
+- Issue comments are meat-only. `orchd` must never post metadata into issue comments.
+- `orchd` projects orchestration state out-of-band via labels (`orchd/state/*`) and (for worktree directives) via work-plane transitions (`state/*`).
+- Agents should use `forgejoctl` as the control plane API surface.
 
 Core behavior:
 
 - accepts webhook events at `POST /webhook`
-- parses directives (`@codex-orch design`, `@codex-orch impl`, `@codex poke`)
+- parses directives (`@codex-orch design`, `@codex-orch impl`, `@codex-orch reply`, `@codex poke`)
 - persists `events`, `decisions`, and `dispatches` in sqlite
 - ensures per-repo Forgejo webhooks exist (best-effort) for repos owned by `FORGEJO_DEFAULT_OWNER`
 - ensures per-repo policy labels exist (best-effort) and maintains per-role local checkouts under the orchd state dir
 - emits heartbeat + reconcile logs periodically
-- ignores self-generated `orchd:` comments to avoid echo loops
+- dispatches `reply` implicitly on new issue comments when the issue has exactly one assignee and it is a `codex-*` user (unless an explicit directive is present)
 
 Dispatch behavior is configured in `config/orchd-dispatch.toml`:
 
@@ -138,7 +144,7 @@ body='{
   "action":"created",
   "repository":{"full_name":"main/orchd-debug"},
   "issue":{"number":1},
-  "comment":{"body":"@codex-orch poke","user":{"login":"main"}},
+  "comment":{"body":"@codex-orch reply","user":{"login":"main"}},
   "sender":{"login":"main"}
 }'
 

@@ -173,7 +173,9 @@ impl DispatchBackendAdapter for LocalBackendAdapter {
 
 fn codex_sandbox_for_directive(directive: &str) -> &'static str {
     match directive {
-        lexicon::DIRECTIVE_DESIGN | lexicon::DIRECTIVE_POKE => "read-only",
+        lexicon::DIRECTIVE_DESIGN | lexicon::DIRECTIVE_REPLY | lexicon::DIRECTIVE_POKE => {
+            "read-only"
+        }
         _ => "workspace-write",
     }
 }
@@ -332,24 +334,6 @@ async fn plan_dispatch(
     record: &EventRecord,
     decision: &DecisionRecord,
 ) -> Result<DispatchPlan, DispatchError> {
-    let actor = record
-        .actor_login
-        .clone()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let policy_decision = if dispatch_config
-        .allowed_actors
-        .iter()
-        .any(|allowed| allowed == &actor)
-    {
-        DispatchPolicyDecision::allow()
-    } else {
-        DispatchPolicyDecision::deny(format!("actor '{actor}' is not allowlisted"))
-    };
-    if policy_decision.outcome != DispatchPolicyOutcome::Allow {
-        return Err(DispatchError::ActorNotAllowed(actor));
-    }
-
     let directive_name = decision
         .directive
         .as_deref()
@@ -359,11 +343,37 @@ async fn plan_dispatch(
         .get(directive_name)
         .ok_or_else(|| DispatchError::DirectiveNotConfigured(directive_name.to_string()))?
         .clone();
+
+    let role_name = decision
+        .target_role
+        .as_deref()
+        .unwrap_or(directive.role.as_str())
+        .to_ascii_lowercase();
     let role = dispatch_config
         .roles
-        .get(&directive.role)
-        .ok_or_else(|| DispatchError::RoleNotConfigured(directive.role.clone()))?
+        .get(&role_name)
+        .ok_or_else(|| DispatchError::RoleNotConfigured(role_name.clone()))?
         .clone();
+
+    let actor = record
+        .actor_login
+        .clone()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let bypass_allowlist = decision.reason_code == "assignee_reply";
+    let policy_decision = if bypass_allowlist
+        || dispatch_config
+            .allowed_actors
+            .iter()
+            .any(|allowed| allowed == &actor)
+    {
+        DispatchPolicyDecision::allow()
+    } else {
+        DispatchPolicyDecision::deny(format!("actor '{actor}' is not allowlisted"))
+    };
+    if policy_decision.outcome != DispatchPolicyOutcome::Allow {
+        return Err(DispatchError::ActorNotAllowed(actor));
+    }
 
     let issue_number = record
         .issue_number
@@ -372,7 +382,7 @@ async fn plan_dispatch(
         intent_id: format!("event-{current_event_id}-decision-{decision_id}"),
         repo_full_name: record.repo_full_name.clone(),
         issue_number,
-        role: directive.role.clone(),
+        role: role_name.clone(),
         directive: directive_name.to_string(),
         actor_login: actor.clone(),
         delivery_id: record.delivery_id.clone(),

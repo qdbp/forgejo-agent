@@ -73,8 +73,7 @@ Scope:
 
 - Introduce and document `orchd/*` label vocabulary.
 - Add `forgejoctl` helper(s) to set scoped/exclusive runtime labels atomically (remove old `orchd/state/*`, set exactly one new state).
-- Replace `orchd: dispatch started/blocked` status comments with label updates.
-- Keep completion summary comments for now (high signal only).
+- Replace status comments with label updates; `orchd` does not post metadata into issue comments.
 
 Proposed runtime labels:
 

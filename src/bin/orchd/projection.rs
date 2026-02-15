@@ -31,26 +31,6 @@ pub(super) fn dispatch_comment_identity(
     })
 }
 
-pub(super) async fn post_issue_comment(
-    state: AppState,
-    repo_full_name: &str,
-    issue_number: u64,
-    body: String,
-) -> Result<()> {
-    let repo = RepoRef::parse(repo_full_name)?;
-    let issue = IssueRef {
-        repo,
-        number: issue_number,
-    };
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        let api = ForgejoClient::new(&state.cfg)?;
-        api.comment_issue(&state.cfg, &issue, &body)
-    })
-    .await
-    .context("comment task join failure")??;
-    Ok(())
-}
-
 const fn orchd_runtime_label_meta(state: OrchdRuntimeState) -> (&'static str, &'static str, bool) {
     match state {
         OrchdRuntimeState::Queued => ("d4c5f9", "dispatch accepted and queued", true),
