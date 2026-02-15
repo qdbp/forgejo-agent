@@ -14,6 +14,12 @@
 - If you touch `src/main.rs`, `src/api.rs`, `src/policy.rs`, `src/types.rs`, or `tests/live_forgejo.rs`, also run:
   - `FORGEJO_LIVE_TESTS=1 cargo test --test live_forgejo -- --nocapture`
 
+## Module Indexing Policy
+
+- For any `mod.rs` that declares submodules, add a 1-2 line comment above each `mod foo;` answering:
+  - what the submodule does
+  - when you should read it (vs safely skip it)
+
 ## Forgejo Access Policy
 
 - Agent workflows should use `/home/main/.local/bin/forgejoctl` for Forgejo mutations.
