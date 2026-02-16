@@ -385,29 +385,46 @@ pub(super) fn issue_delta_rows(
 }
 
 pub(super) fn summarize_issue_delta(rows: &[IssueEventDeltaRow]) -> String {
-    const MAX_DELTA_LINES: usize = 32;
-    const MAX_LINE_CHARS: usize = 220;
+    const MAX_CONTEXT_LINES: usize = 24;
+    const MAX_CONTEXT_LINE_CHARS: usize = 220;
 
     fn normalize_single_line(raw: &str) -> String {
         raw.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
-    fn truncate_for_line(mut text: String) -> String {
-        if text.chars().count() > MAX_LINE_CHARS {
+    fn truncate_for_context_line(mut text: String) -> String {
+        if text.chars().count() > MAX_CONTEXT_LINE_CHARS {
             text = format!(
                 "{}...",
-                text.chars().take(MAX_LINE_CHARS).collect::<String>()
+                text.chars()
+                    .take(MAX_CONTEXT_LINE_CHARS)
+                    .collect::<String>()
             );
         }
         text
+    }
+
+    fn format_comment_line(timestamp: &str, actor: &str, raw_text: &str) -> String {
+        let text = raw_text.trim();
+        if text.is_empty() {
+            return format!("- [{timestamp}] {actor} issue_comment: (empty)");
+        }
+        let mut rendered = format!("- [{timestamp}] {actor} issue_comment:");
+        for line in text.lines() {
+            rendered.push_str("\n  | ");
+            rendered.push_str(line);
+        }
+        rendered
     }
 
     if rows.is_empty() {
         return "(no new issue events since last handled dispatch)".to_string();
     }
 
-    let mut seen = HashSet::<(String, String, String)>::new();
-    let mut lines = Vec::<String>::new();
+    let mut seen_context = HashSet::<(String, String, String)>::new();
+    let mut comment_lines = Vec::<String>::new();
+    let mut context_lines = Vec::<String>::new();
+    let mut omitted_context_total = 0_usize;
 
     for row in rows {
         let timestamp = row
@@ -420,7 +437,15 @@ pub(super) fn summarize_issue_delta(rows: &[IssueEventDeltaRow]) -> String {
             .as_deref()
             .filter(|text| !text.trim().is_empty())
             .unwrap_or("unknown");
-        let normalized = normalize_single_line(row.event_text.as_deref().unwrap_or(""));
+        let raw_text = row.event_text.as_deref().unwrap_or("");
+        if raw_text.trim().is_empty() {
+            continue;
+        }
+        if row.event_type == EVENT_ISSUE_COMMENT {
+            comment_lines.push(format_comment_line(timestamp, actor, raw_text));
+            continue;
+        }
+        let normalized = normalize_single_line(raw_text);
         if normalized.is_empty() {
             continue;
         }
@@ -429,35 +454,45 @@ pub(super) fn summarize_issue_delta(rows: &[IssueEventDeltaRow]) -> String {
             actor.to_string(),
             normalized.clone(),
         );
-        if !seen.insert(dedupe_key) {
+        if !seen_context.insert(dedupe_key) {
+            omitted_context_total += 1;
             continue;
         }
-        lines.push(format!(
+        if context_lines.len() >= MAX_CONTEXT_LINES {
+            omitted_context_total += 1;
+            continue;
+        }
+        context_lines.push(format!(
             "- [{}] {} {}: {}",
             timestamp,
             actor,
             row.event_type,
-            truncate_for_line(normalized)
+            truncate_for_context_line(normalized)
         ));
-        if lines.len() >= MAX_DELTA_LINES {
-            break;
-        }
     }
 
-    if lines.is_empty() {
+    if comment_lines.is_empty() && context_lines.is_empty() {
         return "(no new issue events since last handled dispatch)".to_string();
     }
 
-    let omitted_total = rows.len().saturating_sub(lines.len());
-    if omitted_total > 0 {
-        lines.push(format!(
-            "- (omitted {} additional or duplicate event{})",
-            omitted_total,
-            if omitted_total == 1 { "" } else { "s" }
+    let mut sections = Vec::<String>::new();
+    if !comment_lines.is_empty() {
+        sections.push("New comments (verbatim):".to_string());
+        sections.extend(comment_lines);
+    }
+    if !context_lines.is_empty() || omitted_context_total > 0 {
+        sections.push("Other issue activity (context, may be truncated):".to_string());
+        sections.extend(context_lines);
+    }
+    if omitted_context_total > 0 {
+        sections.push(format!(
+            "- (omitted {} older or duplicate context event{})",
+            omitted_context_total,
+            if omitted_context_total == 1 { "" } else { "s" }
         ));
     }
 
-    lines.join("\n")
+    sections.join("\n")
 }
 
 struct DispatchTransitionPlan {
@@ -2087,8 +2122,44 @@ mod tests {
         ];
 
         let summary = super::summarize_issue_delta(&rows);
+        assert!(summary.contains("New comments (verbatim):"));
+        assert!(summary.contains("Other issue activity (context, may be truncated):"));
         assert_eq!(summary.matches("codex-orch issues").count(), 1);
-        assert_eq!(summary.matches("main issue_comment").count(), 1);
-        assert!(summary.contains("omitted 1 additional or duplicate event"));
+        assert_eq!(summary.matches("main issue_comment:").count(), 1);
+        assert!(summary.contains("omitted 1 older or duplicate context event"));
+    }
+
+    #[test]
+    fn summarize_issue_delta_keeps_full_comment_text() {
+        let long_comment = "x".repeat(300);
+        let rows = vec![super::IssueEventDeltaRow {
+            event_type: EVENT_ISSUE_COMMENT.to_string(),
+            actor_login: Some("main".to_string()),
+            event_text: Some(long_comment.clone()),
+            received_at: "2026-01-01T00:00:00Z".to_string(),
+            source_created_at: Some("2026-01-01T00:00:00Z".to_string()),
+        }];
+
+        let summary = super::summarize_issue_delta(&rows);
+        assert!(summary.contains("New comments (verbatim):"));
+        assert!(summary.contains(&format!("| {long_comment}")));
+    }
+
+    #[test]
+    fn summarize_issue_delta_truncates_context_section_only() {
+        let mut rows = Vec::new();
+        for idx in 0..30 {
+            rows.push(super::IssueEventDeltaRow {
+                event_type: EVENT_ISSUES.to_string(),
+                actor_login: Some("codex-orch".to_string()),
+                event_text: Some(format!("context row {idx}")),
+                received_at: format!("2026-01-01T00:00:{idx:02}Z"),
+                source_created_at: Some(format!("2026-01-01T00:00:{idx:02}Z")),
+            });
+        }
+
+        let summary = super::summarize_issue_delta(&rows);
+        assert!(summary.contains("Other issue activity (context, may be truncated):"));
+        assert!(summary.contains("omitted"));
     }
 }
