@@ -52,6 +52,7 @@ pub(super) async fn run_server(cli: Cli) -> Result<()> {
     };
     let config_override = cli.config.clone();
     let cfg = AgentConfig::load(cli.config, cli.token_file)?;
+    enforce_machine_identity(&cfg)?;
     let dispatch_config_path = expand_tilde_path(&cli.dispatch_config)?;
     let dispatch_config = match cli.dispatch_mode {
         DispatchMode::DryRun => None,
@@ -178,6 +179,42 @@ pub(super) async fn run_server(cli: Cli) -> Result<()> {
         .await
         .context("orchd server failed")?;
 
+    Ok(())
+}
+
+fn enforce_machine_identity(cfg: &AgentConfig) -> Result<()> {
+    let api = ForgejoClient::new(cfg).context("failed to initialize Forgejo client")?;
+    let whoami = api
+        .whoami(cfg)
+        .context("failed to resolve authenticated Forgejo identity")?;
+    let login = whoami
+        .get("login")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("Forgejo /api/v1/user response missing login"))?;
+    let allow_main = std::env::var("ORCHD_ALLOW_MAIN_LOGIN")
+        .ok()
+        .is_some_and(|value| value == "1");
+    if login.eq_ignore_ascii_case("main") && !allow_main {
+        return Err(anyhow!(
+            "orchd refuses to run with Forgejo login 'main'; use the orchd machine token"
+        ));
+    }
+    if login.eq_ignore_ascii_case("main") && allow_main {
+        log_line(
+            "startup_identity_override",
+            json!({
+                "login": login,
+                "reason": "ORCHD_ALLOW_MAIN_LOGIN=1",
+            }),
+        );
+    } else {
+        log_line(
+            "startup_identity",
+            json!({
+                "login": login,
+            }),
+        );
+    }
     Ok(())
 }
 
