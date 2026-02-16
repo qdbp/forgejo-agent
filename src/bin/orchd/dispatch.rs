@@ -31,6 +31,12 @@ use super::telemetry::{log_line, record_phase_latency_ms};
 
 pub(super) const STARTING_DISPATCH_STALE_AFTER_SEC: i64 = 120;
 
+fn fail_dispatch_start(db_path: &Path, dispatch_id: i64, lock_path: &Path, err: &DispatchError) {
+    let _ =
+        db::update_dispatch_failed_start(db_path, dispatch_id, err.reason_code(), &err.to_string());
+    let _ = fs::remove_file(lock_path);
+}
+
 #[derive(Debug, Clone)]
 struct DispatchPlan {
     actor: String,
@@ -659,120 +665,131 @@ async fn plan_dispatch(
         }
     };
 
-    let run_dir = repo::run_root(&state.db_path)?.join(format!("dispatch-{dispatch_id}"));
-    fs::create_dir_all(&run_dir)
-        .map_err(|err| DispatchError::Io(format!("failed to create run dir: {err}")))?;
-    let issue_title = issue.title;
-    let issue_body = issue.body.unwrap_or_default();
-    let issue_url = issue.html_url;
+    let plan_build: Result<DispatchPlan, DispatchError> = async {
+        let run_dir = repo::run_root(&state.db_path)?.join(format!("dispatch-{dispatch_id}"));
+        fs::create_dir_all(&run_dir)
+            .map_err(|err| DispatchError::Io(format!("failed to create run dir: {err}")))?;
+        let issue_title = issue.title;
+        let issue_body = issue.body.unwrap_or_default();
+        let issue_url = issue.html_url;
 
-    let base_repo_checkout = repo::ensure_repo_checkout(state, &role, &intent.repo_full_name)?;
-    if db::repo_labels_ensured_at(&state.db_path, &intent.repo_full_name)
-        .unwrap_or(None)
-        .is_none()
-    {
-        let repo_full_name = intent.repo_full_name.clone();
-        let forgejoctl_bin = dispatch_config.forgejoctl_bin.clone();
-        let config_file = state.forgejo_config_file.clone();
-        let token_file = role.token_file.clone();
-        let ensure_outcome = tokio::task::spawn_blocking(move || {
-            forgejoctl_cmd::run_forgejoctl(
-                &forgejoctl_bin,
-                config_file.as_deref(),
-                &token_file,
-                &["repo", "ensure", &repo_full_name],
-            )
-        })
-        .await;
-        match ensure_outcome {
-            Ok(Ok(())) => {
-                let _ = db::update_repo_labels_ensured(
-                    &state.db_path,
-                    &intent.repo_full_name,
-                    true,
-                    None,
-                );
-            }
-            Ok(Err(err)) => {
-                let _ = db::update_repo_labels_ensured(
-                    &state.db_path,
-                    &intent.repo_full_name,
-                    false,
-                    Some(&err.to_string()),
-                );
-            }
-            Err(err) => {
-                let _ = db::update_repo_labels_ensured(
-                    &state.db_path,
-                    &intent.repo_full_name,
-                    false,
-                    Some(&format!("ensure join failure: {err}")),
-                );
+        let base_repo_checkout = repo::ensure_repo_checkout(state, &role, &intent.repo_full_name)?;
+        if db::repo_labels_ensured_at(&state.db_path, &intent.repo_full_name)
+            .unwrap_or(None)
+            .is_none()
+        {
+            let repo_full_name = intent.repo_full_name.clone();
+            let forgejoctl_bin = dispatch_config.forgejoctl_bin.clone();
+            let config_file = state.forgejo_config_file.clone();
+            let token_file = role.token_file.clone();
+            let ensure_outcome = tokio::task::spawn_blocking(move || {
+                forgejoctl_cmd::run_forgejoctl(
+                    &forgejoctl_bin,
+                    config_file.as_deref(),
+                    &token_file,
+                    &["repo", "ensure", &repo_full_name],
+                )
+            })
+            .await;
+            match ensure_outcome {
+                Ok(Ok(())) => {
+                    let _ = db::update_repo_labels_ensured(
+                        &state.db_path,
+                        &intent.repo_full_name,
+                        true,
+                        None,
+                    );
+                }
+                Ok(Err(err)) => {
+                    let _ = db::update_repo_labels_ensured(
+                        &state.db_path,
+                        &intent.repo_full_name,
+                        false,
+                        Some(&err.to_string()),
+                    );
+                }
+                Err(err) => {
+                    let _ = db::update_repo_labels_ensured(
+                        &state.db_path,
+                        &intent.repo_full_name,
+                        false,
+                        Some(&format!("ensure join failure: {err}")),
+                    );
+                }
             }
         }
-    }
-    let (workdir, git_remote, git_base, git_branch) =
-        if lexicon::directive_uses_worktree(&intent.directive) {
-            let git_remote = repo_binding.map_or_else(
-                || repo::DEFAULT_GIT_REMOTE.to_string(),
-                |binding| binding.git_remote.clone(),
-            );
-            let git_base = repo_binding.map_or_else(
-                || repo::DEFAULT_GIT_BASE_BRANCH.to_string(),
-                |binding| binding.git_base.clone(),
-            );
-            let git_branch = repo::dispatch_worktree_branch(
-                &intent.repo_full_name,
-                intent.issue_number,
-                dispatch_id,
-                directive_name,
-            );
-            let workdir = run_dir.join("worktree");
-            repo::create_dispatch_worktree(
-                &state.db_path,
-                &role.token_file,
-                &base_repo_checkout,
-                &workdir,
-                &git_branch,
-                &git_remote,
-                &git_base,
-            )?;
-            (workdir, git_remote, git_base, git_branch)
+        let (workdir, git_remote, git_base, git_branch) =
+            if lexicon::directive_uses_worktree(&intent.directive) {
+                let git_remote = repo_binding.map_or_else(
+                    || repo::DEFAULT_GIT_REMOTE.to_string(),
+                    |binding| binding.git_remote.clone(),
+                );
+                let git_base = repo_binding.map_or_else(
+                    || repo::DEFAULT_GIT_BASE_BRANCH.to_string(),
+                    |binding| binding.git_base.clone(),
+                );
+                let git_branch = repo::dispatch_worktree_branch(
+                    &intent.repo_full_name,
+                    intent.issue_number,
+                    dispatch_id,
+                    directive_name,
+                );
+                let workdir = run_dir.join("worktree");
+                repo::create_dispatch_worktree(
+                    &state.db_path,
+                    &role.token_file,
+                    &base_repo_checkout,
+                    &workdir,
+                    &git_branch,
+                    &git_remote,
+                    &git_base,
+                )?;
+                (workdir, git_remote, git_base, git_branch)
+            } else {
+                (
+                    base_repo_checkout,
+                    repo::DEFAULT_GIT_REMOTE.to_string(),
+                    repo::DEFAULT_GIT_BASE_BRANCH.to_string(),
+                    String::new(),
+                )
+            };
+        let principal_workdir = if intent.directive == lexicon::DIRECTIVE_IMPL {
+            repo_binding.map(|binding| binding.local_path.clone())
         } else {
-            (
-                base_repo_checkout,
-                repo::DEFAULT_GIT_REMOTE.to_string(),
-                repo::DEFAULT_GIT_BASE_BRANCH.to_string(),
-                String::new(),
-            )
+            None
         };
-    let principal_workdir = if intent.directive == lexicon::DIRECTIVE_IMPL {
-        repo_binding.map(|binding| binding.local_path.clone())
-    } else {
-        None
-    };
 
-    Ok(DispatchPlan {
-        actor,
-        event_type: record.event_type.clone(),
-        directive,
-        role,
-        workdir,
-        principal_workdir,
-        git_remote,
-        git_base,
-        git_branch,
-        intent,
-        issue_ref,
-        issue_title,
-        issue_body,
-        issue_url,
-        issue_session_id,
-        issue_delta_summary,
-        dispatch_id,
-        lock_path,
-        run_dir,
-    })
+        Ok(DispatchPlan {
+            actor,
+            event_type: record.event_type.clone(),
+            directive,
+            role,
+            workdir,
+            principal_workdir,
+            git_remote,
+            git_base,
+            git_branch,
+            intent,
+            issue_ref,
+            issue_title,
+            issue_body,
+            issue_url,
+            issue_session_id,
+            issue_delta_summary,
+            dispatch_id,
+            lock_path: lock_path.clone(),
+            run_dir,
+        })
+    }
+    .await;
+
+    match plan_build {
+        Ok(plan) => Ok(plan),
+        Err(err) => {
+            fail_dispatch_start(&state.db_path, dispatch_id, &lock_path, &err);
+            Err(err)
+        }
+    }
 }
 
 fn materialize_run_artifacts(
@@ -921,7 +938,7 @@ pub(super) async fn dispatch_issue(
         .as_ref()
         .ok_or(DispatchError::ConfigNotLoaded)?;
     let phase_plan_start = Instant::now();
-    let plan = plan_dispatch(
+    let plan = match plan_dispatch(
         &state,
         dispatch_config,
         decision_id,
@@ -929,20 +946,46 @@ pub(super) async fn dispatch_issue(
         record,
         decision,
     )
-    .await?;
-    record_phase_latency_ms(
-        "plan",
-        phase_plan_start.elapsed().as_secs_f64() * 1000.0,
-        "ok",
-    );
+    .await
+    {
+        Ok(plan) => {
+            record_phase_latency_ms(
+                "plan",
+                phase_plan_start.elapsed().as_secs_f64() * 1000.0,
+                "ok",
+            );
+            plan
+        }
+        Err(err) => {
+            record_phase_latency_ms(
+                "plan",
+                phase_plan_start.elapsed().as_secs_f64() * 1000.0,
+                "error",
+            );
+            return Err(err);
+        }
+    };
 
     let phase_materialize_start = Instant::now();
-    let artifacts = materialize_run_artifacts(&state, dispatch_config, &plan)?;
-    record_phase_latency_ms(
-        "materialize",
-        phase_materialize_start.elapsed().as_secs_f64() * 1000.0,
-        "ok",
-    );
+    let artifacts = match materialize_run_artifacts(&state, dispatch_config, &plan) {
+        Ok(artifacts) => {
+            record_phase_latency_ms(
+                "materialize",
+                phase_materialize_start.elapsed().as_secs_f64() * 1000.0,
+                "ok",
+            );
+            artifacts
+        }
+        Err(err) => {
+            record_phase_latency_ms(
+                "materialize",
+                phase_materialize_start.elapsed().as_secs_f64() * 1000.0,
+                "error",
+            );
+            fail_dispatch_start(&state.db_path, plan.dispatch_id, &plan.lock_path, &err);
+            return Err(err);
+        }
+    };
 
     let phase_launch_start = Instant::now();
     let launch_result = launch_dispatch_backend(&state, dispatch_config, &plan, &artifacts);
@@ -954,13 +997,7 @@ pub(super) async fn dispatch_issue(
                 phase_launch_start.elapsed().as_secs_f64() * 1000.0,
                 "error",
             );
-            let _ = db::update_dispatch_failed_start(
-                &state.db_path,
-                plan.dispatch_id,
-                err.reason_code(),
-                &err.to_string(),
-            );
-            let _ = fs::remove_file(&plan.lock_path);
+            fail_dispatch_start(&state.db_path, plan.dispatch_id, &plan.lock_path, &err);
             return Err(err);
         }
     };

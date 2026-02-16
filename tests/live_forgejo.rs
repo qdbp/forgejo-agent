@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -788,6 +789,56 @@ fn orchd_latest_dispatch_directive_and_role(
     .with_context(|| {
         format!(
             "failed selecting latest dispatch from {}",
+            db_path.display()
+        )
+    })
+}
+
+fn orchd_latest_dispatch_status_reason(
+    db_path: &Path,
+    repo_full_name: &str,
+    issue_number: u64,
+) -> Result<Option<(String, Option<String>)>> {
+    let conn = Connection::open(db_path)
+        .with_context(|| format!("failed opening orchd db: {}", db_path.display()))?;
+    let issue_number = i64::try_from(issue_number)
+        .with_context(|| format!("issue_number overflowed i64: {issue_number}"))?;
+    conn.query_row(
+        "SELECT status, reason_code \
+         FROM dispatches \
+         WHERE repo_full_name = ?1 AND issue_number = ?2 \
+         ORDER BY id DESC LIMIT 1",
+        params![repo_full_name, issue_number],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+    .with_context(|| {
+        format!(
+            "failed selecting latest dispatch status from {}",
+            db_path.display()
+        )
+    })
+}
+
+fn orchd_starting_dispatch_count(
+    db_path: &Path,
+    repo_full_name: &str,
+    issue_number: u64,
+) -> Result<i64> {
+    let conn = Connection::open(db_path)
+        .with_context(|| format!("failed opening orchd db: {}", db_path.display()))?;
+    let issue_number = i64::try_from(issue_number)
+        .with_context(|| format!("issue_number overflowed i64: {issue_number}"))?;
+    conn.query_row(
+        "SELECT COUNT(1) \
+         FROM dispatches \
+         WHERE repo_full_name = ?1 AND issue_number = ?2 AND status = 'starting'",
+        params![repo_full_name, issue_number],
+        |row| row.get(0),
+    )
+    .with_context(|| {
+        format!(
+            "failed counting starting dispatch rows from {}",
             db_path.display()
         )
     })
@@ -1627,6 +1678,141 @@ fn live_orchd_reply_autodispatches_to_assignee() -> Result<()> {
             .ok_or_else(|| anyhow!("expected a dispatch row after reply"))?;
     if dispatch.0 != "reply" || dispatch.1 != "codex-orch" {
         bail!("unexpected dispatch directive/role: {:?}", dispatch);
+    }
+
+    Ok(())
+}
+
+#[test]
+#[serial(live_forgejo)]
+fn live_orchd_prompt_template_failure_marks_failed_start() -> Result<()> {
+    if !live_tests_enabled() {
+        eprintln!(
+            "skipping live orchd integration test; enable with {}=1",
+            LIVE_TESTS_ENV
+        );
+        return Ok(());
+    }
+
+    let harness = LiveHarness::bootstrap("live_orchd_prompt_template_failure_marks_failed_start")?;
+    let issue_number = harness.create_issue("orchd bad prompt", "issue body", "ready")?;
+
+    let dispatch_cfg_path = harness
+        .fixture
+        .work_path
+        .join("orchd-dispatch-bad-template.toml");
+    let db_path = harness.fixture.work_path.join("orchd-bad-template.sqlite");
+    let orchd_stdout = harness
+        .fixture
+        .work_path
+        .join("orchd-bad-template-stdout.log");
+    let orchd_stderr = harness
+        .fixture
+        .work_path
+        .join("orchd-bad-template-stderr.log");
+
+    let fake_codex = ensure_fake_codex_bin()?;
+    let forgejoctl = forgejo_agent_bin()?;
+
+    write_orchd_dispatch_toml(
+        &dispatch_cfg_path,
+        OrchdDispatchTomlInputs {
+            actor: "nobody",
+            forgejo_login: harness.fixture.owner.as_str(),
+            repo_ref: harness.repo_ref.as_str(),
+            principal_workdir: &harness.principal_workdir,
+            codex_bin: &fake_codex,
+            token_file: &harness.token_path,
+            forgejoctl: &forgejoctl,
+            directives: &[OrchdTestDirective::Reply],
+            timeout_sec: 10,
+        },
+    )?;
+
+    let bad_fresh = harness
+        .fixture
+        .work_path
+        .join("orchd-bad-fresh-envelope.md");
+    fs::write(
+        &bad_fresh,
+        "## Broken\n{{dispatch_md}}\n{{orders_md}}\n{{issue_md}}\n{{role_card_md}}\n",
+    )
+    .with_context(|| format!("failed writing {}", bad_fresh.display()))?;
+
+    let original_cfg = fs::read_to_string(&dispatch_cfg_path)
+        .with_context(|| format!("failed reading {}", dispatch_cfg_path.display()))?;
+    let mut rewritten_cfg = String::new();
+    for line in original_cfg.lines() {
+        if line.trim_start().starts_with("fresh_envelope = ") {
+            writeln!(
+                &mut rewritten_cfg,
+                "fresh_envelope = \"{}\"",
+                bad_fresh.display()
+            )
+            .map_err(|err| anyhow!("failed to format rewritten config: {err}"))?;
+        } else {
+            rewritten_cfg.push_str(line);
+            rewritten_cfg.push('\n');
+        }
+    }
+    fs::write(&dispatch_cfg_path, rewritten_cfg)
+        .with_context(|| format!("failed rewriting {}", dispatch_cfg_path.display()))?;
+
+    let port = pick_unused_port().ok_or_else(|| anyhow!("failed to pick unused port"))?;
+    let orchd = OrchdTestProcess::spawn(OrchdSpawnInputs {
+        listen_port: port,
+        db_path: &db_path,
+        repo_ref: &harness.repo_ref,
+        dispatch_cfg_path: &dispatch_cfg_path,
+        config_path: &harness.config_path,
+        token_path: &harness.token_path,
+        stdout_path: &orchd_stdout,
+        stderr_path: &orchd_stderr,
+        env: &[],
+    })?;
+
+    let reply = post_orchd_issue_comment_webhook_with_issue(
+        &orchd.client,
+        &orchd.base_url,
+        &harness.repo_ref,
+        serde_json::json!({
+            "number": issue_number,
+            "assignees": [{ "login": "codex-orch" }],
+        }),
+        harness.fixture.owner.as_str(),
+        "follow-up with no directive",
+    )?;
+    if json_str_field(&reply, "decision")? != "accepted" {
+        bail!("expected accepted decision for assignee reply: {reply}");
+    }
+
+    let _ = wait_for_issue_label(
+        &harness,
+        issue_number,
+        "orchd/state/failed",
+        Duration::from_secs(30),
+    )?;
+
+    let status_reason =
+        orchd_latest_dispatch_status_reason(&db_path, &harness.repo_ref, issue_number)?
+            .ok_or_else(|| anyhow!("expected latest dispatch row for issue"))?;
+    if status_reason.0 != "failed_start" {
+        bail!(
+            "expected failed_start terminal dispatch, got status={} reason={:?}",
+            status_reason.0,
+            status_reason.1
+        );
+    }
+    if status_reason.1.as_deref() != Some("prompt_template_error") {
+        bail!(
+            "expected prompt_template_error reason code, got {:?}",
+            status_reason.1
+        );
+    }
+
+    let starting_count = orchd_starting_dispatch_count(&db_path, &harness.repo_ref, issue_number)?;
+    if starting_count != 0 {
+        bail!("expected no starting dispatch rows, found {starting_count}");
     }
 
     Ok(())
