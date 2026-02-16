@@ -827,14 +827,6 @@ fn cmd_issue_claim(api: &ForgejoClient, cfg: &AgentConfig, args: IssueClaimArgs)
 
     let now = Utc::now();
     let until = now + ChronoDuration::minutes(ttl_min);
-    let body = format!(
-        "[lease] claimed by {} at {} UTC; expires at {} UTC",
-        agent,
-        now.format("%Y-%m-%dT%H:%M:%SZ"),
-        until.format("%Y-%m-%dT%H:%M:%SZ")
-    );
-    api.comment_issue(cfg, &args.issue, &body)?;
-
     println!(
         "claimed: {} as {} until {}",
         args.issue,
@@ -866,12 +858,6 @@ fn cmd_issue_release(api: &ForgejoClient, cfg: &AgentConfig, args: IssueReleaseA
         ensure_issue_state(api, cfg, &args.issue, WorkflowState::Ready)?;
     }
 
-    let msg = if let Some(agent) = args.agent {
-        format!("[lease] released claim for {agent}")
-    } else {
-        "[lease] released all claims".to_string()
-    };
-    api.comment_issue(cfg, &args.issue, &msg)?;
     println!("released: {}", args.issue);
     Ok(())
 }
