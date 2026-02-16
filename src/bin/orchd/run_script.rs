@@ -178,27 +178,45 @@ if [[ -n "$PRINCIPAL_WORKDIR" ]]; then
   principal_args+=(--principal-workdir "$PRINCIPAL_WORKDIR")
 fi
 
-"$ORCHD_BIN" finalize-dispatch "${{config_args[@]}}" "${{principal_args[@]}}" \
-  --db-path "$DB_PATH" \
-  --dispatch-id "$DISPATCH_ID" \
-  --status "$status" \
-  --reason-code "$reason_code" \
-  --exit-code "$exit_code" \
-  --session-id "$session_for_finalize" \
-  --issue-ref "$ISSUE_REF" \
-  --issue-title "$ISSUE_TITLE" \
-  --issue-url "$ISSUE_URL" \
-  --directive "$DIRECTIVE" \
-  --role-name "$ROLE_NAME" \
-  --run-dir "$RUN_DIR" \
-  --log-file "$CODEX_LOG_FILE" \
-  --completion-file "$COMPLETION_FILE" \
-  --git-workdir "$GIT_WORKDIR" \
-  --git-remote "$GIT_REMOTE" \
-  --git-base "$GIT_BASE" \
-  --git-branch "$GIT_BRANCH" \
-  --forgejoctl-bin "$FORGEJOCTL_BIN" \
-  --token-file "$FINALIZE_TOKEN_FILE" || true
+run_finalize() {{
+  "$ORCHD_BIN" finalize-dispatch "${{config_args[@]}}" "${{principal_args[@]}}" \
+    --db-path "$DB_PATH" \
+    --dispatch-id "$DISPATCH_ID" \
+    --status "$status" \
+    --reason-code "$reason_code" \
+    --exit-code "$exit_code" \
+    --session-id "$session_for_finalize" \
+    --issue-ref "$ISSUE_REF" \
+    --issue-title "$ISSUE_TITLE" \
+    --issue-url "$ISSUE_URL" \
+    --directive "$DIRECTIVE" \
+    --role-name "$ROLE_NAME" \
+    --run-dir "$RUN_DIR" \
+    --log-file "$CODEX_LOG_FILE" \
+    --completion-file "$COMPLETION_FILE" \
+    --git-workdir "$GIT_WORKDIR" \
+    --git-remote "$GIT_REMOTE" \
+    --git-base "$GIT_BASE" \
+    --git-branch "$GIT_BRANCH" \
+    --forgejoctl-bin "$FORGEJOCTL_BIN" \
+    --token-file "$FINALIZE_TOKEN_FILE"
+}}
+
+finalize_attempt=1
+finalize_max_attempts=8
+while true; do
+  if run_finalize >> "$CODEX_LOG_FILE" 2>&1; then
+    break
+  fi
+  if [[ "$finalize_attempt" -ge "$finalize_max_attempts" ]]; then
+    echo "orchd: finalize-dispatch failed after $finalize_attempt attempts" | tee -a "$CODEX_LOG_FILE"
+    exit 91
+  fi
+  sleep_sec=$((finalize_attempt * 2))
+  echo "orchd: finalize-dispatch attempt $finalize_attempt failed; retrying in ${{sleep_sec}}s" | tee -a "$CODEX_LOG_FILE"
+  sleep "$sleep_sec"
+  finalize_attempt=$((finalize_attempt + 1))
+done
 "#,
         dispatch_id = inputs.dispatch_id,
         db_path = shell_quote(&inputs.db_path.to_string_lossy()),
