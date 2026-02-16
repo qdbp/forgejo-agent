@@ -15,6 +15,7 @@ use serde_json::json;
 
 use forgejo_agent::api::ForgejoClient;
 use forgejo_agent::config::AgentConfig;
+use forgejo_agent::orchd_dispatch_core::DispatchState;
 use forgejo_agent::types::{OrchdRuntimeState, RepoRef};
 
 use super::cli::{Cli, DispatchMode};
@@ -288,6 +289,56 @@ async fn webhook_handler(
     }
 }
 
+const fn terminal_runtime_state_for_dispatch_status(
+    status: DispatchState,
+) -> Option<OrchdRuntimeState> {
+    match status {
+        DispatchState::Completed => Some(OrchdRuntimeState::Completed),
+        DispatchState::Blocked => Some(OrchdRuntimeState::Blocked),
+        DispatchState::FailedStart
+        | DispatchState::FailedRuntime
+        | DispatchState::TimedOut
+        | DispatchState::Canceled => Some(OrchdRuntimeState::Failed),
+        DispatchState::Queued
+        | DispatchState::Launching
+        | DispatchState::Starting
+        | DispatchState::Running => None,
+    }
+}
+
+async fn project_post_launch_runtime_state(
+    state: AppState,
+    repo_full_name: &str,
+    issue_number: u64,
+    dispatch_identity: Option<projection::CommentIdentity>,
+) -> Result<()> {
+    projection::project_issue_runtime_state(
+        state.clone(),
+        repo_full_name,
+        issue_number,
+        OrchdRuntimeState::Running,
+        dispatch_identity.clone(),
+    )
+    .await?;
+
+    let maybe_status =
+        db::latest_issue_dispatch_status(&state.db_path, repo_full_name, issue_number)?;
+    if let Some(status) = maybe_status
+        && let Some(terminal_state) = terminal_runtime_state_for_dispatch_status(status)
+    {
+        projection::project_issue_runtime_state(
+            state,
+            repo_full_name,
+            issue_number,
+            terminal_state,
+            dispatch_identity,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
 async fn process_webhook(
     state: &AppState,
     headers: &HeaderMap,
@@ -396,11 +447,10 @@ async fn process_webhook(
                         .await
                         {
                             Ok(()) => {
-                                if let Err(err) = projection::project_issue_runtime_state(
+                                if let Err(err) = project_post_launch_runtime_state(
                                     state.clone(),
                                     &record.repo_full_name,
                                     issue_number,
-                                    OrchdRuntimeState::Running,
                                     dispatch_identity.clone(),
                                 )
                                 .await
@@ -559,11 +609,10 @@ async fn dispatch_queue_once(state: &AppState) -> Result<()> {
         .await
         {
             Ok(()) => {
-                let _ = projection::project_issue_runtime_state(
+                let _ = project_post_launch_runtime_state(
                     state.clone(),
                     &item.record.repo_full_name,
                     issue_number,
-                    OrchdRuntimeState::Running,
                     dispatch_identity.clone(),
                 )
                 .await;

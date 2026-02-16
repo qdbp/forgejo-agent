@@ -904,6 +904,32 @@ pub(super) fn latest_issue_active_dispatch(
     Ok(dispatch)
 }
 
+pub(super) fn latest_issue_dispatch_status(
+    db_path: &Path,
+    repo_full_name: &str,
+    issue_number: u64,
+) -> Result<Option<DispatchState>> {
+    let conn = open_db(db_path)?;
+    let status = conn
+        .query_row(
+            r"
+            SELECT status
+            FROM dispatches
+            WHERE repo_full_name = ?1
+              AND issue_number = ?2
+            ORDER BY id DESC
+            LIMIT 1
+            ",
+            params![repo_full_name, i64::try_from(issue_number)?],
+            |row| {
+                let status_raw: String = row.get(0)?;
+                parse_dispatch_state_literal(&status_raw, 0)
+            },
+        )
+        .optional()?;
+    Ok(status)
+}
+
 pub(super) fn latest_issue_resume_dispatch(
     db_path: &Path,
     repo_full_name: &str,
@@ -1635,6 +1661,35 @@ mod tests {
             .expect("active dispatch present");
         assert_eq!(active.id, active_id);
         assert_eq!(active.status, DispatchState::Running);
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn latest_issue_dispatch_status_returns_latest_row_status() {
+        let db_path = temp_db_path("issue-latest-status");
+        super::init_db(&db_path).expect("db init");
+        let decision_id = seed_decision_id(&db_path);
+        insert_dispatch_row(
+            &db_path,
+            decision_id,
+            13,
+            DispatchState::Running,
+            "codex-orch",
+            None,
+        );
+        insert_dispatch_row(
+            &db_path,
+            decision_id,
+            13,
+            DispatchState::Completed,
+            "codex-orch",
+            None,
+        );
+
+        let latest = super::latest_issue_dispatch_status(&db_path, "main/orchd-debug", 13)
+            .expect("query latest status");
+        assert_eq!(latest, Some(DispatchState::Completed));
 
         let _ = fs::remove_file(db_path);
     }
