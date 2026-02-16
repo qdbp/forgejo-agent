@@ -138,11 +138,13 @@ Core behavior:
 Role launch wrapper:
 
 - `orchd` dispatches Codex through the repo-managed wrapper `bin/codex-role` (configured in `config/orchd-dispatch.toml`), not by clobbering `/usr/bin/codex`.
+- `orchd` service auth uses `~/.config/forgejo-agent/creds/orchd.token` so orchestrator actions never impersonate `main`.
 
 Run (`exec`, default + restart-resilient backend):
 
 ```bash
 cargo run --bin orchd -- \
+  --token-file ~/.config/forgejo-agent/creds/orchd.token \
   --listen 127.0.0.1:7878 \
   --db-path ~/.local/state/orchd-dev/orchd.sqlite \
   --reconcile-repo main/orchd-debug \
@@ -157,6 +159,7 @@ Run (`exec` + local backend, convenient for tests):
 
 ```bash
 cargo run --bin orchd -- \
+  --token-file ~/.config/forgejo-agent/creds/orchd.token \
   --listen 127.0.0.1:7878 \
   --db-path ~/.local/state/orchd-dev/orchd.sqlite \
   --reconcile-repo main/orchd-debug \
@@ -186,6 +189,7 @@ Run (`dry-run`):
 
 ```bash
 cargo run --bin orchd -- \
+  --token-file ~/.config/forgejo-agent/creds/orchd.token \
   --listen 127.0.0.1:7878 \
   --db-path ~/.local/state/orchd-dev/orchd.sqlite \
   --reconcile-repo main/orchd-debug \

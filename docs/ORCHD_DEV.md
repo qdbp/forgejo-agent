@@ -12,6 +12,7 @@ Current implementation supports two dispatch modes:
 - Issue comments are meat-only. `orchd` must never post metadata into issue comments.
 - `orchd` projects orchestration state out-of-band via labels (`orchd/state/*`) and (for worktree directives) via work-plane transitions (`state/*`).
 - Agents should use `forgejoctl` as the control plane API surface.
+- `orchd` must authenticate as the `orchd` machine user. No orchestrator path should impersonate `main`.
 
 Core behavior:
 
@@ -49,6 +50,7 @@ Desktop notifications are emitted directly from `orchd` via `notify-send`:
 
 ```bash
 cargo run --bin orchd -- \
+  --token-file ~/.config/forgejo-agent/creds/orchd.token \
   --listen 127.0.0.1:7878 \
   --db-path ~/.local/state/orchd-dev/orchd.sqlite \
   --reconcile-repo main/orchd-debug \
@@ -63,6 +65,7 @@ cargo run --bin orchd -- \
 
 ```bash
 cargo run --bin orchd -- \
+  --token-file ~/.config/forgejo-agent/creds/orchd.token \
   --listen 127.0.0.1:7878 \
   --db-path ~/.local/state/orchd-dev/orchd.sqlite \
   --reconcile-repo main/orchd-debug \
@@ -77,6 +80,7 @@ cargo run --bin orchd -- \
 
 ```bash
 cargo run --bin orchd -- \
+  --token-file ~/.config/forgejo-agent/creds/orchd.token \
   --listen 127.0.0.1:7878 \
   --db-path ~/.local/state/orchd-dev/orchd.sqlite \
   --reconcile-repo main/orchd-debug \

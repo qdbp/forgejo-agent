@@ -5,9 +5,16 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SERVICE_SRC="$ROOT_DIR/templates/orchd.service"
 SERVICE_DIR="$HOME/.config/systemd/user"
 SERVICE_DST="$SERVICE_DIR/orchd.service"
+ORCHD_TOKEN_FILE="$HOME/.config/forgejo-agent/creds/orchd.token"
 
 if [[ ! -f "$SERVICE_SRC" ]]; then
   echo "missing service template: $SERVICE_SRC" >&2
+  exit 1
+fi
+
+if [[ ! -r "$ORCHD_TOKEN_FILE" ]]; then
+  echo "missing orchd token file: $ORCHD_TOKEN_FILE" >&2
+  echo "create an orchd Forgejo token and store it there before installing the service." >&2
   exit 1
 fi
 
