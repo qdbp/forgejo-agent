@@ -14,3 +14,6 @@
 - Include commit refs, verification summary, and residual risk in the final response.
 - Keep issue workflow current: transition to `state/review` on success, or `state/blocked` with a terse unblock comment when stopped by blockers.
 - Keep issue comments terse and natural-language (no rigid field templates).
+
+When impl is complete, good etiquette is to scan for any recent tickets that might be related
+and to leave mentions where they provide value or context.
