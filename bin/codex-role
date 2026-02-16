@@ -23,15 +23,15 @@ esac
 
 token_dir="${CODEX_ROLE_TOKEN_DIR:-$HOME/.config/forgejo-agent/creds}"
 role_token="${token_dir}/codex-${role}.token"
-fallback_token="${HOME}/.config/forgejo-agent/token"
+explicit_token="${CODEX_ROLE_TOKEN_FILE:-}"
 
-if [[ -r "$role_token" ]]; then
+if [[ -n "$explicit_token" ]]; then
+  token_file="$explicit_token"
+elif [[ -r "$role_token" ]]; then
   token_file="$role_token"
-elif [[ -r "$fallback_token" ]]; then
-  token_file="$fallback_token"
 else
   printf 'error: no readable token file for role %s\n' "$role" >&2
-  printf 'checked: %s and %s\n' "$role_token" "$fallback_token" >&2
+  printf 'checked: %s\n' "$role_token" >&2
   exit 1
 fi
 

@@ -48,7 +48,9 @@ Do this once per installation, not per repo:
 - `codex-lead` (non-admin user)
 - `codex-dev` (non-admin user)
 2. Store token files under `~/.config/forgejo-agent/creds/`.
-3. Ensure orchd dispatch config has role blocks and role cards:
+3. Ensure every configured role has a dedicated token file; do not point role
+   entries at `~/.config/forgejo-agent/token` (owner fallback token).
+4. Ensure orchd dispatch config has role blocks and role cards:
 - `config/orchd-dispatch.toml`
 - `prompts/roles/*.md`
 
