@@ -20,7 +20,8 @@ use forgejo_agent::types::{ApiIssue, IssueRef, RepoRef};
 use super::cli::{DispatchBackend, DispatchMode};
 use super::db;
 use super::dispatch_config::{
-    DispatchConfig, DispatchDirectiveConfig, DispatchPromptEnvelopeConfig, DispatchRoleConfig,
+    DispatchConfig, DispatchDirectiveConfig, DispatchPromptEnvelopeConfig, DispatchRankAclConfig,
+    DispatchRoleConfig,
 };
 use super::errors::DispatchError;
 use super::forgejoctl_cmd;
@@ -271,6 +272,7 @@ fn render_prompt(template: &str, values: &[(&str, &str)]) -> Result<String, Disp
 
 fn render_fresh_preamble(
     prompt_envelopes: &DispatchPromptEnvelopeConfig,
+    rank_acl: &DispatchRankAclConfig,
     role_name: &str,
 ) -> Result<String, DispatchError> {
     let preamble_template = fs::read_to_string(&prompt_envelopes.preamble_file).map_err(|err| {
@@ -287,7 +289,12 @@ fn render_fresh_preamble(
             role_name
         ))
     })?;
-    render_prompt(&preamble_template, &[("role_card_md", &role_card_md)])
+    let acl_summary_md = rank_acl.acl_summary_markdown(role_name);
+    let role_card_with_acl_md = format!("{role_card_md}\n\n{acl_summary_md}");
+    render_prompt(
+        &preamble_template,
+        &[("role_card_md", &role_card_with_acl_md)],
+    )
 }
 
 fn render_prompt_file(
@@ -562,7 +569,7 @@ async fn plan_dispatch(
         .to_ascii_lowercase();
     let self_directive =
         decision.reason_code == "explicit_directive" && !actor.is_empty() && actor == role_name;
-    let bypass_allowlist = decision.reason_code == "assignee_reply" || self_directive;
+    let bypass_allowlist = self_directive || dispatch_config.rank_acl.has_role_policy(&actor);
     let policy_decision = if bypass_allowlist
         || dispatch_config
             .allowed_actors
@@ -576,6 +583,10 @@ async fn plan_dispatch(
     if policy_decision.outcome != DispatchPolicyOutcome::Allow {
         return Err(DispatchError::ActorNotAllowed(actor));
     }
+    dispatch_config
+        .rank_acl
+        .assert_actor_can_dispatch(&actor, &role_name, directive_name)
+        .map_err(|err| DispatchError::RankAclDenied(err.to_string()))?;
 
     let issue_number = record
         .issue_number
@@ -590,7 +601,7 @@ async fn plan_dispatch(
         delivery_id: record.delivery_id.clone(),
         parent_dispatch_id: None,
         created_at: Utc::now(),
-        policy_snapshot: Some("cp2".to_string()),
+        policy_snapshot: Some("cp3-rank-acl-v1".to_string()),
     };
 
     let repo_binding = dispatch_config.repo_bindings.get(&intent.repo_full_name);
@@ -823,7 +834,11 @@ fn materialize_run_artifacts(
     };
 
     let preamble_md = if prompt_mode == "fresh" {
-        render_fresh_preamble(&dispatch_config.prompt_envelopes, &plan.intent.role)?
+        render_fresh_preamble(
+            &dispatch_config.prompt_envelopes,
+            &dispatch_config.rank_acl,
+            &plan.intent.role,
+        )?
     } else {
         String::new()
     };

@@ -10,6 +10,8 @@ pub(super) enum DispatchError {
     DirectiveNotConfigured(String),
     #[error("role not configured: {0}")]
     RoleNotConfigured(String),
+    #[error("rank acl denied dispatch: {0}")]
+    RankAclDenied(String),
     #[error("repo workspace binding is required for impl dispatch: {0}")]
     RepoBindingMissing(String),
     #[error(
@@ -41,6 +43,7 @@ impl DispatchError {
             Self::ActorNotAllowed(_) => "actor_not_allowed",
             Self::DirectiveNotConfigured(_) => "directive_not_configured",
             Self::RoleNotConfigured(_) => "role_not_configured",
+            Self::RankAclDenied(_) => "rank_acl_denied",
             Self::RepoBindingMissing(_) => "repo_binding_missing",
             Self::IssueDispatchInFlight { .. } => "issue_dispatch_in_flight",
             Self::InvalidIssueRef(_) => "invalid_issue_ref",
@@ -59,6 +62,7 @@ pub(super) const fn runtime_state_for_dispatch_error(error: &DispatchError) -> O
         DispatchError::ActorNotAllowed(_)
         | DispatchError::DirectiveNotConfigured(_)
         | DispatchError::RoleNotConfigured(_)
+        | DispatchError::RankAclDenied(_)
         | DispatchError::RepoBindingMissing(_)
         | DispatchError::InvalidIssueRef(_) => OrchdRuntimeState::Blocked,
         DispatchError::PromptTemplate(_)

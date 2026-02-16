@@ -1,4 +1,5 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -8,7 +9,10 @@ use serde::Deserialize;
 use forgejo_agent::orchd_dispatch_core::DispatchNotificationPhase;
 use forgejo_agent::types::RepoRef;
 
-use super::lexicon::{DIRECTIVE_REPLY, EVENT_ISSUE_COMMENT, EVENT_ISSUES, directive_is_known};
+use super::lexicon::{
+    DIRECTIVE_DESIGN, DIRECTIVE_IMPL, DIRECTIVE_INVESTIGATE, DIRECTIVE_POKE, DIRECTIVE_REPLY,
+    EVENT_ISSUE_COMMENT, EVENT_ISSUES, directive_is_known,
+};
 use super::paths::expand_tilde_path;
 
 #[derive(Clone, Debug)]
@@ -16,6 +20,7 @@ pub(super) struct DispatchConfig {
     pub(super) allowed_actors: Vec<String>,
     pub(super) prompt_envelopes: DispatchPromptEnvelopeConfig,
     pub(super) notifications: DispatchNotificationsConfig,
+    pub(super) rank_acl: DispatchRankAclConfig,
     pub(super) roles: HashMap<String, DispatchRoleConfig>,
     pub(super) control_plane: Option<DispatchControlPlaneConfig>,
     pub(super) directives: HashMap<String, DispatchDirectiveConfig>,
@@ -79,6 +84,122 @@ pub(super) struct DispatchRepoBindingConfig {
     pub(super) local_path: PathBuf,
     pub(super) git_remote: String,
     pub(super) git_base: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(super) struct DispatchRank(u8);
+
+impl DispatchRank {
+    fn parse(raw: &str) -> Result<Self> {
+        let normalized = raw
+            .trim()
+            .trim_matches(|ch: char| [',', ';', ':', '.'].contains(&ch))
+            .to_ascii_uppercase();
+        let Some(digits) = normalized.strip_prefix("OF-") else {
+            return Err(anyhow!(
+                "expected officer rank in format OF-<n>, got '{raw}'"
+            ));
+        };
+        let value: u8 = digits
+            .parse()
+            .with_context(|| format!("invalid officer rank digits in '{raw}'"))?;
+        Ok(Self(value))
+    }
+}
+
+impl fmt::Display for DispatchRank {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "OF-{}", self.0)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct DispatchRankAclRolePolicy {
+    pub(super) rank: DispatchRank,
+    pub(super) directives: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct DispatchRankAclConfig {
+    pub(super) enabled: bool,
+    rank_directives: BTreeMap<DispatchRank, BTreeSet<String>>,
+    role_policies: BTreeMap<String, DispatchRankAclRolePolicy>,
+}
+
+impl DispatchRankAclConfig {
+    pub(super) fn has_role_policy(&self, role_name: &str) -> bool {
+        let role_name = role_name.trim().to_ascii_lowercase();
+        self.role_policies.contains_key(role_name.as_str())
+    }
+
+    pub(super) fn assert_actor_can_dispatch(
+        &self,
+        actor_login: &str,
+        target_role: &str,
+        directive: &str,
+    ) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        let actor_login = actor_login.trim().to_ascii_lowercase();
+        let target_role = target_role.trim().to_ascii_lowercase();
+        let directive = directive.trim().to_ascii_lowercase();
+
+        let actor_policy = self
+            .role_policies
+            .get(actor_login.as_str())
+            .ok_or_else(|| anyhow!("actor '{actor_login}' has no rank ACL policy"))?;
+        let target_policy = self
+            .role_policies
+            .get(target_role.as_str())
+            .ok_or_else(|| anyhow!("target role '{target_role}' has no rank ACL policy"))?;
+
+        if actor_policy.rank < target_policy.rank {
+            return Err(anyhow!(
+                "actor '{actor_login}' rank {} cannot dispatch to higher-rank role '{target_role}' ({})",
+                actor_policy.rank,
+                target_policy.rank
+            ));
+        }
+        if !actor_policy.directives.contains(directive.as_str()) {
+            return Err(anyhow!(
+                "actor '{actor_login}' rank {} is not permitted directive '{directive}'",
+                actor_policy.rank
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn acl_summary_markdown(&self, role_name: &str) -> String {
+        if !self.enabled {
+            return "## Rank ACL Envelope\n- disabled".to_string();
+        }
+
+        let mut lines = vec!["## Rank ACL Envelope (Directive Scope v1)".to_string()];
+        for (rank, directives) in &self.rank_directives {
+            let directive_list = directives.iter().cloned().collect::<Vec<_>>().join(", ");
+            lines.push(format!("- rank {rank}: {directive_list}"));
+        }
+
+        let role_name = role_name.trim().to_ascii_lowercase();
+        if let Some(policy) = self.role_policies.get(role_name.as_str()) {
+            let directives = policy
+                .directives
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push(format!(
+                "- effective for {role_name} ({rank}): {directives}",
+                rank = policy.rank
+            ));
+        } else {
+            lines.push(format!("- effective for {role_name}: unavailable"));
+        }
+
+        lines.join("\n")
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -187,6 +308,8 @@ struct DispatchConfigFile {
     prompt_envelopes: DispatchPromptEnvelopeConfigFile,
     #[serde(default)]
     notifications: DispatchNotificationsConfigFile,
+    #[serde(default)]
+    rank_acl: DispatchRankAclConfigFile,
     roles: HashMap<String, DispatchRoleConfigFile>,
     #[serde(default)]
     control_plane: Option<DispatchControlPlaneConfigFile>,
@@ -339,6 +462,41 @@ struct DispatchTriggerActionConfigFile {
     reason_code: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DispatchRankAclConfigFile {
+    #[serde(default = "default_rank_acl_enabled")]
+    enabled: bool,
+    #[serde(default)]
+    ranks: HashMap<String, DispatchRankAclRankConfigFile>,
+    #[serde(default)]
+    role_overrides: HashMap<String, DispatchRankAclRoleOverrideConfigFile>,
+}
+
+impl Default for DispatchRankAclConfigFile {
+    fn default() -> Self {
+        Self {
+            enabled: default_rank_acl_enabled(),
+            ranks: HashMap::new(),
+            role_overrides: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DispatchRankAclRankConfigFile {
+    #[serde(default)]
+    directives: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DispatchRankAclRoleOverrideConfigFile {
+    #[serde(default)]
+    directives: Vec<String>,
+}
+
 fn default_codex_bin() -> String {
     "/home/main/forgejo-agent/bin/codex-role".to_string()
 }
@@ -435,6 +593,218 @@ const fn default_trigger_deny_self_loop() -> bool {
     true
 }
 
+const fn default_rank_acl_enabled() -> bool {
+    true
+}
+
+fn default_rank_directives() -> BTreeMap<DispatchRank, BTreeSet<String>> {
+    let mut policies = BTreeMap::new();
+    let all_directives = [
+        DIRECTIVE_DESIGN,
+        DIRECTIVE_INVESTIGATE,
+        DIRECTIVE_IMPL,
+        DIRECTIVE_REPLY,
+        DIRECTIVE_POKE,
+    ];
+    let all_directives = all_directives
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect::<BTreeSet<_>>();
+    policies.insert(DispatchRank(10), all_directives.clone());
+    policies.insert(DispatchRank(8), all_directives.clone());
+    policies.insert(DispatchRank(6), all_directives);
+    policies.insert(
+        DispatchRank(2),
+        [DIRECTIVE_IMPL, DIRECTIVE_REPLY, DIRECTIVE_POKE]
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect(),
+    );
+    policies
+}
+
+fn parse_acl_directive_set(
+    config_path: &Path,
+    source: &str,
+    directives: Vec<String>,
+) -> Result<BTreeSet<String>> {
+    directives
+        .into_iter()
+        .map(|directive| {
+            let directive = directive.trim().to_ascii_lowercase();
+            if directive.is_empty() {
+                return Err(anyhow!(
+                    "dispatch config {} {} includes empty directive",
+                    config_path.display(),
+                    source
+                ));
+            }
+            if !directive_is_known(directive.as_str()) {
+                return Err(anyhow!(
+                    "dispatch config {} {} references unknown directive '{}'",
+                    config_path.display(),
+                    source,
+                    directive
+                ));
+            }
+            Ok(directive)
+        })
+        .collect()
+}
+
+fn parse_role_card_rank(role_card_md: &str) -> Option<DispatchRank> {
+    role_card_md.lines().find_map(|line| {
+        let line = line.trim();
+        let line = line
+            .strip_prefix('-')
+            .or_else(|| line.strip_prefix('*'))
+            .map(str::trim_start)?;
+        let token = line.split_whitespace().next()?;
+        DispatchRank::parse(token).ok()
+    })
+}
+
+fn read_role_card_rank(
+    config_path: &Path,
+    prompt_envelopes: &DispatchPromptEnvelopeConfig,
+    role_name: &str,
+) -> Result<DispatchRank> {
+    let role_card_file = prompt_envelopes.role_card_file_for(role_name);
+    if !role_card_file.is_file() {
+        return Err(anyhow!(
+            "dispatch config {} missing role card for role {} at {}",
+            config_path.display(),
+            role_name,
+            role_card_file.display()
+        ));
+    }
+    let role_card_md = fs::read_to_string(&role_card_file).with_context(|| {
+        format!(
+            "failed reading role card {} for role {}",
+            role_card_file.display(),
+            role_name
+        )
+    })?;
+    parse_role_card_rank(&role_card_md).ok_or_else(|| {
+        anyhow!(
+            "dispatch config {} role card for role {} is missing rank bullet '- OF-<n>' at {}",
+            config_path.display(),
+            role_name,
+            role_card_file.display()
+        )
+    })
+}
+
+fn compile_rank_acl_config(
+    config_path: &Path,
+    raw: DispatchRankAclConfigFile,
+    prompt_envelopes: &DispatchPromptEnvelopeConfig,
+    roles: &HashMap<String, DispatchRoleConfig>,
+    allowed_actors: &[String],
+) -> Result<DispatchRankAclConfig> {
+    if !raw.enabled {
+        return Ok(DispatchRankAclConfig {
+            enabled: false,
+            rank_directives: BTreeMap::new(),
+            role_policies: BTreeMap::new(),
+        });
+    }
+
+    let mut rank_directives = default_rank_directives();
+    for (raw_rank, rank_policy) in raw.ranks {
+        let rank = DispatchRank::parse(raw_rank.as_str()).with_context(|| {
+            format!(
+                "dispatch config {} rank_acl has invalid rank key '{}'",
+                config_path.display(),
+                raw_rank
+            )
+        })?;
+        let source = format!("rank_acl.ranks.{}.directives", rank);
+        let directives = parse_acl_directive_set(config_path, &source, rank_policy.directives)?;
+        rank_directives.insert(rank, directives);
+    }
+
+    let mut role_overrides: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (raw_role, role_policy) in raw.role_overrides {
+        let role_name = raw_role.trim().to_ascii_lowercase();
+        if role_name.is_empty() {
+            return Err(anyhow!(
+                "dispatch config {} rank_acl has empty role override key",
+                config_path.display()
+            ));
+        }
+        if role_overrides.contains_key(role_name.as_str()) {
+            return Err(anyhow!(
+                "dispatch config {} rank_acl has duplicate role override '{}'",
+                config_path.display(),
+                role_name
+            ));
+        }
+        let source = format!("rank_acl.role_overrides.{}.directives", role_name);
+        let directives = parse_acl_directive_set(config_path, &source, role_policy.directives)?;
+        role_overrides.insert(role_name, directives);
+    }
+
+    let mut policy_roles: BTreeSet<String> = roles.keys().cloned().collect();
+    policy_roles.extend(
+        allowed_actors
+            .iter()
+            .map(|actor| actor.trim().to_ascii_lowercase())
+            .filter(|actor| !actor.is_empty()),
+    );
+    policy_roles.extend(role_overrides.keys().cloned());
+
+    let mut role_policies = BTreeMap::new();
+    for role_name in policy_roles {
+        let rank = read_role_card_rank(config_path, prompt_envelopes, role_name.as_str())?;
+        let rank_directives_for_role = rank_directives.get(&rank).ok_or_else(|| {
+            anyhow!(
+                "dispatch config {} rank_acl is missing directives for rank {} (role '{}')",
+                config_path.display(),
+                rank,
+                role_name
+            )
+        })?;
+
+        let directives = if let Some(override_directives) = role_overrides.get(role_name.as_str()) {
+            let widened = override_directives
+                .difference(rank_directives_for_role)
+                .cloned()
+                .collect::<Vec<_>>();
+            if !widened.is_empty() {
+                return Err(anyhow!(
+                    "dispatch config {} rank_acl.role_overrides.{} widens rank {} envelope with directives: {}",
+                    config_path.display(),
+                    role_name,
+                    rank,
+                    widened.join(", ")
+                ));
+            }
+            override_directives.clone()
+        } else {
+            rank_directives_for_role.clone()
+        };
+
+        role_policies.insert(role_name, DispatchRankAclRolePolicy { rank, directives });
+    }
+
+    for role_name in roles.keys() {
+        if !role_policies.contains_key(role_name.as_str()) {
+            return Err(anyhow!(
+                "dispatch config {} rank_acl is missing policy for configured role '{}'",
+                config_path.display(),
+                role_name
+            ));
+        }
+    }
+
+    Ok(DispatchRankAclConfig {
+        enabled: true,
+        rank_directives,
+        role_policies,
+    })
+}
+
 pub(super) fn legacy_trigger_pack() -> Vec<DispatchTriggerConfig> {
     vec![
         DispatchTriggerConfig {
@@ -525,6 +895,19 @@ pub(super) fn load_dispatch_config(path: &Path) -> Result<DispatchConfig> {
         .map(PathBuf::from)
         .ok_or_else(|| anyhow!("dispatch config has no parent: {}", path.display()))?;
 
+    let allowed_actors = raw
+        .allowed_actors
+        .into_iter()
+        .map(|actor| actor.trim().to_ascii_lowercase())
+        .filter(|actor| !actor.is_empty())
+        .collect::<Vec<_>>();
+    if allowed_actors.is_empty() {
+        return Err(anyhow!(
+            "dispatch config {} has empty allowed_actors",
+            path.display()
+        ));
+    }
+
     let mut roles = HashMap::new();
     for (role_name, role) in raw.roles {
         let role_name = role_name.to_ascii_lowercase();
@@ -582,16 +965,17 @@ pub(super) fn load_dispatch_config(path: &Path) -> Result<DispatchConfig> {
     let mut role_names: Vec<_> = roles.keys().cloned().collect();
     role_names.sort();
     for role_name in role_names {
-        let role_card_file = prompt_envelopes.role_card_file_for(&role_name);
-        if !role_card_file.is_file() {
-            return Err(anyhow!(
-                "dispatch config {} missing role card for role {} at {}",
-                path.display(),
-                role_name,
-                role_card_file.display()
-            ));
-        }
+        let _ = read_role_card_rank(path, &prompt_envelopes, role_name.as_str())?;
     }
+
+    let rank_acl = compile_rank_acl_config(
+        path,
+        raw.rank_acl,
+        &prompt_envelopes,
+        &roles,
+        &allowed_actors,
+    )?;
+
     let mut repo_bindings = HashMap::new();
     for binding in raw.repo_bindings {
         let repo = RepoRef::parse(&binding.repo)
@@ -657,11 +1041,7 @@ pub(super) fn load_dispatch_config(path: &Path) -> Result<DispatchConfig> {
     }
 
     Ok(DispatchConfig {
-        allowed_actors: raw
-            .allowed_actors
-            .into_iter()
-            .map(|actor| actor.to_ascii_lowercase())
-            .collect(),
+        allowed_actors,
         prompt_envelopes,
         notifications: DispatchNotificationsConfig {
             enabled: raw.notifications.enabled,
@@ -671,6 +1051,7 @@ pub(super) fn load_dispatch_config(path: &Path) -> Result<DispatchConfig> {
             watch_login: raw.notifications.watch_login.to_ascii_lowercase(),
             notify_send_bin: resolve_config_path(&base_dir, &raw.notifications.notify_send_bin)?,
         },
+        rank_acl,
         roles,
         control_plane,
         directives,
@@ -978,7 +1359,11 @@ prompt_file = "{design_prompt}"
         let prompts_dir = root.join("prompts");
         let roles_dir = prompts_dir.join("roles");
         fs::create_dir_all(&roles_dir)?;
-        fs::write(roles_dir.join("codex-orch.md"), "# codex-orch role card\n")?;
+        fs::write(
+            roles_dir.join("codex-orch.md"),
+            "# codex-orch role card\n\n- OF-8\n",
+        )?;
+        fs::write(roles_dir.join("main.md"), "# main role card\n\n- OF-10\n")?;
 
         let config_toml = format!(
             r#"version = 1
@@ -1012,6 +1397,12 @@ prompt_file = "{reply_prompt}"
 
         let config = load_dispatch_config(&config_path)?;
         assert!(config.roles.contains_key("codex-orch"));
+        assert!(
+            config
+                .rank_acl
+                .assert_actor_can_dispatch("main", "codex-orch", "design")
+                .is_ok()
+        );
         assert!(!config.triggers.is_empty());
         Ok(())
     }
@@ -1024,7 +1415,8 @@ prompt_file = "{reply_prompt}"
         let prompts_dir = root.join("prompts");
         let roles_dir = prompts_dir.join("roles");
         fs::create_dir_all(&roles_dir)?;
-        fs::write(roles_dir.join("codex-orch.md"), "# role\n")?;
+        fs::write(roles_dir.join("codex-orch.md"), "# role\n\n- OF-8\n")?;
+        fs::write(roles_dir.join("main.md"), "# main role\n\n- OF-10\n")?;
 
         let config_toml = format!(
             r#"version = 1
@@ -1064,6 +1456,59 @@ target_role = "codex-orch"
         assert!(
             err.to_string()
                 .contains("trigger 'bad' references unknown directive 'debrief'")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn load_dispatch_config_rejects_rank_override_widening_rank_envelope() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path();
+        let config_path = root.join("dispatch.toml");
+        let prompts_dir = root.join("prompts");
+        let roles_dir = prompts_dir.join("roles");
+        fs::create_dir_all(&roles_dir)?;
+        fs::write(
+            roles_dir.join("codex-orch.md"),
+            "# codex-orch role card\n\n- OF-8\n",
+        )?;
+        fs::write(roles_dir.join("main.md"), "# main role card\n\n- OF-10\n")?;
+
+        let config_toml = format!(
+            r#"version = 1
+allowed_actors = ["main"]
+legacy_triggers = false
+
+[prompt_envelopes]
+preamble_file = "{preamble}"
+fresh_envelope = "{fresh}"
+followup_envelope = "{followup}"
+
+[roles.codex-orch]
+token_file = "{token}"
+
+[rank_acl.ranks."OF-8"]
+directives = ["reply"]
+
+[rank_acl.role_overrides.codex-orch]
+directives = ["reply", "impl"]
+
+[directives.reply]
+role = "codex-orch"
+prompt_file = "{reply_prompt}"
+"#,
+            preamble = prompts_dir.join("orchd-preamble.md").display(),
+            fresh = prompts_dir.join("orchd-envelope-fresh.md").display(),
+            followup = prompts_dir.join("orchd-envelope-followup.md").display(),
+            token = root.join("token.txt").display(),
+            reply_prompt = prompts_dir.join("orchd-poke.md").display(),
+        );
+        fs::write(&config_path, config_toml)?;
+
+        let err = load_dispatch_config(&config_path).expect_err("config should fail");
+        assert!(
+            err.to_string()
+                .contains("rank_acl.role_overrides.codex-orch widens rank OF-8 envelope")
         );
         Ok(())
     }

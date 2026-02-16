@@ -15,6 +15,21 @@ token_file = "/home/main/.config/forgejo-agent/creds/codex-lead.token"
 [control_plane]
 token_file = "/home/main/.config/forgejo-agent/creds/orchd.token"
 
+[rank_acl]
+enabled = true
+
+[rank_acl.ranks."OF-10"]
+directives = ["design", "investigate", "impl", "reply", "poke"]
+
+[rank_acl.ranks."OF-8"]
+directives = ["design", "investigate", "impl", "reply", "poke"]
+
+[rank_acl.ranks."OF-6"]
+directives = ["design", "investigate", "impl", "reply", "poke"]
+
+[rank_acl.ranks."OF-2"]
+directives = ["impl", "reply", "poke"]
+
 [[repo_bindings]]
 repo = "main/forgejo-agent"
 local_path = "/home/main/forgejo-agent"
