@@ -10,6 +10,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use portpicker::pick_unused_port;
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 use serial_test::serial;
 use tempfile::TempDir;
@@ -718,6 +719,39 @@ fn ensure_contains(haystack: &str, needle: &str, context: &str) -> Result<()> {
     bail!("expected '{needle}' in {context}: {haystack}");
 }
 
+fn orchd_dispatch_count(db_path: &Path) -> Result<i64> {
+    let conn = Connection::open(db_path)
+        .with_context(|| format!("failed opening orchd db: {}", db_path.display()))?;
+    conn.query_row("SELECT COUNT(1) FROM dispatches", [], |row| row.get(0))
+        .with_context(|| format!("failed counting dispatches in {}", db_path.display()))
+}
+
+fn orchd_latest_dispatch_directive_and_role(
+    db_path: &Path,
+    repo_full_name: &str,
+    issue_number: u64,
+) -> Result<Option<(String, String)>> {
+    let conn = Connection::open(db_path)
+        .with_context(|| format!("failed opening orchd db: {}", db_path.display()))?;
+    let issue_number = i64::try_from(issue_number)
+        .with_context(|| format!("issue_number overflowed i64: {issue_number}"))?;
+    conn.query_row(
+        "SELECT directive, target_role \
+         FROM dispatches \
+         WHERE repo_full_name = ?1 AND issue_number = ?2 \
+         ORDER BY id DESC LIMIT 1",
+        params![repo_full_name, issue_number],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+    .with_context(|| {
+        format!(
+            "failed selecting latest dispatch from {}",
+            db_path.display()
+        )
+    })
+}
+
 #[derive(Debug)]
 struct LiveHarness {
     timer: StepTimer,
@@ -829,6 +863,7 @@ impl LiveHarness {
 #[derive(Debug, Clone, Copy)]
 enum OrchdTestDirective {
     Poke,
+    Reply,
     Impl,
     Pr,
 }
@@ -837,6 +872,7 @@ impl OrchdTestDirective {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Poke => "poke",
+            Self::Reply => "reply",
             Self::Impl => "impl",
             Self::Pr => "pr",
         }
@@ -844,7 +880,7 @@ impl OrchdTestDirective {
 
     const fn prompt_file(self) -> &'static str {
         match self {
-            Self::Poke => "orchd-poke.md",
+            Self::Poke | Self::Reply => "orchd-poke.md",
             Self::Impl => "orchd-impl.md",
             Self::Pr => "orchd-pr.md",
         }
@@ -910,19 +946,19 @@ fn write_orchd_dispatch_toml(path: &Path, inputs: OrchdDispatchTomlInputs<'_>) -
     Ok(())
 }
 
-fn post_orchd_issue_comment_webhook(
+fn post_orchd_issue_comment_webhook_with_issue(
     client: &Client,
     orchd_base_url: &str,
     repo_ref: &str,
-    issue_number: u64,
+    issue_payload: Value,
     actor: &str,
     comment_body: &str,
-) -> Result<()> {
+) -> Result<Value> {
     let delivery_id = format!("itest-webhook-{}", unique_suffix()?);
     let webhook_body = serde_json::json!({
         "action": "created",
         "repository": { "full_name": repo_ref },
-        "issue": { "number": issue_number },
+        "issue": issue_payload,
         "comment": { "body": comment_body, "user": { "login": actor } },
         "sender": { "login": actor },
     });
@@ -936,10 +972,30 @@ fn post_orchd_issue_comment_webhook(
         .send()
         .context("failed POSTing webhook to orchd")?;
     let webhook_status = webhook_resp.status();
+    let body = webhook_resp.text().unwrap_or_default();
     if webhook_status != StatusCode::ACCEPTED && webhook_status != StatusCode::OK {
-        let body = webhook_resp.text().unwrap_or_default();
         bail!("orchd webhook returned {} body={body}", webhook_status);
     }
+    serde_json::from_str(&body)
+        .with_context(|| format!("orchd webhook response was not JSON: {body}"))
+}
+
+fn post_orchd_issue_comment_webhook(
+    client: &Client,
+    orchd_base_url: &str,
+    repo_ref: &str,
+    issue_number: u64,
+    actor: &str,
+    comment_body: &str,
+) -> Result<()> {
+    let _ = post_orchd_issue_comment_webhook_with_issue(
+        client,
+        orchd_base_url,
+        repo_ref,
+        serde_json::json!({ "number": issue_number }),
+        actor,
+        comment_body,
+    )?;
     Ok(())
 }
 
@@ -1372,6 +1428,149 @@ fn live_orchd_local_backend_smoke() -> Result<()> {
         "orchd/state/completed",
         Duration::from_secs(30),
     )?;
+
+    Ok(())
+}
+
+#[test]
+#[serial(live_forgejo)]
+fn live_orchd_reply_autodispatches_to_assignee() -> Result<()> {
+    if !live_tests_enabled() {
+        eprintln!(
+            "skipping live orchd integration test; enable with {}=1",
+            LIVE_TESTS_ENV
+        );
+        return Ok(());
+    }
+
+    let harness = LiveHarness::bootstrap("live_orchd_reply_autodispatches_to_assignee")?;
+
+    let issue_number = harness.create_issue("orchd reply", "issue body", "ready")?;
+
+    let dispatch_cfg_path = harness.fixture.work_path.join("orchd-dispatch-reply.toml");
+    let db_path = harness.fixture.work_path.join("orchd-reply.sqlite");
+    let orchd_stdout = harness.fixture.work_path.join("orchd-reply-stdout.log");
+    let orchd_stderr = harness.fixture.work_path.join("orchd-reply-stderr.log");
+
+    let fake_codex = ensure_fake_codex_bin()?;
+    let forgejoctl = forgejo_agent_bin()?;
+
+    write_orchd_dispatch_toml(
+        &dispatch_cfg_path,
+        OrchdDispatchTomlInputs {
+            // Deliberately *not* the real actor: reply is expected to bypass allowlist.
+            actor: "nobody",
+            forgejo_login: harness.fixture.owner.as_str(),
+            codex_bin: &fake_codex,
+            token_file: &harness.token_path,
+            forgejoctl: &forgejoctl,
+            directives: &[OrchdTestDirective::Reply],
+            timeout_sec: 10,
+        },
+    )?;
+
+    let port = pick_unused_port().ok_or_else(|| anyhow!("failed to pick unused port"))?;
+    let orchd = OrchdTestProcess::spawn(OrchdSpawnInputs {
+        listen_port: port,
+        db_path: &db_path,
+        repo_ref: &harness.repo_ref,
+        dispatch_cfg_path: &dispatch_cfg_path,
+        config_path: &harness.config_path,
+        token_path: &harness.token_path,
+        stdout_path: &orchd_stdout,
+        stderr_path: &orchd_stderr,
+        env: &[],
+    })?;
+
+    if orchd_dispatch_count(&db_path)? != 0 {
+        bail!("expected empty dispatch table at test start");
+    }
+
+    let non_codex = post_orchd_issue_comment_webhook_with_issue(
+        &orchd.client,
+        &orchd.base_url,
+        &harness.repo_ref,
+        serde_json::json!({
+            "number": issue_number,
+            "assignees": [{ "login": harness.fixture.owner.as_str() }],
+        }),
+        "random-human",
+        "hello",
+    )?;
+    if json_str_field(&non_codex, "decision")? != "ignored" {
+        bail!("expected ignored decision for non-codex assignee: {non_codex}");
+    }
+    if orchd_dispatch_count(&db_path)? != 0 {
+        bail!("expected no dispatch for non-codex assignee");
+    }
+
+    let self_comment = post_orchd_issue_comment_webhook_with_issue(
+        &orchd.client,
+        &orchd.base_url,
+        &harness.repo_ref,
+        serde_json::json!({
+            "number": issue_number,
+            "assignees": [{ "login": "codex-orch" }],
+        }),
+        "codex-orch",
+        "hello",
+    )?;
+    if json_str_field(&self_comment, "decision")? != "ignored" {
+        bail!("expected ignored decision for assignee self-comment: {self_comment}");
+    }
+    if orchd_dispatch_count(&db_path)? != 0 {
+        bail!("expected no dispatch for assignee self-comment");
+    }
+
+    let multi = post_orchd_issue_comment_webhook_with_issue(
+        &orchd.client,
+        &orchd.base_url,
+        &harness.repo_ref,
+        serde_json::json!({
+            "number": issue_number,
+            "assignees": [{ "login": "codex-orch" }, { "login": "codex-dev" }],
+        }),
+        "random-human",
+        "hello",
+    )?;
+    if json_str_field(&multi, "decision")? != "ignored" {
+        bail!("expected ignored decision for multi-assignee: {multi}");
+    }
+    if orchd_dispatch_count(&db_path)? != 0 {
+        bail!("expected no dispatch for multi-assignee");
+    }
+
+    let reply = post_orchd_issue_comment_webhook_with_issue(
+        &orchd.client,
+        &orchd.base_url,
+        &harness.repo_ref,
+        serde_json::json!({
+            "number": issue_number,
+            "assignees": [{ "login": "codex-orch" }],
+        }),
+        harness.fixture.owner.as_str(),
+        "please take this",
+    )?;
+    if json_str_field(&reply, "decision")? != "accepted" {
+        bail!("expected accepted decision for assignee reply: {reply}");
+    }
+    if json_str_field(&reply, "reason_code")? != "assignee_reply" {
+        bail!("expected assignee_reply reason for assignee reply: {reply}");
+    }
+
+    let _ = wait_for_issue_label(
+        &harness,
+        issue_number,
+        "orchd/state/completed",
+        Duration::from_secs(30),
+    )?;
+
+    let dispatch =
+        orchd_latest_dispatch_directive_and_role(&db_path, &harness.repo_ref, issue_number)?
+            .ok_or_else(|| anyhow!("expected a dispatch row after reply"))?;
+    if dispatch.0 != "reply" || dispatch.1 != "codex-orch" {
+        bail!("unexpected dispatch directive/role: {:?}", dispatch);
+    }
 
     Ok(())
 }
