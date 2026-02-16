@@ -17,7 +17,7 @@ Current implementation supports two dispatch modes:
 Core behavior:
 
 - accepts webhook events at `POST /webhook`
-- parses directives (`@codex-orch design`, `@codex-orch impl`, `@codex-orch reply`, `@codex poke`)
+- parses directives (`@codex-orch design`, `@codex-orch investigate`, `@codex-orch impl`, `@codex-orch reply`, `@codex poke`)
 - persists `events`, `decisions`, and `dispatches` in sqlite
 - ensures per-repo Forgejo webhooks exist (best-effort) for repos owned by `FORGEJO_DEFAULT_OWNER`
 - ensures per-repo policy labels exist (best-effort) and maintains per-role local checkouts under the orchd state dir
@@ -183,6 +183,7 @@ Expected in `exec` mode:
 - sqlite `dispatches` row with `status=running` then terminal status
 - completion status is projected to `orchd/state/completed` on success or `orchd/state/failed` otherwise
 - for `impl` directive runs, orchd applies work-plane transitions (`state/review` on success, `state/blocked` on non-success) via `forgejoctl issue transition --force`
+- for non-worktree directives (`design`, `investigate`, `reply`, `poke`), orchd does not auto-transition `state/*` workflow labels
 - generated run artifacts include `prompt.md` and `prompt_mode.txt` (`fresh` or `followup`)
 - follow-up prompts include an issue delta block derived from events newer than the role cursor
 - stale in-flight rows are healed on startup and before launch attempts (status set to `failed_runtime`, reason `stale_dispatch_autohealed`) when the backend handle is no longer live

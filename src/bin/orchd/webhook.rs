@@ -5,8 +5,8 @@ use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
 use super::lexicon::{
-    DECISION_ACCEPTED, DECISION_IGNORED, DIRECTIVE_DESIGN, DIRECTIVE_IMPL, DIRECTIVE_POKE,
-    DIRECTIVE_REPLY, EVENT_ISSUE_COMMENT, EVENT_ISSUES, directive_is_known,
+    DECISION_ACCEPTED, DECISION_IGNORED, DIRECTIVE_DESIGN, DIRECTIVE_IMPL, DIRECTIVE_INVESTIGATE,
+    DIRECTIVE_POKE, DIRECTIVE_REPLY, EVENT_ISSUE_COMMENT, EVENT_ISSUES, directive_is_known,
 };
 use super::paths::expand_tilde_path;
 use super::state::{DecisionRecord, EventContext, ParsedDirective, WebhookPayload};
@@ -216,6 +216,7 @@ fn parse_directive_line(line: &str) -> Option<ParsedDirective> {
     let directive_text = directive_text.to_ascii_lowercase();
     let directive = [
         DIRECTIVE_DESIGN,
+        DIRECTIVE_INVESTIGATE,
         DIRECTIVE_IMPL,
         DIRECTIVE_POKE,
         DIRECTIVE_REPLY,
@@ -251,8 +252,8 @@ pub(super) fn extract_header(headers: &HeaderMap, names: &[&str]) -> Option<Stri
 #[cfg(test)]
 mod tests {
     use crate::orchd::lexicon::{
-        DECISION_ACCEPTED, DECISION_IGNORED, DIRECTIVE_DESIGN, DIRECTIVE_POKE, DIRECTIVE_REPLY,
-        EVENT_ISSUE_COMMENT, EVENT_ISSUES,
+        DECISION_ACCEPTED, DECISION_IGNORED, DIRECTIVE_DESIGN, DIRECTIVE_INVESTIGATE,
+        DIRECTIVE_POKE, DIRECTIVE_REPLY, EVENT_ISSUE_COMMENT, EVENT_ISSUES,
     };
     use crate::orchd::state::EventContext;
 
@@ -326,6 +327,25 @@ mod tests {
             parse_directive("@codex-orch design, open ended").expect("directive should parse");
         assert_eq!(parsed.role, "codex-orch");
         assert_eq!(parsed.directive, DIRECTIVE_DESIGN);
+    }
+
+    #[test]
+    fn investigate_directive_is_accepted() {
+        let context = EventContext {
+            repo_full_name: "main/orchd-debug".to_string(),
+            issue_number: Some(1),
+            actor_login: Some("main".to_string()),
+            text: Some("@codex-orch investigate".to_string()),
+            source_comment_id: None,
+            source_created_at: None,
+            assignees: Vec::new(),
+        };
+        let decision = decide(EVENT_ISSUE_COMMENT, Some("created"), Some(&context));
+        assert_eq!(decision.decision, DECISION_ACCEPTED);
+        assert_eq!(decision.reason_code, "explicit_directive");
+        assert_eq!(decision.directive.as_deref(), Some(DIRECTIVE_INVESTIGATE));
+        assert_eq!(decision.target_role.as_deref(), Some("codex-orch"));
+        assert!(decision.would_dispatch);
     }
 
     #[test]

@@ -127,7 +127,7 @@ Current mode supports both:
 Core behavior:
 
 - webhook ingest
-- directive parse (`@codex-orch design|impl|poke`, `@codex poke`)
+- directive parse (`@codex-orch design|investigate|impl|reply|poke`, `@codex poke`)
 - sqlite event/decision/dispatch persistence
 - runtime dispatch status projected to `orchd/state/*` labels (`queued|running|blocked|failed|completed`)
 - one active dispatch per issue (duplicates blocked while running)

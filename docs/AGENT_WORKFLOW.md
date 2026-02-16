@@ -66,6 +66,7 @@ Start new issues from `templates/issue-template.md`.
 Start a line with one of these shorthands in an issue body/comment:
 
 - `@codex-orch design` (or `codex-orch design`)
+- `@codex-orch investigate` (or `codex-orch investigate`)
 - `@codex-orch impl` (or `codex-orch impl`)
 - `@codex-orch poke` (or `codex-orch poke`)
 
@@ -75,6 +76,7 @@ followed by `,`, `.`, `:`, or `;` (for example `@codex-orch design, open ended`)
 Current semantics:
 
 - `design`: produce high-level design/spec response and drive state toward `spec`.
+- `investigate`: run bounded feasibility/current-state/options discovery in read-only mode; include evidence and concrete next-step guidance without auto-advancing workflow state.
 - `impl`: execute implementation loop and autoland to `main` on success (multiple impl turns may run in parallel; conflicts are handled via follow-up rebase turns).
 - `poke`: conversational “status/next action” response (read-only).
 

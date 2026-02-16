@@ -208,9 +208,10 @@ impl DispatchBackendAdapter for LocalBackendAdapter {
 
 fn codex_sandbox_for_directive(directive: &str) -> &'static str {
     match directive {
-        lexicon::DIRECTIVE_DESIGN | lexicon::DIRECTIVE_REPLY | lexicon::DIRECTIVE_POKE => {
-            "read-only"
-        }
+        lexicon::DIRECTIVE_DESIGN
+        | lexicon::DIRECTIVE_INVESTIGATE
+        | lexicon::DIRECTIVE_REPLY
+        | lexicon::DIRECTIVE_POKE => "read-only",
         _ => "workspace-write",
     }
 }
@@ -1109,5 +1110,11 @@ mod tests {
         let err = super::render_prompt("{{missing_key}}", &[])
             .expect_err("expected unresolved template token error");
         assert!(matches!(err, DispatchError::PromptTemplate(_)));
+    }
+
+    #[test]
+    fn investigate_runs_read_only() {
+        let sandbox = super::codex_sandbox_for_directive(super::lexicon::DIRECTIVE_INVESTIGATE);
+        assert_eq!(sandbox, "read-only");
     }
 }
