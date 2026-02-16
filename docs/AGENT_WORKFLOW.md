@@ -63,12 +63,15 @@ Start new issues from `templates/issue-template.md`.
 
 ## Dispatch shorthands
 
-Use one of these on its own line in an issue body/comment:
+Start a line with one of these shorthands in an issue body/comment:
 
 - `@codex-orch design` (or `codex-orch design`)
 - `@codex-orch impl` (or `codex-orch impl`)
 - `@codex-orch pr` (or `codex-orch pr`)
 - `@codex-orch poke` (or `codex-orch poke`)
+
+You can add suffix text on the same line only when the directive is immediately
+followed by `,`, `.`, `:`, or `;` (for example `@codex-orch design, open ended`).
 
 Current semantics:
 

@@ -5,8 +5,8 @@ use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
 use super::lexicon::{
-    DECISION_ACCEPTED, DECISION_IGNORED, DIRECTIVE_REPLY, EVENT_ISSUE_COMMENT, EVENT_ISSUES,
-    directive_is_known,
+    DECISION_ACCEPTED, DECISION_IGNORED, DIRECTIVE_DESIGN, DIRECTIVE_IMPL, DIRECTIVE_POKE,
+    DIRECTIVE_PR, DIRECTIVE_REPLY, EVENT_ISSUE_COMMENT, EVENT_ISSUES, directive_is_known,
 };
 use super::paths::expand_tilde_path;
 use super::state::{DecisionRecord, EventContext, ParsedDirective, WebhookPayload};
@@ -192,19 +192,17 @@ pub(super) fn parse_directive(text: &str) -> Option<ParsedDirective> {
 }
 
 fn parse_directive_line(line: &str) -> Option<ParsedDirective> {
-    let mut parts = line.split_whitespace();
-    let role_token = parts.next()?;
-    let directive_token = parts.next()?;
-    if parts.next().is_some() {
+    let trimmed = line.trim_start();
+    let role_end = trimmed.find(char::is_whitespace)?;
+    let role_token = &trimmed[..role_end];
+    let directive_text = trimmed[role_end..].trim_start();
+    if directive_text.is_empty() {
         return None;
     }
 
     let role_token = role_token
         .trim_matches(|ch: char| [',', ';', ':'].contains(&ch))
         .trim_start_matches('@')
-        .to_ascii_lowercase();
-    let directive = directive_token
-        .trim_matches(|ch: char| [',', ';', ':', '.'].contains(&ch))
         .to_ascii_lowercase();
 
     let role = if role_token == "codex" {
@@ -215,10 +213,30 @@ fn parse_directive_line(line: &str) -> Option<ParsedDirective> {
         return None;
     };
 
+    let directive_text = directive_text.to_ascii_lowercase();
+    let directive = [
+        DIRECTIVE_DESIGN,
+        DIRECTIVE_IMPL,
+        DIRECTIVE_POKE,
+        DIRECTIVE_PR,
+        DIRECTIVE_REPLY,
+    ]
+    .iter()
+    .find_map(|candidate| {
+        let rest = directive_text.strip_prefix(candidate)?;
+        match rest.chars().next() {
+            None => Some((*candidate).to_string()),
+            Some(ch) if [',', '.', ':', ';'].contains(&ch) => Some((*candidate).to_string()),
+            Some(ch) if ch.is_whitespace() && rest.trim().is_empty() => {
+                Some((*candidate).to_string())
+            }
+            _ => None,
+        }
+    })?;
+
     if !directive_is_known(directive.as_str()) {
         return None;
     }
-
     Some(ParsedDirective { role, directive })
 }
 
@@ -301,6 +319,26 @@ mod tests {
         let parsed = parse_directive("@codex poke").expect("directive should parse");
         assert_eq!(parsed.role, "codex-orch");
         assert_eq!(parsed.directive, DIRECTIVE_POKE);
+    }
+
+    #[test]
+    fn directive_with_comma_suffix_text_parses() {
+        let parsed =
+            parse_directive("@codex-orch design, open ended").expect("directive should parse");
+        assert_eq!(parsed.role, "codex-orch");
+        assert_eq!(parsed.directive, DIRECTIVE_DESIGN);
+    }
+
+    #[test]
+    fn directive_with_unpunctuated_suffix_text_is_rejected() {
+        let parsed = parse_directive("@codex-orch design open ended");
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn directive_followed_by_quote_is_rejected() {
+        let parsed = parse_directive("@codex-orch design\"open ended\"");
+        assert!(parsed.is_none());
     }
 
     #[test]
