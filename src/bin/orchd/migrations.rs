@@ -9,7 +9,7 @@ struct Migration {
     apply: fn(&mut Connection) -> Result<()>,
 }
 
-const LATEST_SCHEMA_VERSION: i64 = 4;
+const LATEST_SCHEMA_VERSION: i64 = 6;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -29,8 +29,18 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 4,
-        name: "add_trigger_dispatch_dedupe_table",
-        apply: migration_0004_add_trigger_dispatch_dedupe_table,
+        name: "add_notification_deliveries_table",
+        apply: migration_0004_add_notification_deliveries_table,
+    },
+    Migration {
+        version: 5,
+        name: "ensure_notification_deliveries_table",
+        apply: migration_0005_ensure_notification_deliveries_table,
+    },
+    Migration {
+        version: 6,
+        name: "ensure_trigger_dispatch_dedupe_table",
+        apply: migration_0006_ensure_trigger_dispatch_dedupe_table,
     },
 ];
 
@@ -317,7 +327,28 @@ fn migration_0003_drop_legacy_tmux_dispatch_columns(conn: &mut Connection) -> Re
     migration_result
 }
 
-fn migration_0004_add_trigger_dispatch_dedupe_table(conn: &mut Connection) -> Result<()> {
+fn migration_0004_add_notification_deliveries_table(conn: &mut Connection) -> Result<()> {
+    migration_0005_ensure_notification_deliveries_table(conn)
+}
+
+fn migration_0005_ensure_notification_deliveries_table(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    tx.execute_batch(
+        r"
+        CREATE TABLE IF NOT EXISTS notification_deliveries (
+            dedupe_key TEXT PRIMARY KEY,
+            category TEXT NOT NULL,
+            sent_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_notification_deliveries_category_sent
+            ON notification_deliveries (category, sent_at DESC);
+        ",
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn migration_0006_ensure_trigger_dispatch_dedupe_table(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     tx.execute_batch(
         r"
@@ -381,6 +412,19 @@ fn foreign_keys_enabled(conn: &Connection) -> Result<bool> {
 }
 
 #[cfg(test)]
+fn table_exists(conn: &Connection, table_name: &str) -> Result<bool> {
+    let exists = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            params![table_name],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    Ok(exists != 0)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -388,6 +432,8 @@ mod tests {
     fn apply_all_creates_latest_schema_on_new_db() {
         let mut conn = Connection::open_in_memory().expect("open in-memory db");
         apply_all(&mut conn).expect("apply all migrations");
+        assert!(table_exists(&conn, "notification_deliveries").expect("table exists"));
+        assert!(table_exists(&conn, "trigger_dispatch_dedupes").expect("table exists"));
         assert!(!table_has_column(&conn, "dispatches", "tmux_session").expect("pragma"));
         assert!(!table_has_column(&conn, "dispatches", "tmux_window").expect("pragma"));
         assert!(table_has_column(&conn, "dispatches", "backend_kind").expect("pragma"));
@@ -465,6 +511,8 @@ mod tests {
 
         apply_all(&mut conn).expect("apply all migrations");
 
+        assert!(table_exists(&conn, "notification_deliveries").expect("table exists"));
+        assert!(table_exists(&conn, "trigger_dispatch_dedupes").expect("table exists"));
         assert!(!table_has_column(&conn, "dispatches", "tmux_session").expect("pragma"));
         assert!(!table_has_column(&conn, "dispatches", "tmux_window").expect("pragma"));
         assert!(table_has_column(&conn, "trigger_dispatch_dedupes", "dedupe_key").expect("pragma"));
@@ -481,6 +529,41 @@ mod tests {
             backend_ref.as_deref(),
             Some("codex-orch:rmain-forgejo-work-i1")
         );
+        assert_eq!(
+            current_schema_version(&conn).expect("schema version query"),
+            LATEST_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn apply_all_upgrades_notification_only_schema_to_include_trigger_dedupes() {
+        let mut conn = Connection::open_in_memory().expect("open in-memory db");
+        conn.execute_batch(
+            r"
+            CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at TEXT NOT NULL
+            );
+            INSERT INTO schema_migrations(version, name, applied_at) VALUES
+                (1, 'bootstrap_core_tables', '2026-01-01T00:00:00Z'),
+                (2, 'add_late_columns', '2026-01-01T00:00:01Z'),
+                (3, 'drop_legacy_tmux_dispatch_columns', '2026-01-01T00:00:02Z'),
+                (4, 'add_notification_deliveries_table', '2026-01-01T00:00:03Z'),
+                (5, 'ensure_notification_deliveries_table', '2026-01-01T00:00:04Z');
+            CREATE TABLE notification_deliveries (
+                dedupe_key TEXT PRIMARY KEY,
+                category TEXT NOT NULL,
+                sent_at TEXT NOT NULL
+            );
+            ",
+        )
+        .expect("seed notification-only schema");
+
+        apply_all(&mut conn).expect("apply all migrations");
+
+        assert!(table_exists(&conn, "notification_deliveries").expect("table exists"));
+        assert!(table_exists(&conn, "trigger_dispatch_dedupes").expect("table exists"));
         assert_eq!(
             current_schema_version(&conn).expect("schema version query"),
             LATEST_SCHEMA_VERSION
