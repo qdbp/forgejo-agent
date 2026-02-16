@@ -23,7 +23,7 @@ use super::db;
 use super::dispatch;
 use super::dispatch_config::load_dispatch_config;
 use super::errors::runtime_state_for_dispatch_error;
-use super::lexicon::{DIRECTIVE_IMPL, EVENT_ISSUE_COMMENT, EVENT_ISSUES};
+use super::lexicon::{EVENT_ISSUE_COMMENT, EVENT_ISSUES};
 use super::notifier;
 use super::paths::expand_tilde_path;
 use super::projection;
@@ -408,97 +408,67 @@ async fn process_webhook(
             match state.dispatch_mode {
                 DispatchMode::DryRun => {}
                 DispatchMode::Exec => {
-                    let defer_impl = match decision.directive.as_deref() {
-                        Some(DIRECTIVE_IMPL) => match db::latest_repo_inflight_impl_dispatch_id(
-                            &state.db_path,
-                            &record.repo_full_name,
-                        ) {
-                            Ok(Some(inflight)) => {
-                                log_line(
-                                    "dispatch_deferred_repo_busy",
-                                    json!({
-                                        "repo": record.repo_full_name,
-                                        "issue_number": issue_number,
-                                        "directive": DIRECTIVE_IMPL,
-                                        "inflight_dispatch_id": inflight,
-                                    }),
-                                );
-                                true
+                    match dispatch::dispatch_issue(
+                        state.clone(),
+                        decision_id,
+                        event_id,
+                        &record,
+                        &decision,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            if let Err(err) = project_post_launch_runtime_state(
+                                state.clone(),
+                                &record.repo_full_name,
+                                issue_number,
+                                dispatch_identity.clone(),
+                            )
+                            .await
+                            {
+                                if status_error.is_none() {
+                                    status_error = Some(err.to_string());
+                                }
+                            } else {
+                                status_projected = true;
                             }
-                            Ok(None) => false,
-                            Err(err) => {
-                                status_error = Some(format!(
-                                    "failed checking repo inflight impl dispatch: {err}"
-                                ));
-                                false
-                            }
-                        },
-                        _ => false,
-                    };
-
-                    if !defer_impl {
-                        match dispatch::dispatch_issue(
-                            state.clone(),
-                            decision_id,
-                            event_id,
-                            &record,
-                            &decision,
-                        )
-                        .await
-                        {
-                            Ok(()) => {
-                                if let Err(err) = project_post_launch_runtime_state(
-                                    state.clone(),
+                            if let Some(role_name) = decision.target_role.as_deref()
+                                && let Err(err) = db::upsert_issue_role_cursor_event_id(
+                                    &state.db_path,
                                     &record.repo_full_name,
                                     issue_number,
-                                    dispatch_identity.clone(),
+                                    role_name,
+                                    event_id,
                                 )
-                                .await
-                                {
-                                    if status_error.is_none() {
-                                        status_error = Some(err.to_string());
-                                    }
-                                } else {
+                                && status_error.is_none()
+                            {
+                                status_error = Some(format!(
+                                    "failed updating issue cursor for role {role_name}: {err}"
+                                ));
+                            }
+                        }
+                        Err(err) => {
+                            let projection = projection::project_issue_runtime_state(
+                                state.clone(),
+                                &record.repo_full_name,
+                                issue_number,
+                                runtime_state_for_dispatch_error(&err),
+                                dispatch_identity.clone(),
+                            )
+                            .await;
+                            match projection {
+                                Ok(()) => {
                                     status_projected = true;
                                 }
-                                if let Some(role_name) = decision.target_role.as_deref()
-                                    && let Err(err) = db::upsert_issue_role_cursor_event_id(
-                                        &state.db_path,
-                                        &record.repo_full_name,
-                                        issue_number,
-                                        role_name,
-                                        event_id,
-                                    )
-                                    && status_error.is_none()
-                                {
-                                    status_error = Some(format!(
-                                        "failed updating issue cursor for role {role_name}: {err}"
-                                    ));
+                                Err(projection_err) => {
+                                    if status_error.is_none() {
+                                        status_error = Some(projection_err.to_string());
+                                    }
                                 }
                             }
-                            Err(err) => {
-                                let projection = projection::project_issue_runtime_state(
-                                    state.clone(),
-                                    &record.repo_full_name,
-                                    issue_number,
-                                    runtime_state_for_dispatch_error(&err),
-                                    dispatch_identity.clone(),
-                                )
-                                .await;
-                                match projection {
-                                    Ok(()) => {
-                                        status_projected = true;
-                                    }
-                                    Err(projection_err) => {
-                                        if status_error.is_none() {
-                                            status_error = Some(projection_err.to_string());
-                                        }
-                                    }
-                                }
-                                if status_error.is_none() {
-                                    status_error =
-                                        Some(format!("dispatch {}: {}", err.reason_code(), err));
-                                }
+                            if status_error.is_none() {
+                                status_error =
+                                    Some(format!("dispatch {}: {}", err.reason_code(), err));
                             }
                         }
                     }
@@ -579,21 +549,6 @@ async fn dispatch_queue_once(state: &AppState) -> Result<()> {
     }
     let items = db::queued_impl_decisions(&state.db_path, 10)?;
     for item in items {
-        let repo_full_name = item.record.repo_full_name.clone();
-        if let Ok(Some(inflight)) =
-            db::latest_repo_inflight_impl_dispatch_id(&state.db_path, &repo_full_name)
-        {
-            log_line(
-                "dispatch_queue_repo_busy",
-                json!({
-                    "repo": repo_full_name,
-                    "decision_id": item.decision_id,
-                    "event_id": item.event_id,
-                    "inflight_dispatch_id": inflight,
-                }),
-            );
-            continue;
-        }
         let issue_number = item
             .record
             .issue_number

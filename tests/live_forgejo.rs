@@ -820,6 +820,26 @@ fn orchd_latest_dispatch_status_reason(
     })
 }
 
+fn orchd_issue_dispatch_statuses(
+    db_path: &Path,
+    repo_full_name: &str,
+    issue_number: u64,
+) -> Result<Vec<String>> {
+    let conn = Connection::open(db_path)
+        .with_context(|| format!("failed opening orchd db: {}", db_path.display()))?;
+    let issue_number = i64::try_from(issue_number)
+        .with_context(|| format!("issue_number overflowed i64: {issue_number}"))?;
+    let mut stmt = conn.prepare(
+        "SELECT status \
+         FROM dispatches \
+         WHERE repo_full_name = ?1 AND issue_number = ?2 \
+         ORDER BY id ASC",
+    )?;
+    let rows = stmt.query_map(params![repo_full_name, issue_number], |row| row.get(0))?;
+    let statuses = rows.collect::<std::result::Result<Vec<String>, _>>()?;
+    Ok(statuses)
+}
+
 fn orchd_starting_dispatch_count(
     db_path: &Path,
     repo_full_name: &str,
@@ -960,7 +980,6 @@ enum OrchdTestDirective {
     Poke,
     Reply,
     Impl,
-    Pr,
 }
 
 impl OrchdTestDirective {
@@ -969,7 +988,6 @@ impl OrchdTestDirective {
             Self::Poke => "poke",
             Self::Reply => "reply",
             Self::Impl => "impl",
-            Self::Pr => "pr",
         }
     }
 
@@ -977,7 +995,6 @@ impl OrchdTestDirective {
         match self {
             Self::Poke | Self::Reply => "orchd-poke.md",
             Self::Impl => "orchd-impl.md",
-            Self::Pr => "orchd-pr.md",
         }
     }
 }
@@ -1923,7 +1940,7 @@ fn live_orchd_impl_autoland_updates_remote_main() -> Result<()> {
 
 #[test]
 #[serial(live_forgejo)]
-fn live_orchd_pr_pushes_branch_and_opens_pr() -> Result<()> {
+fn live_orchd_impl_allows_parallel_dispatches_per_repo() -> Result<()> {
     if !live_tests_enabled() {
         eprintln!(
             "skipping live orchd integration test; enable with {}=1",
@@ -1932,127 +1949,7 @@ fn live_orchd_pr_pushes_branch_and_opens_pr() -> Result<()> {
         return Ok(());
     }
 
-    let harness = LiveHarness::bootstrap("live_orchd_pr_pushes_branch_and_opens_pr")?;
-    let issue_number = harness.create_issue("orchd pr smoke", "issue body", "ready")?;
-
-    let git = GitWorkspace::from_fixture(&harness.fixture, &harness.repo_name)?;
-    let before_main = git.bare_head_main()?;
-
-    let fake_codex = ensure_fake_codex_bin()?;
-    let forgejoctl = forgejo_agent_bin()?;
-
-    let dispatch_cfg_path = harness.fixture.work_path.join("orchd-dispatch-pr.toml");
-    write_orchd_dispatch_toml(
-        &dispatch_cfg_path,
-        OrchdDispatchTomlInputs {
-            actor: harness.fixture.owner.as_str(),
-            forgejo_login: harness.fixture.owner.as_str(),
-            repo_ref: harness.repo_ref.as_str(),
-            principal_workdir: &harness.principal_workdir,
-            codex_bin: &fake_codex,
-            token_file: &harness.token_path,
-            forgejoctl: &forgejoctl,
-            directives: &[OrchdTestDirective::Pr],
-            timeout_sec: 30,
-        },
-    )?;
-
-    let db_path = harness.fixture.work_path.join("orchd-pr.sqlite");
-    let orchd_stdout = harness.fixture.work_path.join("orchd-pr-stdout.log");
-    let orchd_stderr = harness.fixture.work_path.join("orchd-pr-stderr.log");
-    let port = pick_unused_port().ok_or_else(|| anyhow!("failed to pick unused port"))?;
-
-    let orchd = OrchdTestProcess::spawn(OrchdSpawnInputs {
-        listen_port: port,
-        db_path: &db_path,
-        repo_ref: &harness.repo_ref,
-        dispatch_cfg_path: &dispatch_cfg_path,
-        config_path: &harness.config_path,
-        token_path: &harness.token_path,
-        stdout_path: &orchd_stdout,
-        stderr_path: &orchd_stderr,
-        env: &[
-            ("FAKE_CODEX_MODE", "git_append_commit"),
-            ("FAKE_CODEX_GIT_FILE", "orchd-itest.txt"),
-        ],
-    })?;
-
-    post_orchd_issue_comment_webhook(
-        &orchd.client,
-        &orchd.base_url,
-        &harness.repo_ref,
-        issue_number,
-        harness.fixture.owner.as_str(),
-        "@codex-orch pr",
-    )?;
-
-    let _ = wait_for_issue_label(
-        &harness,
-        issue_number,
-        "orchd/state/completed",
-        Duration::from_secs(60),
-    )?;
-
-    let after_main = git.bare_head_main()?;
-    if after_main != before_main {
-        bail!(
-            "expected pr directive to not advance main (before={before_main} after={after_main})"
-        );
-    }
-
-    let pulls = harness.fixture.authed_get(&format!(
-        "/api/v1/repos/{}/{}/pulls?state=open&limit=50",
-        harness.fixture.owner, harness.repo_name
-    ))?;
-    let pulls = pulls
-        .as_array()
-        .ok_or_else(|| anyhow!("pulls list response was not an array"))?;
-    let pr = pulls
-        .iter()
-        .find(|pr| {
-            pr.get("title")
-                .and_then(Value::as_str)
-                .is_some_and(|t| t == "orchd pr smoke")
-        })
-        .ok_or_else(|| anyhow!("expected a PR titled 'orchd pr smoke'"))?;
-
-    let head_ref = pr
-        .get("head")
-        .and_then(Value::as_object)
-        .and_then(|head| head.get("ref"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("PR JSON missing head.ref"))?;
-    let base_ref = pr
-        .get("base")
-        .and_then(Value::as_object)
-        .and_then(|base| base.get("ref"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("PR JSON missing base.ref"))?;
-    if base_ref != "main" {
-        bail!("expected base branch main, got {base_ref}");
-    }
-
-    let _ = git_bare_output_checked(
-        &git.bare_repo,
-        &["show-ref", "--verify", &format!("refs/heads/{head_ref}")],
-        "git --git-dir show-ref --verify refs/heads/<head>",
-    )?;
-
-    Ok(())
-}
-
-#[test]
-#[serial(live_forgejo)]
-fn live_orchd_impl_serializes_queue_per_repo() -> Result<()> {
-    if !live_tests_enabled() {
-        eprintln!(
-            "skipping live orchd integration test; enable with {}=1",
-            LIVE_TESTS_ENV
-        );
-        return Ok(());
-    }
-
-    let harness = LiveHarness::bootstrap("live_orchd_impl_serializes_queue_per_repo")?;
+    let harness = LiveHarness::bootstrap("live_orchd_impl_allows_parallel_dispatches_per_repo")?;
     let issue1 = harness.create_issue("orchd impl a", "issue body", "ready")?;
     let issue2 = harness.create_issue("orchd impl b", "issue body", "ready")?;
 
@@ -2127,29 +2024,34 @@ fn live_orchd_impl_serializes_queue_per_repo() -> Result<()> {
     let _ = wait_for_issue_label(
         &harness,
         issue2,
-        "orchd/state/queued",
+        "orchd/state/running",
         Duration::from_secs(30),
     )?;
 
-    // Ensure issue2 does not start running until issue1 completes.
-    let issue1_deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        let a = harness.get_issue(issue1)?;
-        if issue_has_label(&a, "orchd/state/completed")? {
-            break;
-        }
+    let _ = wait_for_issue_label(
+        &harness,
+        issue1,
+        "orchd/state/completed",
+        Duration::from_secs(90),
+    )?;
 
-        let b = harness.get_issue(issue2)?;
-        if issue_has_label(&b, "orchd/state/running")? {
-            bail!("expected queued impl to not run until prior impl completed");
-        }
+    let _ = wait_for_issue_label(
+        &harness,
+        issue2,
+        "orchd/state/blocked",
+        Duration::from_secs(90),
+    )?;
 
-        if Instant::now() >= issue1_deadline {
-            bail!("timed out waiting for issue1 dispatch to complete");
-        }
-
-        thread::sleep(Duration::from_millis(200));
-    }
+    // Live harness posts synthetic webhooks directly to orchd. In production,
+    // the autoland-conflict retry comment would trigger this follow-up webhook.
+    post_orchd_issue_comment_webhook(
+        &orchd.client,
+        &orchd.base_url,
+        &harness.repo_ref,
+        issue2,
+        harness.fixture.owner.as_str(),
+        "@codex-orch impl",
+    )?;
 
     let _ = wait_for_issue_label(
         &harness,
@@ -2158,10 +2060,26 @@ fn live_orchd_impl_serializes_queue_per_repo() -> Result<()> {
         Duration::from_secs(90),
     )?;
 
+    let issue2_dispatch_statuses =
+        orchd_issue_dispatch_statuses(&db_path, &harness.repo_ref, issue2)?;
+    if !issue2_dispatch_statuses
+        .iter()
+        .any(|status| status == "blocked")
+    {
+        bail!(
+            "expected parallel impl conflict retry path to produce a blocked dispatch before recovery; statuses={issue2_dispatch_statuses:?}"
+        );
+    }
+    if issue2_dispatch_statuses.last().map(String::as_str) != Some("completed") {
+        bail!(
+            "expected final dispatch status for issue2 to be completed; statuses={issue2_dispatch_statuses:?}"
+        );
+    }
+
     let after_count = git.bare_commit_count_main()?;
     if after_count != before_count + 2 {
         bail!(
-            "expected two queued impl runs to autoland two commits ({before_count} -> {after_count})"
+            "expected two parallel impl runs to autoland two commits ({before_count} -> {after_count})"
         );
     }
     let principal_count = stdout_trim(&git_output_checked(

@@ -553,7 +553,9 @@ async fn plan_dispatch(
         .clone()
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let bypass_allowlist = decision.reason_code == "assignee_reply";
+    let self_directive =
+        decision.reason_code == "explicit_directive" && !actor.is_empty() && actor == role_name;
+    let bypass_allowlist = decision.reason_code == "assignee_reply" || self_directive;
     let policy_decision = if bypass_allowlist
         || dispatch_config
             .allowed_actors
@@ -658,13 +660,6 @@ async fn plan_dispatch(
             return Err(DispatchError::IssueDispatchInFlight {
                 repo_full_name: intent.repo_full_name.clone(),
                 issue_number: intent.issue_number,
-                dispatch_id,
-            });
-        }
-        db::DispatchReservation::InFlightRepo(dispatch_id) => {
-            let _ = fs::remove_file(&lock_path);
-            return Err(DispatchError::RepoImplDispatchInFlight {
-                repo_full_name: intent.repo_full_name.clone(),
                 dispatch_id,
             });
         }
@@ -883,6 +878,10 @@ fn materialize_run_artifacts(
         forgejoctl_bin: &dispatch_config.forgejoctl_bin,
         forgejo_config_file: state.forgejo_config_file.as_deref(),
         token_file: &plan.role.token_file,
+        control_token_file: dispatch_config
+            .control_plane
+            .as_ref()
+            .map(|control| control.token_file.as_path()),
         workdir: &plan.workdir,
         principal_workdir: plan.principal_workdir.as_deref(),
         codex_sandbox: codex_sandbox_for_directive(&plan.intent.directive),

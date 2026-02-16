@@ -10,21 +10,16 @@ pub(super) const DECISION_IGNORED: &str = "ignored";
 
 pub(super) const DIRECTIVE_DESIGN: &str = "design";
 pub(super) const DIRECTIVE_IMPL: &str = "impl";
-pub(super) const DIRECTIVE_PR: &str = "pr";
 pub(super) const DIRECTIVE_REPLY: &str = "reply";
 pub(super) const DIRECTIVE_POKE: &str = "poke";
 
 pub(super) fn directive_is_known(directive: &str) -> bool {
     matches!(
         directive,
-        DIRECTIVE_DESIGN | DIRECTIVE_IMPL | DIRECTIVE_PR | DIRECTIVE_REPLY | DIRECTIVE_POKE
+        DIRECTIVE_DESIGN | DIRECTIVE_IMPL | DIRECTIVE_REPLY | DIRECTIVE_POKE
     )
 }
 
-pub(super) fn directive_serializes_repo(directive: &str) -> bool {
-    directive == DIRECTIVE_IMPL
-}
-
 pub(super) fn directive_uses_worktree(directive: &str) -> bool {
-    matches!(directive, DIRECTIVE_IMPL | DIRECTIVE_PR)
+    directive == DIRECTIVE_IMPL
 }

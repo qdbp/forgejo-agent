@@ -13,9 +13,7 @@ use forgejo_agent::orchd_dispatch_core::{
     reduce_dispatch_state,
 };
 
-use super::lexicon::{
-    DIRECTIVE_IMPL, EVENT_ISSUE_COMMENT, EVENT_ISSUES, directive_serializes_repo,
-};
+use super::lexicon::{DIRECTIVE_IMPL, EVENT_ISSUE_COMMENT, EVENT_ISSUES};
 use super::migrations;
 use super::state::{DecisionRecord, EventRecord, IssueEventDeltaRow};
 
@@ -23,7 +21,6 @@ use super::state::{DecisionRecord, EventRecord, IssueEventDeltaRow};
 pub(super) enum DispatchReservation {
     Started(i64),
     InFlightIssue(i64),
-    InFlightRepo(i64),
 }
 
 #[derive(Debug)]
@@ -613,33 +610,6 @@ pub(super) fn reserve_dispatch_starting(
         return Ok(DispatchReservation::InFlightIssue(dispatch_id));
     }
 
-    if directive_serializes_repo(insert.directive) {
-        let repo_inflight = tx
-            .query_row(
-                r"
-                SELECT id
-                FROM dispatches
-                WHERE repo_full_name = ?1
-                  AND directive = ?2
-                  AND status IN (?3, ?4)
-                ORDER BY id DESC
-                LIMIT 1
-                ",
-                params![
-                    insert.repo_full_name,
-                    insert.directive,
-                    starting_status,
-                    running_status
-                ],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?;
-        if let Some(dispatch_id) = repo_inflight {
-            tx.commit()?;
-            return Ok(DispatchReservation::InFlightRepo(dispatch_id));
-        }
-    }
-
     tx.execute(
         r"
         INSERT INTO dispatches
@@ -1048,35 +1018,6 @@ pub(super) fn latest_issue_resume_dispatch(
     Ok(dispatch)
 }
 
-pub(super) fn latest_repo_inflight_impl_dispatch_id(
-    db_path: &Path,
-    repo_full_name: &str,
-) -> Result<Option<i64>> {
-    let conn = open_db(db_path)?;
-    let starting_status = DispatchState::Starting.as_db_str();
-    let running_status = DispatchState::Running.as_db_str();
-    conn.query_row(
-        r"
-        SELECT id
-        FROM dispatches
-        WHERE repo_full_name = ?1
-          AND directive = ?2
-          AND status IN (?3, ?4)
-        ORDER BY id DESC
-        LIMIT 1
-        ",
-        params![
-            repo_full_name,
-            DIRECTIVE_IMPL,
-            starting_status,
-            running_status
-        ],
-        |row| row.get::<_, i64>(0),
-    )
-    .optional()
-    .map_err(Into::into)
-}
-
 pub(super) fn mark_dispatch_failed_runtime(
     db_path: &Path,
     dispatch_id: i64,
@@ -1188,58 +1129,43 @@ pub(super) fn queued_impl_decisions(db_path: &Path, limit: u32) -> Result<Vec<Qu
         JOIN decisions d ON d.id = l.decision_id
         JOIN events e ON e.id = d.event_id
         WHERE NOT EXISTS (SELECT 1 FROM dispatches x WHERE x.decision_id = d.id)
-          AND NOT EXISTS (
-              SELECT 1
-              FROM dispatches inflight
-              WHERE inflight.repo_full_name = d.repo_full_name
-                AND inflight.directive = ?1
-                AND inflight.status IN (?2, ?3)
-          )
         ORDER BY d.id ASC
-        LIMIT ?4
+        LIMIT ?2
         ",
     )?;
     let rows = stmt
-        .query_map(
-            params![
-                DIRECTIVE_IMPL,
-                DispatchState::Starting.as_db_str(),
-                DispatchState::Running.as_db_str(),
-                i64::from(limit)
-            ],
-            |row| {
-                let decision_id: i64 = row.get(0)?;
-                let event_id: i64 = row.get(1)?;
-                let record = EventRecord {
-                    delivery_id: row.get(2)?,
-                    event_type: row.get(3)?,
-                    repo_full_name: row.get(4)?,
-                    issue_number: row
-                        .get::<_, Option<i64>>(5)?
-                        .and_then(|n| u64::try_from(n).ok()),
-                    action: row.get(6)?,
-                    actor_login: row.get(7)?,
-                    event_text: row.get(8)?,
-                    source_comment_id: row.get(9)?,
-                    source_created_at: row.get(10)?,
-                    raw_json: row.get(11)?,
-                };
-                let would_dispatch_int: i64 = row.get(16)?;
-                let decision = DecisionRecord {
-                    decision: row.get(12)?,
-                    reason_code: row.get(13)?,
-                    directive: row.get(14)?,
-                    target_role: row.get(15)?,
-                    would_dispatch: would_dispatch_int != 0,
-                };
-                Ok(QueuedDecision {
-                    decision_id,
-                    event_id,
-                    record,
-                    decision,
-                })
-            },
-        )?
+        .query_map(params![DIRECTIVE_IMPL, i64::from(limit)], |row| {
+            let decision_id: i64 = row.get(0)?;
+            let event_id: i64 = row.get(1)?;
+            let record = EventRecord {
+                delivery_id: row.get(2)?,
+                event_type: row.get(3)?,
+                repo_full_name: row.get(4)?,
+                issue_number: row
+                    .get::<_, Option<i64>>(5)?
+                    .and_then(|n| u64::try_from(n).ok()),
+                action: row.get(6)?,
+                actor_login: row.get(7)?,
+                event_text: row.get(8)?,
+                source_comment_id: row.get(9)?,
+                source_created_at: row.get(10)?,
+                raw_json: row.get(11)?,
+            };
+            let would_dispatch_int: i64 = row.get(16)?;
+            let decision = DecisionRecord {
+                decision: row.get(12)?,
+                reason_code: row.get(13)?,
+                directive: row.get(14)?,
+                target_role: row.get(15)?,
+                would_dispatch: would_dispatch_int != 0,
+            };
+            Ok(QueuedDecision {
+                decision_id,
+                event_id,
+                record,
+                decision,
+            })
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
@@ -1625,8 +1551,7 @@ mod tests {
         let first = reserve_sample_dispatch(&db_path, first_decision_id, 7, DIRECTIVE_POKE);
         let first_id = match first {
             super::DispatchReservation::Started(id) => id,
-            super::DispatchReservation::InFlightIssue(_)
-            | super::DispatchReservation::InFlightRepo(_) => {
+            super::DispatchReservation::InFlightIssue(_) => {
                 panic!("expected first reservation to start")
             }
         };
@@ -1641,39 +1566,6 @@ mod tests {
             super::DispatchReservation::Started(_) => {
                 panic!("expected second reservation to be blocked")
             }
-            super::DispatchReservation::InFlightRepo(_) => {
-                panic!("expected issue-level inflight, not repo-level inflight")
-            }
-        }
-
-        let _ = fs::remove_file(db_path);
-    }
-
-    #[test]
-    fn reserve_dispatch_blocks_second_inflight_impl_for_repo() {
-        let db_path = temp_db_path("dispatch-reserve-repo");
-        super::init_db(&db_path).expect("db init");
-        let first_decision_id = seed_decision_id(&db_path);
-        let second_decision_id = seed_decision_id(&db_path);
-
-        let first = reserve_sample_dispatch(&db_path, first_decision_id, 7, DIRECTIVE_IMPL);
-        let first_id = match first {
-            super::DispatchReservation::Started(id) => id,
-            super::DispatchReservation::InFlightIssue(_)
-            | super::DispatchReservation::InFlightRepo(_) => {
-                panic!("expected first reservation to start")
-            }
-        };
-
-        let second = reserve_sample_dispatch(&db_path, second_decision_id, 8, DIRECTIVE_IMPL);
-        match second {
-            super::DispatchReservation::InFlightRepo(id) => assert_eq!(id, first_id),
-            super::DispatchReservation::Started(_) => {
-                panic!("expected repo-level inflight block")
-            }
-            super::DispatchReservation::InFlightIssue(_) => {
-                panic!("expected repo-level inflight, not issue-level inflight")
-            }
         }
 
         let _ = fs::remove_file(db_path);
@@ -1686,8 +1578,7 @@ mod tests {
         let decision_id = seed_decision_id(&db_path);
         let started_id = match reserve_sample_dispatch(&db_path, decision_id, 9, DIRECTIVE_POKE) {
             super::DispatchReservation::Started(id) => id,
-            super::DispatchReservation::InFlightIssue(_)
-            | super::DispatchReservation::InFlightRepo(_) => {
+            super::DispatchReservation::InFlightIssue(_) => {
                 panic!("expected started dispatch")
             }
         };
@@ -2064,22 +1955,20 @@ mod tests {
     }
 
     #[test]
-    fn queued_impl_decisions_excludes_repos_with_inflight_impl_dispatch() {
-        let db_path = temp_db_path("queued-impl-busy-repo");
+    fn queued_impl_decisions_allows_parallel_repo_dispatches() {
+        let db_path = temp_db_path("queued-impl-parallel-repo");
         super::init_db(&db_path).expect("db init");
 
         let busy_repo = "main/busy-repo";
         let free_repo = "main/free-repo";
 
-        let mut busy_decisions = Vec::new();
-        for issue_number in 1..=12_u64 {
-            busy_decisions.push(seed_impl_decision(&db_path, busy_repo, issue_number));
-        }
-        let free_decision = seed_impl_decision(&db_path, free_repo, 1);
+        let busy_decision_inflight = seed_impl_decision(&db_path, busy_repo, 1);
+        let busy_decision_queued = seed_impl_decision(&db_path, busy_repo, 2);
+        let free_decision_queued = seed_impl_decision(&db_path, free_repo, 1);
 
         let _busy_dispatch = insert_dispatch_row_for_repo(
             &db_path,
-            busy_decisions[0],
+            busy_decision_inflight,
             busy_repo,
             1,
             DispatchState::Running,
@@ -2087,10 +1976,12 @@ mod tests {
         );
 
         let queued = super::queued_impl_decisions(&db_path, 10).expect("query queued decisions");
-        assert_eq!(queued.len(), 1);
-        assert_eq!(queued[0].decision_id, free_decision);
-        assert_eq!(queued[0].record.repo_full_name, free_repo);
-        assert_eq!(queued[0].record.issue_number, Some(1));
+        let queued_ids = queued
+            .iter()
+            .map(|item| item.decision_id)
+            .collect::<Vec<_>>();
+        assert!(queued_ids.contains(&busy_decision_queued));
+        assert!(queued_ids.contains(&free_decision_queued));
 
         let _ = fs::remove_file(db_path);
     }

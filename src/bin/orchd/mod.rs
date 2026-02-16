@@ -46,7 +46,7 @@ mod repo;
 // forgejoctl subprocess wrapper. Read when debugging control-plane side effects (labels/state/comments) from orchd.
 mod forgejoctl_cmd;
 
-// Dispatch finalization (db terminal transitions, landing/autoland/PR). Read when changing completion semantics.
+// Dispatch finalization (db terminal transitions + autoland). Read when changing completion semantics.
 mod finalize;
 
 // Run script generation for codex offline execution + finalize handoff. Read when changing dispatch launch payload.

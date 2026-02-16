@@ -16,6 +16,7 @@ pub(super) struct DispatchConfig {
     pub(super) prompt_envelopes: DispatchPromptEnvelopeConfig,
     pub(super) notifications: DispatchNotificationsConfig,
     pub(super) roles: HashMap<String, DispatchRoleConfig>,
+    pub(super) control_plane: Option<DispatchControlPlaneConfig>,
     pub(super) directives: HashMap<String, DispatchDirectiveConfig>,
     pub(super) repo_bindings: HashMap<String, DispatchRepoBindingConfig>,
     pub(super) forgejoctl_bin: PathBuf,
@@ -56,6 +57,11 @@ pub(super) struct DispatchRoleConfig {
 }
 
 #[derive(Clone, Debug)]
+pub(super) struct DispatchControlPlaneConfig {
+    pub(super) token_file: PathBuf,
+}
+
+#[derive(Clone, Debug)]
 pub(super) struct DispatchDirectiveConfig {
     pub(super) role: String,
     pub(super) prompt_file: PathBuf,
@@ -80,6 +86,8 @@ struct DispatchConfigFile {
     #[serde(default)]
     notifications: DispatchNotificationsConfigFile,
     roles: HashMap<String, DispatchRoleConfigFile>,
+    #[serde(default)]
+    control_plane: Option<DispatchControlPlaneConfigFile>,
     directives: HashMap<String, DispatchDirectiveConfigFile>,
     #[serde(default)]
     repo_bindings: Vec<DispatchRepoBindingConfigFile>,
@@ -145,6 +153,12 @@ struct DispatchRoleConfigFile {
     codex_bin: String,
     codex_role_arg: Option<String>,
     forgejo_login: Option<String>,
+    token_file: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DispatchControlPlaneConfigFile {
     token_file: String,
 }
 
@@ -287,6 +301,15 @@ pub(super) fn load_dispatch_config(path: &Path) -> Result<DispatchConfig> {
         followup_envelope: resolve_config_path(&base_dir, &raw.prompt_envelopes.followup_envelope)?,
     };
 
+    let control_plane = raw
+        .control_plane
+        .map(|control| -> Result<DispatchControlPlaneConfig> {
+            Ok(DispatchControlPlaneConfig {
+                token_file: resolve_config_path(&base_dir, &control.token_file)?,
+            })
+        })
+        .transpose()?;
+
     let mut role_names: Vec<_> = roles.keys().cloned().collect();
     role_names.sort();
     for role_name in role_names {
@@ -355,6 +378,7 @@ pub(super) fn load_dispatch_config(path: &Path) -> Result<DispatchConfig> {
             notify_send_bin: resolve_config_path(&base_dir, &raw.notifications.notify_send_bin)?,
         },
         roles,
+        control_plane,
         directives,
         repo_bindings,
         forgejoctl_bin: resolve_config_path(&base_dir, &raw.forgejoctl_bin)?,

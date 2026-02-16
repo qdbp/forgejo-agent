@@ -67,7 +67,6 @@ Start a line with one of these shorthands in an issue body/comment:
 
 - `@codex-orch design` (or `codex-orch design`)
 - `@codex-orch impl` (or `codex-orch impl`)
-- `@codex-orch pr` (or `codex-orch pr`)
 - `@codex-orch poke` (or `codex-orch poke`)
 
 You can add suffix text on the same line only when the directive is immediately
@@ -76,8 +75,7 @@ followed by `,`, `.`, `:`, or `;` (for example `@codex-orch design, open ended`)
 Current semantics:
 
 - `design`: produce high-level design/spec response and drive state toward `spec`.
-- `impl`: execute implementation loop and autoland to `main` on success.
-- `pr`: execute implementation loop and open a PR on success (no autoland).
+- `impl`: execute implementation loop and autoland to `main` on success (multiple impl turns may run in parallel; conflicts are handled via follow-up rebase turns).
 - `poke`: conversational “status/next action” response (read-only).
 
 ## Traceability

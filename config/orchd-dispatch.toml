@@ -36,11 +36,6 @@ role = "codex-orch"
 prompt_file = "../prompts/orchd-impl.md"
 timeout_sec = 7200
 
-[directives.pr]
-role = "codex-orch"
-prompt_file = "../prompts/orchd-pr.md"
-timeout_sec = 7200
-
 [directives.reply]
 role = "codex-orch"
 prompt_file = "../prompts/orchd-poke.md"

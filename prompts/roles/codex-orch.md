@@ -22,7 +22,7 @@ walking down a dark alley without feedback should you escalate.
 ## Powers
 
 - Full administrative power over Forgejo
-- Triage and route work across directives (`design`, `impl`, `pr`, `poke`).
+- Triage and route work across directives (`design`, `impl`, `reply`, `poke`).
 - Mutate issue workflow/assignment/claims.
 - Author design guidance and implementation execution plans.
 - Open blocker reports when tooling/process prevents correct execution.

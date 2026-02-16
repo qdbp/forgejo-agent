@@ -20,11 +20,6 @@ pub(super) enum DispatchError {
         issue_number: u64,
         dispatch_id: i64,
     },
-    #[error("repo impl dispatch already in flight for {repo_full_name} (dispatch {dispatch_id})")]
-    RepoImplDispatchInFlight {
-        repo_full_name: String,
-        dispatch_id: i64,
-    },
     #[error("invalid issue ref: {0}")]
     InvalidIssueRef(String),
     #[error("prompt template failure: {0}")]
@@ -48,7 +43,6 @@ impl DispatchError {
             Self::RoleNotConfigured(_) => "role_not_configured",
             Self::RepoBindingMissing(_) => "repo_binding_missing",
             Self::IssueDispatchInFlight { .. } => "issue_dispatch_in_flight",
-            Self::RepoImplDispatchInFlight { .. } => "repo_impl_dispatch_in_flight",
             Self::InvalidIssueRef(_) => "invalid_issue_ref",
             Self::PromptTemplate(_) => "prompt_template_error",
             Self::Io(_) => "io_failure",
@@ -62,7 +56,6 @@ impl DispatchError {
 pub(super) const fn runtime_state_for_dispatch_error(error: &DispatchError) -> OrchdRuntimeState {
     match error {
         DispatchError::IssueDispatchInFlight { .. } => OrchdRuntimeState::Running,
-        DispatchError::RepoImplDispatchInFlight { .. } => OrchdRuntimeState::Queued,
         DispatchError::ActorNotAllowed(_)
         | DispatchError::DirectiveNotConfigured(_)
         | DispatchError::RoleNotConfigured(_)

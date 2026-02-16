@@ -17,6 +17,7 @@ pub(super) struct DispatchRunScriptInputs<'a> {
     pub(super) forgejoctl_bin: &'a Path,
     pub(super) forgejo_config_file: Option<&'a Path>,
     pub(super) token_file: &'a Path,
+    pub(super) control_token_file: Option<&'a Path>,
     pub(super) workdir: &'a Path,
     pub(super) principal_workdir: Option<&'a Path>,
     pub(super) codex_sandbox: &'a str,
@@ -40,6 +41,9 @@ fn shell_quote(value: &str) -> String {
 pub(super) fn build_exec_run_script(inputs: &DispatchRunScriptInputs<'_>) -> String {
     let forgejo_config_file = inputs
         .forgejo_config_file
+        .map_or(Cow::Borrowed(""), |path| path.to_string_lossy());
+    let control_token_file = inputs
+        .control_token_file
         .map_or(Cow::Borrowed(""), |path| path.to_string_lossy());
     let principal_workdir = inputs
         .principal_workdir
@@ -65,6 +69,7 @@ ORCHD_BIN={orchd_bin}
 FORGEJOCTL_BIN={forgejoctl_bin}
 FORGEJO_CONFIG_FILE={forgejo_config_file}
 TOKEN_FILE={token_file}
+CONTROL_TOKEN_FILE={control_token_file}
 WORKDIR={workdir}
 PRINCIPAL_WORKDIR={principal_workdir}
 CODEX_SANDBOX={codex_sandbox}
@@ -145,6 +150,12 @@ else
   session_for_finalize=""
 fi
 
+if [[ -n "$CONTROL_TOKEN_FILE" ]]; then
+  FINALIZE_TOKEN_FILE="$CONTROL_TOKEN_FILE"
+else
+  FINALIZE_TOKEN_FILE="$TOKEN_FILE"
+fi
+
 {{
   echo "orchd: dispatch completed id=$DISPATCH_ID status=$status reason=$reason_code"
   echo "directive=$DIRECTIVE role=$ROLE_NAME"
@@ -187,7 +198,7 @@ fi
   --git-base "$GIT_BASE" \
   --git-branch "$GIT_BRANCH" \
   --forgejoctl-bin "$FORGEJOCTL_BIN" \
-  --token-file "$TOKEN_FILE" || true
+  --token-file "$FINALIZE_TOKEN_FILE" || true
 "#,
         dispatch_id = inputs.dispatch_id,
         db_path = shell_quote(&inputs.db_path.to_string_lossy()),
@@ -206,6 +217,7 @@ fi
         forgejoctl_bin = shell_quote(&inputs.forgejoctl_bin.to_string_lossy()),
         forgejo_config_file = shell_quote(forgejo_config_file.as_ref()),
         token_file = shell_quote(&inputs.token_file.to_string_lossy()),
+        control_token_file = shell_quote(control_token_file.as_ref()),
         workdir = shell_quote(&inputs.workdir.to_string_lossy()),
         principal_workdir = shell_quote(principal_workdir.as_ref()),
         codex_sandbox = shell_quote(inputs.codex_sandbox),

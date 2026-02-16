@@ -469,20 +469,3 @@ pub(super) fn autoland_and_sync_principal(
         ),
     ])
 }
-
-pub(super) fn push_branch(
-    db_path: &Path,
-    token_file: &Path,
-    workdir: &Path,
-    remote: &str,
-    branch: &str,
-) -> Result<String> {
-    let head = git_stdout_trim(&git_checked(workdir, &["rev-parse", "--short", "HEAD"])?);
-    git_checked_with_token(
-        db_path,
-        token_file,
-        Some(workdir),
-        &["push", "-u", remote, &format!("HEAD:{branch}")],
-    )?;
-    Ok(format!("pushed branch: {head} -> {remote}/{branch}"))
-}

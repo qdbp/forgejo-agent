@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 
 use super::lexicon::{
     DECISION_ACCEPTED, DECISION_IGNORED, DIRECTIVE_DESIGN, DIRECTIVE_IMPL, DIRECTIVE_POKE,
-    DIRECTIVE_PR, DIRECTIVE_REPLY, EVENT_ISSUE_COMMENT, EVENT_ISSUES, directive_is_known,
+    DIRECTIVE_REPLY, EVENT_ISSUE_COMMENT, EVENT_ISSUES, directive_is_known,
 };
 use super::paths::expand_tilde_path;
 use super::state::{DecisionRecord, EventContext, ParsedDirective, WebhookPayload};
@@ -218,7 +218,6 @@ fn parse_directive_line(line: &str) -> Option<ParsedDirective> {
         DIRECTIVE_DESIGN,
         DIRECTIVE_IMPL,
         DIRECTIVE_POKE,
-        DIRECTIVE_PR,
         DIRECTIVE_REPLY,
     ]
     .iter()

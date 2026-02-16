@@ -10,6 +10,7 @@
 - Produce a clean commit (or commit series) with tests/format/lints passing.
 - Include `Refs: <owner/repo#N>` in each commit footer.
 - Do NOT merge; do NOT push. orchd will attempt a fast-forward autoland to `main` after you finish.
+- If orchd reports a fast-forward/autoland conflict, rebase on latest `main` and continue via the follow-up `impl` turn.
 - Include commit refs, verification summary, and residual risk in the final response.
 - Keep issue workflow current: transition to `state/review` on success, or `state/blocked` with a terse unblock comment when stopped by blockers.
 - Keep issue comments terse and natural-language (no rigid field templates).

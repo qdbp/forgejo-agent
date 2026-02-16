@@ -22,12 +22,17 @@ pub(super) fn dispatch_comment_identity(
     decision: &DecisionRecord,
 ) -> Option<CommentIdentity> {
     let dispatch_config = state.dispatch_config.as_ref()?;
-    let role_name = decision.target_role.as_deref()?;
-    let role = dispatch_config.roles.get(role_name)?;
+    let token_file = if let Some(control_plane) = dispatch_config.control_plane.as_ref() {
+        control_plane.token_file.clone()
+    } else {
+        let role_name = decision.target_role.as_deref()?;
+        let role = dispatch_config.roles.get(role_name)?;
+        role.token_file.clone()
+    };
     Some(CommentIdentity {
         forgejoctl_bin: dispatch_config.forgejoctl_bin.clone(),
         config_file: state.forgejo_config_file.clone(),
-        token_file: role.token_file.clone(),
+        token_file,
     })
 }
 
