@@ -23,6 +23,15 @@ pub(super) struct DispatchPromptEnvelopeConfig {
     pub(super) followup_envelope: PathBuf,
 }
 
+impl DispatchPromptEnvelopeConfig {
+    pub(super) fn role_card_file_for(&self, role_name: &str) -> PathBuf {
+        self.preamble_file
+            .parent()
+            .map_or_else(|| PathBuf::from("roles"), |parent| parent.join("roles"))
+            .join(format!("{role_name}.md"))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct DispatchRoleConfig {
     pub(super) codex_bin: PathBuf,
@@ -173,20 +182,33 @@ pub(super) fn load_dispatch_config(path: &Path) -> Result<DispatchConfig> {
         );
     }
 
+    let prompt_envelopes = DispatchPromptEnvelopeConfig {
+        preamble_file: resolve_config_path(&base_dir, &raw.prompt_envelopes.preamble_file)?,
+        fresh_envelope: resolve_config_path(&base_dir, &raw.prompt_envelopes.fresh_envelope)?,
+        followup_envelope: resolve_config_path(&base_dir, &raw.prompt_envelopes.followup_envelope)?,
+    };
+
+    let mut role_names: Vec<_> = roles.keys().cloned().collect();
+    role_names.sort();
+    for role_name in role_names {
+        let role_card_file = prompt_envelopes.role_card_file_for(&role_name);
+        if !role_card_file.is_file() {
+            return Err(anyhow!(
+                "dispatch config {} missing role card for role {} at {}",
+                path.display(),
+                role_name,
+                role_card_file.display()
+            ));
+        }
+    }
+
     Ok(DispatchConfig {
         allowed_actors: raw
             .allowed_actors
             .into_iter()
             .map(|actor| actor.to_ascii_lowercase())
             .collect(),
-        prompt_envelopes: DispatchPromptEnvelopeConfig {
-            preamble_file: resolve_config_path(&base_dir, &raw.prompt_envelopes.preamble_file)?,
-            fresh_envelope: resolve_config_path(&base_dir, &raw.prompt_envelopes.fresh_envelope)?,
-            followup_envelope: resolve_config_path(
-                &base_dir,
-                &raw.prompt_envelopes.followup_envelope,
-            )?,
-        },
+        prompt_envelopes,
         roles,
         directives,
         forgejoctl_bin: resolve_config_path(&base_dir, &raw.forgejoctl_bin)?,
@@ -199,5 +221,107 @@ fn resolve_config_path(base_dir: &Path, raw: &str) -> Result<PathBuf> {
         Ok(expanded)
     } else {
         Ok(base_dir.join(expanded))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::Path;
+
+    use anyhow::Result;
+    use tempfile::tempdir;
+
+    use super::{DispatchPromptEnvelopeConfig, load_dispatch_config};
+
+    #[test]
+    fn role_card_file_for_uses_roles_subdir_next_to_preamble() {
+        let envelopes = DispatchPromptEnvelopeConfig {
+            preamble_file: Path::new("/tmp/prompts/orchd-preamble.md").to_path_buf(),
+            fresh_envelope: Path::new("/tmp/prompts/orchd-envelope-fresh.md").to_path_buf(),
+            followup_envelope: Path::new("/tmp/prompts/orchd-envelope-followup.md").to_path_buf(),
+        };
+
+        let card = envelopes.role_card_file_for("codex-orch");
+        assert_eq!(card, Path::new("/tmp/prompts/roles/codex-orch.md"));
+    }
+
+    #[test]
+    fn load_dispatch_config_rejects_missing_role_card() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path();
+        let config_path = root.join("dispatch.toml");
+        let prompts_dir = root.join("prompts");
+        fs::create_dir_all(&prompts_dir)?;
+
+        let config_toml = format!(
+            r#"version = 1
+allowed_actors = ["main"]
+forgejoctl_bin = "/home/main/.local/bin/forgejoctl"
+
+[prompt_envelopes]
+preamble_file = "{preamble}"
+fresh_envelope = "{fresh}"
+followup_envelope = "{followup}"
+
+[roles.codex-orch]
+token_file = "{token}"
+
+[directives.design]
+role = "codex-orch"
+prompt_file = "{design_prompt}"
+"#,
+            preamble = prompts_dir.join("orchd-preamble.md").display(),
+            fresh = prompts_dir.join("orchd-envelope-fresh.md").display(),
+            followup = prompts_dir.join("orchd-envelope-followup.md").display(),
+            token = root.join("token.txt").display(),
+            design_prompt = prompts_dir.join("orchd-design.md").display(),
+        );
+        fs::write(&config_path, config_toml)?;
+
+        let err = load_dispatch_config(&config_path).expect_err("config should fail");
+        let err_text = err.to_string();
+        assert!(err_text.contains("missing role card for role codex-orch"));
+        Ok(())
+    }
+
+    #[test]
+    fn load_dispatch_config_accepts_present_role_card() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path();
+        let config_path = root.join("dispatch.toml");
+        let prompts_dir = root.join("prompts");
+        let roles_dir = prompts_dir.join("roles");
+        fs::create_dir_all(&roles_dir)?;
+        fs::write(roles_dir.join("codex-orch.md"), "# codex-orch role card\n")?;
+
+        let config_toml = format!(
+            r#"version = 1
+allowed_actors = ["main"]
+forgejoctl_bin = "/home/main/.local/bin/forgejoctl"
+
+[prompt_envelopes]
+preamble_file = "{preamble}"
+fresh_envelope = "{fresh}"
+followup_envelope = "{followup}"
+
+[roles.codex-orch]
+token_file = "{token}"
+
+[directives.design]
+role = "codex-orch"
+prompt_file = "{design_prompt}"
+"#,
+            preamble = prompts_dir.join("orchd-preamble.md").display(),
+            fresh = prompts_dir.join("orchd-envelope-fresh.md").display(),
+            followup = prompts_dir.join("orchd-envelope-followup.md").display(),
+            token = root.join("token.txt").display(),
+            design_prompt = prompts_dir.join("orchd-design.md").display(),
+        );
+        fs::write(&config_path, config_toml)?;
+
+        let config = load_dispatch_config(&config_path)?;
+        assert!(config.roles.contains_key("codex-orch"));
+        Ok(())
     }
 }

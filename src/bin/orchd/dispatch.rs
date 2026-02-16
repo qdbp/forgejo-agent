@@ -18,7 +18,9 @@ use forgejo_agent::types::{ApiIssue, IssueRef, RepoRef};
 
 use super::cli::{DispatchBackend, DispatchMode};
 use super::db;
-use super::dispatch_config::{DispatchConfig, DispatchDirectiveConfig, DispatchRoleConfig};
+use super::dispatch_config::{
+    DispatchConfig, DispatchDirectiveConfig, DispatchPromptEnvelopeConfig, DispatchRoleConfig,
+};
 use super::errors::DispatchError;
 use super::forgejoctl_cmd;
 use super::lexicon;
@@ -246,6 +248,27 @@ fn render_prompt(template: &str, values: &[(&str, &str)]) -> Result<String, Disp
         )));
     }
     Ok(text)
+}
+
+fn render_fresh_preamble(
+    prompt_envelopes: &DispatchPromptEnvelopeConfig,
+    role_name: &str,
+) -> Result<String, DispatchError> {
+    let preamble_template = fs::read_to_string(&prompt_envelopes.preamble_file).map_err(|err| {
+        DispatchError::Io(format!(
+            "failed reading prompt preamble {}: {err}",
+            prompt_envelopes.preamble_file.display()
+        ))
+    })?;
+    let role_card_file = prompt_envelopes.role_card_file_for(role_name);
+    let role_card_md = fs::read_to_string(&role_card_file).map_err(|err| {
+        DispatchError::Io(format!(
+            "failed reading role card {} for role {}: {err}",
+            role_card_file.display(),
+            role_name
+        ))
+    })?;
+    render_prompt(&preamble_template, &[("role_card_md", &role_card_md)])
 }
 
 fn build_dispatch_md(plan: &DispatchPlan, prompt_mode: &str) -> String {
@@ -755,12 +778,7 @@ fn materialize_run_artifacts(
     };
 
     let preamble_md = if prompt_mode == "fresh" {
-        fs::read_to_string(&dispatch_config.prompt_envelopes.preamble_file).map_err(|err| {
-            DispatchError::Io(format!(
-                "failed reading prompt preamble {}: {err}",
-                dispatch_config.prompt_envelopes.preamble_file.display()
-            ))
-        })?
+        render_fresh_preamble(&dispatch_config.prompt_envelopes, &plan.intent.role)?
     } else {
         String::new()
     };
