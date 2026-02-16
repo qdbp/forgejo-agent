@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
@@ -241,18 +242,28 @@ fn unresolved_prompt_tokens(text: &str) -> Vec<String> {
 }
 
 fn render_prompt(template: &str, values: &[(&str, &str)]) -> Result<String, DispatchError> {
-    let mut text = template.to_string();
-    for (key, value) in values {
-        let token = format!("{{{{{key}}}}}");
-        text = text.replace(&token, value);
-    }
-
-    let unresolved = unresolved_prompt_tokens(&text);
+    let provided_keys: HashSet<&str> = values.iter().map(|(key, _)| *key).collect();
+    let unresolved: Vec<String> = unresolved_prompt_tokens(template)
+        .into_iter()
+        .filter(|token| {
+            let key = token
+                .strip_prefix("{{")
+                .and_then(|value| value.strip_suffix("}}"))
+                .unwrap_or_default();
+            !provided_keys.contains(key)
+        })
+        .collect();
     if !unresolved.is_empty() {
         return Err(DispatchError::PromptTemplate(format!(
             "unresolved prompt tokens: {}",
             unresolved.join(", ")
         )));
+    }
+
+    let mut text = template.to_string();
+    for (key, value) in values {
+        let token = format!("{{{{{key}}}}}");
+        text = text.replace(&token, value);
     }
     Ok(text)
 }
@@ -1035,7 +1046,7 @@ pub(super) async fn dispatch_issue(
 mod tests {
     use chrono::{Duration as ChronoDuration, Utc};
 
-    use super::{DispatchBackendKind, DispatchState, db};
+    use super::{DispatchBackendKind, DispatchError, DispatchState, db};
 
     fn inflight_dispatch(status: DispatchState, started_at: String) -> db::InflightDispatch {
         db::InflightDispatch {
@@ -1083,5 +1094,25 @@ mod tests {
             "main/orchd-debug",
             1
         ));
+    }
+
+    #[test]
+    fn render_prompt_allows_brace_literals_in_injected_values() {
+        let rendered = super::render_prompt(
+            "{{issue_md}}",
+            &[(
+                "issue_md",
+                "observed literal {{role_card_md}} in issue text",
+            )],
+        )
+        .expect("expected literal braces in injected values to be preserved");
+        assert_eq!(rendered, "observed literal {{role_card_md}} in issue text");
+    }
+
+    #[test]
+    fn render_prompt_rejects_missing_template_values() {
+        let err = super::render_prompt("{{missing_key}}", &[])
+            .expect_err("expected unresolved template token error");
+        assert!(matches!(err, DispatchError::PromptTemplate(_)));
     }
 }
