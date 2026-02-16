@@ -251,3 +251,54 @@ done
         timeout_sec = inputs.timeout_sec,
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::{DispatchRunScriptInputs, build_exec_run_script};
+
+    #[test]
+    fn script_retries_finalize_and_does_not_swallow_failures() {
+        let inputs = DispatchRunScriptInputs {
+            dispatch_id: 42,
+            db_path: Path::new("/tmp/orchd.sqlite"),
+            lock_path: Path::new("/tmp/orchd.lock"),
+            run_dir: Path::new("/tmp/run"),
+            prompt_path: Path::new("/tmp/run/prompt.md"),
+            summary_path: Path::new("/tmp/run/summary.md"),
+            completion_path: Path::new("/tmp/run/completion.md"),
+            last_message_path: Path::new("/tmp/run/last.md"),
+            codex_log_path: Path::new("/tmp/run/codex.log"),
+            marker_path: Path::new("/tmp/run/start.marker"),
+            issue_ref_text: "main/repo#1",
+            orchd_bin: Path::new("/tmp/orchd"),
+            forgejoctl_bin: Path::new("/tmp/forgejoctl"),
+            forgejo_config_file: None,
+            token_file: Path::new("/tmp/token"),
+            control_token_file: None,
+            workdir: Path::new("/tmp/workdir"),
+            principal_workdir: Some(Path::new("/tmp/principal")),
+            codex_sandbox: "workspace-write",
+            git_remote: "origin",
+            git_base: "main",
+            git_branch: "orchd/d42/main-repo-i1-impl",
+            issue_title: "title",
+            issue_url: "http://127.0.0.1:3000/main/repo/issues/1",
+            codex_bin: Path::new("/tmp/codex-role"),
+            codex_role_arg: "orch",
+            issue_session_id: None,
+            directive_name: "impl",
+            role_name: "codex-orch",
+            timeout_sec: 60,
+        };
+
+        let script = build_exec_run_script(&inputs);
+        assert!(script.contains("run_finalize()"));
+        assert!(script.contains("finalize_max_attempts=8"));
+        assert!(script.contains("if run_finalize >> \"$CODEX_LOG_FILE\" 2>&1; then"));
+        assert!(script.contains("exit 91"));
+        assert!(!script.contains("|| true"));
+        assert!(!script.contains("--token-file \"$FINALIZE_TOKEN_FILE\" || true"));
+    }
+}

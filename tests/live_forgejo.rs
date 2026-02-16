@@ -1990,6 +1990,132 @@ fn live_orchd_impl_autoland_updates_remote_main() -> Result<()> {
 
 #[test]
 #[serial(live_forgejo)]
+fn live_orchd_impl_dirty_principal_blocks_push() -> Result<()> {
+    if !live_tests_enabled() {
+        eprintln!(
+            "skipping live orchd integration test; enable with {}=1",
+            LIVE_TESTS_ENV
+        );
+        return Ok(());
+    }
+
+    let harness = LiveHarness::bootstrap("live_orchd_impl_dirty_principal_blocks_push")?;
+    let issue_number = harness.create_issue("orchd impl dirty principal", "issue body", "ready")?;
+
+    let git = GitWorkspace::from_fixture(&harness.fixture, &harness.repo_name)?;
+    let before_head = git.bare_head_main()?;
+    let before_count = git.bare_commit_count_main()?;
+
+    fs::write(
+        harness.principal_workdir.join("local-dirty-sentinel.txt"),
+        "dirty principal workspace to verify preflight blocks push\n",
+    )
+    .context("failed to dirty principal workspace")?;
+
+    let fake_codex = ensure_fake_codex_bin()?;
+    let forgejoctl = forgejo_agent_bin()?;
+    let dispatch_cfg_path = harness
+        .fixture
+        .work_path
+        .join("orchd-dispatch-dirty-principal.toml");
+    write_orchd_dispatch_toml(
+        &dispatch_cfg_path,
+        OrchdDispatchTomlInputs {
+            actor: harness.fixture.owner.as_str(),
+            forgejo_login: harness.fixture.owner.as_str(),
+            repo_ref: harness.repo_ref.as_str(),
+            principal_workdir: &harness.principal_workdir,
+            codex_bin: &fake_codex,
+            token_file: &harness.token_path,
+            forgejoctl: &forgejoctl,
+            directives: &[OrchdTestDirective::Impl],
+            timeout_sec: 30,
+        },
+    )?;
+
+    let db_path = harness
+        .fixture
+        .work_path
+        .join("orchd-dirty-principal.sqlite");
+    let orchd_stdout = harness
+        .fixture
+        .work_path
+        .join("orchd-dirty-principal-stdout.log");
+    let orchd_stderr = harness
+        .fixture
+        .work_path
+        .join("orchd-dirty-principal-stderr.log");
+    let port = pick_unused_port().ok_or_else(|| anyhow!("failed to pick unused port"))?;
+
+    let orchd = OrchdTestProcess::spawn(OrchdSpawnInputs {
+        listen_port: port,
+        db_path: &db_path,
+        repo_ref: &harness.repo_ref,
+        dispatch_cfg_path: &dispatch_cfg_path,
+        config_path: &harness.config_path,
+        token_path: &harness.token_path,
+        stdout_path: &orchd_stdout,
+        stderr_path: &orchd_stderr,
+        env: &[
+            ("FAKE_CODEX_MODE", "git_append_commit"),
+            ("FAKE_CODEX_GIT_FILE", "orchd-itest.txt"),
+        ],
+    })?;
+
+    post_orchd_issue_comment_webhook(
+        &orchd.client,
+        &orchd.base_url,
+        &harness.repo_ref,
+        issue_number,
+        harness.fixture.owner.as_str(),
+        "@codex-orch impl",
+    )?;
+
+    let final_issue = wait_for_issue_label(
+        &harness,
+        issue_number,
+        "orchd/state/failed",
+        Duration::from_secs(60),
+    )?;
+    if !issue_has_label(&final_issue, "state/blocked")? {
+        bail!("expected autoland failure to transition issue to state/blocked");
+    }
+
+    let status_reason =
+        orchd_latest_dispatch_status_reason(&db_path, &harness.repo_ref, issue_number)?
+            .ok_or_else(|| anyhow!("expected latest dispatch row for issue"))?;
+    if status_reason.0 != "failed_runtime" {
+        bail!(
+            "expected failed_runtime when principal preflight blocks autoland, got status={} reason={:?}",
+            status_reason.0,
+            status_reason.1
+        );
+    }
+    if status_reason.1.as_deref() != Some("autoland_failed") {
+        bail!(
+            "expected autoland_failed reason code, got {:?}",
+            status_reason.1
+        );
+    }
+
+    let after_head = git.bare_head_main()?;
+    let after_count = git.bare_commit_count_main()?;
+    if after_head != before_head {
+        bail!(
+            "expected preflight failure to block remote push; main moved from {before_head} to {after_head}"
+        );
+    }
+    if after_count != before_count {
+        bail!(
+            "expected preflight failure to keep commit count unchanged ({before_count} -> {after_count})"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+#[serial(live_forgejo)]
 fn live_orchd_impl_allows_parallel_dispatches_per_repo() -> Result<()> {
     if !live_tests_enabled() {
         eprintln!(
