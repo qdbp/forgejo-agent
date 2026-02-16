@@ -37,8 +37,8 @@ Use:
 /home/main/forgejo-agent/scripts/push-both.sh
 ```
 
-That pushes the current ref to both remotes (origin first, then forgejo with
-token-backed non-interactive auth).
+That pushes the current ref to both remotes using `--force-with-lease`
+(origin first, then forgejo with token-backed non-interactive auth).
 
 ## Interactive Role Isolation (No Wrappers)
 

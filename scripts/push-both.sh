@@ -9,6 +9,9 @@ Pushes the current repo to:
 1) origin (GitHub)
 2) forgejo (local Forgejo mirror), using token auth for non-interactive push
 
+Policy:
+- Uses --force-with-lease on both remotes to preserve linear history safely.
+
 Examples:
   scripts/push-both.sh
   scripts/push-both.sh HEAD
@@ -59,10 +62,10 @@ git -C "$repo_root" remote get-url "$forgejo_remote" >/dev/null 2>&1 || {
 }
 
 echo "[push-both] pushing origin ($refspec)"
-git -C "$repo_root" push origin "$refspec"
+git -C "$repo_root" push --force-with-lease origin "$refspec"
 
 echo "[push-both] pushing $forgejo_remote ($refspec)"
 GIT_TERMINAL_PROMPT=0 GIT_ASKPASS="$askpass_tmp" ORCHD_GIT_TOKEN_FILE="$token_file" \
-  git -C "$repo_root" push "$forgejo_remote" "$refspec"
+  git -C "$repo_root" push --force-with-lease "$forgejo_remote" "$refspec"
 
 echo "[push-both] done"
