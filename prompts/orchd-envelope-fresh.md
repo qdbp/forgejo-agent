@@ -9,6 +9,12 @@
 
 {{dispatch_md}}
 
+## Important: you are being dispatched via headless orchestrator (orchd)
+No user is reading your output. Your communication, if any, must take the form
+of an issue reply (strongly preferred one per turn, though not mandatory).
+issued via `forgejoctl`. Please observe good issue etiquette and use clear
+natural language.
+
 {{orders_md}}
 
 {{issue_md}}

@@ -290,26 +290,29 @@ fn render_fresh_preamble(
 }
 
 fn build_dispatch_md(plan: &DispatchPlan, prompt_mode: &str) -> String {
+    let turn_type = if prompt_mode == "fresh" {
+        "first turn in this issue"
+    } else {
+        "follow-up turn in an existing issue session"
+    };
+    let trigger = match plan.event_type.as_str() {
+        lexicon::EVENT_ISSUE_COMMENT => "a new issue comment arrived",
+        lexicon::EVENT_ISSUES => "an issue event triggered dispatch",
+        _ => "a Forgejo webhook event triggered dispatch",
+    };
     format!(
-        r"## Dispatch
+        r"## Turn Context
 
-- role: `{role}`
-- directive: `{directive}`
-- actor: `{actor}`
-- issue: `{issue_ref}`
-- session: `{prompt_mode}`
-- delivery: `{delivery_id}`
-- event: `{event_type}`
-- issue url: <{issue_url}>
+You are working on `{issue_ref}`.
+
+Requester: `{actor}`
+Turn type: {turn_type}
+Why you were invoked: {trigger}
 ",
-        role = plan.intent.role,
-        directive = plan.intent.directive,
         actor = plan.actor,
         issue_ref = plan.issue_ref,
-        prompt_mode = prompt_mode,
-        delivery_id = plan.intent.delivery_id,
-        event_type = plan.event_type,
-        issue_url = plan.issue_url,
+        turn_type = turn_type,
+        trigger = trigger,
     )
 }
 
