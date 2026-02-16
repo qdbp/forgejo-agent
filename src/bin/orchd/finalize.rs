@@ -107,7 +107,10 @@ fn evaluate_landing(args: &FinalizeDispatchArgs) -> LandingOutcome {
         Err(err) => {
             let rendered = format!("{err:#}");
             let line = format!("autoland failed: {rendered}");
-            if is_retryable_autoland_conflict(&rendered) {
+            let lower = rendered.to_ascii_lowercase();
+            if lower.contains("principal workspace sync failed after autoland") {
+                LandingOutcome::Failure(vec![line])
+            } else if is_retryable_autoland_conflict(&rendered) {
                 LandingOutcome::Conflict(vec![line])
             } else {
                 LandingOutcome::Failure(vec![line])

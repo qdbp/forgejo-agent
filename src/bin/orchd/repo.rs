@@ -370,7 +370,33 @@ fn git_stdout_trim(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-fn validate_principal_workspace(principal_workdir: &Path, base_branch: &str) -> Result<()> {
+fn git_is_ancestor(workdir: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
+    let output = git_output(
+        workdir,
+        &["merge-base", "--is-ancestor", ancestor, descendant],
+    )?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(anyhow!(
+                "git merge-base --is-ancestor failed (cwd={}) args=[{ancestor}, {descendant}] status={:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                workdir.display(),
+                output.status.code()
+            ))
+        }
+    }
+}
+
+fn validate_principal_workspace(
+    db_path: &Path,
+    token_file: &Path,
+    principal_workdir: &Path,
+    base_branch: &str,
+    source_remote_url: &str,
+) -> Result<()> {
     let _ = git_checked(principal_workdir, &["rev-parse", "--is-inside-work-tree"])?;
     let status = git_stdout_trim(&git_checked(
         principal_workdir,
@@ -395,7 +421,56 @@ fn validate_principal_workspace(principal_workdir: &Path, base_branch: &str) -> 
             base_branch
         ));
     }
-    Ok(())
+
+    git_checked_with_token(
+        db_path,
+        token_file,
+        Some(principal_workdir),
+        &["fetch", source_remote_url, base_branch],
+    )?;
+    let principal_head = git_stdout_trim(&git_checked(principal_workdir, &["rev-parse", "HEAD"])?);
+    let principal_head_short = git_stdout_trim(&git_checked(
+        principal_workdir,
+        &["rev-parse", "--short", "HEAD"],
+    )?);
+    let fetched_head = git_stdout_trim(&git_checked(
+        principal_workdir,
+        &["rev-parse", "FETCH_HEAD"],
+    )?);
+    let fetched_head_short = git_stdout_trim(&git_checked(
+        principal_workdir,
+        &["rev-parse", "--short", "FETCH_HEAD"],
+    )?);
+
+    if principal_head == fetched_head {
+        return Ok(());
+    }
+
+    let local_is_behind = git_is_ancestor(principal_workdir, &principal_head, &fetched_head)?;
+    let local_is_ahead = git_is_ancestor(principal_workdir, &fetched_head, &principal_head)?;
+    let sync_target = format!("{}:{base_branch}", source_remote_url);
+    if local_is_behind {
+        return Err(anyhow!(
+            "principal workspace {} is behind {sync_target} (local={}, remote={}); reconcile before dispatch",
+            principal_workdir.display(),
+            principal_head_short,
+            fetched_head_short
+        ));
+    }
+    if local_is_ahead {
+        return Err(anyhow!(
+            "principal workspace {} is ahead of {sync_target} (local={}, remote={}); push/rebase and reconcile before dispatch",
+            principal_workdir.display(),
+            principal_head_short,
+            fetched_head_short
+        ));
+    }
+    Err(anyhow!(
+        "principal workspace {} diverged from {sync_target} (local={}, remote={}); reconcile before dispatch",
+        principal_workdir.display(),
+        principal_head_short,
+        fetched_head_short
+    ))
 }
 
 pub(super) fn autoland_and_sync_principal(
@@ -417,7 +492,13 @@ pub(super) fn autoland_and_sync_principal(
     )?);
 
     // Preflight principal before touching remote main.
-    validate_principal_workspace(principal_workdir, base_branch)?;
+    validate_principal_workspace(
+        db_path,
+        token_file,
+        principal_workdir,
+        base_branch,
+        &dispatch_remote_url,
+    )?;
 
     let _ = git_checked_with_token(
         db_path,
@@ -479,18 +560,18 @@ pub(super) fn autoland_and_sync_principal(
         ))
     })();
 
-    match sync_result {
-        Ok((principal_before, principal_after_short, source_remote)) => lines.push(format!(
-            "workspace_sync: {} {} -> {} (source={source_remote})",
-            principal_workdir.display(),
-            principal_before,
-            principal_after_short
-        )),
-        Err(err) => lines.push(format!(
-            "workspace_sync_pending: principal sync failed after successful autoland in {} ({err:#})",
+    let (principal_before, principal_after_short, source_remote) = sync_result.map_err(|err| {
+        anyhow!(
+            "principal workspace sync failed after autoland in {} ({err:#})",
             principal_workdir.display()
-        )),
-    }
+        )
+    })?;
+    lines.push(format!(
+        "workspace_sync: {} {} -> {} (source={source_remote})",
+        principal_workdir.display(),
+        principal_before,
+        principal_after_short
+    ));
 
     Ok(lines)
 }

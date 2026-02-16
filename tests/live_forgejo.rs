@@ -1011,10 +1011,63 @@ struct OrchdDispatchTomlInputs<'a> {
     timeout_sec: u64,
 }
 
+fn ensure_test_prompt_bundle(config_path: &Path, actor: &str) -> Result<PathBuf> {
+    let source_prompts_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("prompts");
+    let bundle_dir = config_path
+        .parent()
+        .ok_or_else(|| {
+            anyhow!(
+                "dispatch config path has no parent: {}",
+                config_path.display()
+            )
+        })?
+        .join("itest-prompts");
+    let roles_dir = bundle_dir.join("roles");
+    fs::create_dir_all(&roles_dir)
+        .with_context(|| format!("failed creating {}", roles_dir.display()))?;
+
+    let prompt_files = [
+        "orchd-preamble.md",
+        "orchd-envelope-fresh.md",
+        "orchd-envelope-followup.md",
+        "orchd-turn-context.md",
+        "orchd-issue-fresh.md",
+        "orchd-issue-followup.md",
+        "orchd-impl.md",
+        "orchd-design.md",
+        "orchd-poke.md",
+        "orchd-investigate.md",
+    ];
+    for file in prompt_files {
+        let src = source_prompts_dir.join(file);
+        let dst = bundle_dir.join(file);
+        fs::copy(&src, &dst)
+            .with_context(|| format!("failed copying {} -> {}", src.display(), dst.display()))?;
+    }
+
+    for role in ["main", "codex-orch"] {
+        let src = source_prompts_dir.join("roles").join(format!("{role}.md"));
+        let dst = roles_dir.join(format!("{role}.md"));
+        fs::copy(&src, &dst)
+            .with_context(|| format!("failed copying {} -> {}", src.display(), dst.display()))?;
+    }
+
+    let actor_role_path = roles_dir.join(format!("{actor}.md"));
+    if !actor_role_path.exists() {
+        fs::write(
+            &actor_role_path,
+            format!("# {actor} role card\n\n- OF-10\n"),
+        )
+        .with_context(|| format!("failed writing {}", actor_role_path.display()))?;
+    }
+
+    Ok(bundle_dir)
+}
+
 fn write_orchd_dispatch_toml(path: &Path, inputs: OrchdDispatchTomlInputs<'_>) -> Result<()> {
     use std::fmt::Write as _;
 
-    let prompts_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("prompts");
+    let prompts_dir = ensure_test_prompt_bundle(path, inputs.actor)?;
     let preamble = prompts_dir.join("orchd-preamble.md");
     let fresh_env = prompts_dir.join("orchd-envelope-fresh.md");
     let follow_env = prompts_dir.join("orchd-envelope-followup.md");
@@ -2013,10 +2066,15 @@ fn live_orchd_impl_dirty_principal_blocks_push() -> Result<()> {
     let before_count = git.bare_commit_count_main()?;
 
     fs::write(
-        harness.principal_workdir.join("local-dirty-sentinel.txt"),
+        harness.principal_workdir.join("tracked-dirty-sentinel.txt"),
         "dirty principal workspace to verify preflight blocks push\n",
     )
     .context("failed to dirty principal workspace")?;
+    git_output_checked(
+        &harness.principal_workdir,
+        &["add", "tracked-dirty-sentinel.txt"],
+        "git add tracked-dirty-sentinel.txt",
+    )?;
 
     let fake_codex = ensure_fake_codex_bin()?;
     let forgejoctl = forgejo_agent_bin()?;
@@ -2114,6 +2172,150 @@ fn live_orchd_impl_dirty_principal_blocks_push() -> Result<()> {
     if after_count != before_count {
         bail!(
             "expected preflight failure to keep commit count unchanged ({before_count} -> {after_count})"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+#[serial(live_forgejo)]
+fn live_orchd_impl_principal_ahead_blocks_push() -> Result<()> {
+    if !live_tests_enabled() {
+        eprintln!(
+            "skipping live orchd integration test; enable with {}=1",
+            LIVE_TESTS_ENV
+        );
+        return Ok(());
+    }
+
+    let harness = LiveHarness::bootstrap("live_orchd_impl_principal_ahead_blocks_push")?;
+    let issue_number = harness.create_issue("orchd impl principal ahead", "issue body", "ready")?;
+
+    let git = GitWorkspace::from_fixture(&harness.fixture, &harness.repo_name)?;
+    let before_head = git.bare_head_main()?;
+    let before_count = git.bare_commit_count_main()?;
+
+    fs::write(
+        harness.principal_workdir.join("local-ahead-sentinel.txt"),
+        "principal ahead sentinel commit\n",
+    )
+    .context("failed to write principal ahead sentinel")?;
+    git_output_checked(
+        &harness.principal_workdir,
+        &["add", "local-ahead-sentinel.txt"],
+        "git add local-ahead-sentinel.txt",
+    )?;
+    git_output_checked(
+        &harness.principal_workdir,
+        &[
+            "-c",
+            "user.name=it-principal",
+            "-c",
+            "user.email=it-principal@localhost",
+            "commit",
+            "-m",
+            "principal ahead sentinel",
+        ],
+        "git commit principal ahead sentinel",
+    )?;
+
+    let fake_codex = ensure_fake_codex_bin()?;
+    let forgejoctl = forgejo_agent_bin()?;
+    let dispatch_cfg_path = harness
+        .fixture
+        .work_path
+        .join("orchd-dispatch-principal-ahead.toml");
+    write_orchd_dispatch_toml(
+        &dispatch_cfg_path,
+        OrchdDispatchTomlInputs {
+            actor: harness.fixture.owner.as_str(),
+            forgejo_login: harness.fixture.owner.as_str(),
+            repo_ref: harness.repo_ref.as_str(),
+            principal_workdir: &harness.principal_workdir,
+            codex_bin: &fake_codex,
+            token_file: &harness.token_path,
+            forgejoctl: &forgejoctl,
+            directives: &[OrchdTestDirective::Impl],
+            timeout_sec: 30,
+        },
+    )?;
+
+    let db_path = harness
+        .fixture
+        .work_path
+        .join("orchd-principal-ahead.sqlite");
+    let orchd_stdout = harness
+        .fixture
+        .work_path
+        .join("orchd-principal-ahead-stdout.log");
+    let orchd_stderr = harness
+        .fixture
+        .work_path
+        .join("orchd-principal-ahead-stderr.log");
+    let port = pick_unused_port().ok_or_else(|| anyhow!("failed to pick unused port"))?;
+
+    let orchd = OrchdTestProcess::spawn(OrchdSpawnInputs {
+        listen_port: port,
+        db_path: &db_path,
+        repo_ref: &harness.repo_ref,
+        dispatch_cfg_path: &dispatch_cfg_path,
+        config_path: &harness.config_path,
+        token_path: &harness.token_path,
+        stdout_path: &orchd_stdout,
+        stderr_path: &orchd_stderr,
+        env: &[
+            ("FAKE_CODEX_MODE", "git_append_commit"),
+            ("FAKE_CODEX_GIT_FILE", "orchd-itest.txt"),
+        ],
+    })?;
+
+    post_orchd_issue_comment_webhook(
+        &orchd.client,
+        &orchd.base_url,
+        &harness.repo_ref,
+        issue_number,
+        harness.fixture.owner.as_str(),
+        "@codex-orch impl",
+    )?;
+
+    let final_issue = wait_for_issue_label(
+        &harness,
+        issue_number,
+        "orchd/state/failed",
+        Duration::from_secs(60),
+    )?;
+    if !issue_has_label(&final_issue, "state/blocked")? {
+        bail!("expected principal-ahead preflight to transition issue to state/blocked");
+    }
+
+    let status_reason =
+        orchd_latest_dispatch_status_reason(&db_path, &harness.repo_ref, issue_number)?
+            .ok_or_else(|| anyhow!("expected latest dispatch row for issue"))?;
+    if status_reason.0 != "failed_runtime" {
+        bail!(
+            "expected failed_runtime when principal ahead preflight blocks autoland, got status={} reason={:?}",
+            status_reason.0,
+            status_reason.1
+        );
+    }
+    if status_reason.1.as_deref() != Some("autoland_failed") {
+        bail!(
+            "expected autoland_failed reason code, got {:?}",
+            status_reason.1
+        );
+    }
+
+    let after_head = git.bare_head_main()?;
+    let after_count = git.bare_commit_count_main()?;
+    if after_head != before_head {
+        bail!(
+            "expected principal-ahead preflight to block remote push; main moved from {before_head} to {after_head}"
+        );
+    }
+    if after_count != before_count {
+        bail!(
+            "expected principal-ahead preflight to keep commit count unchanged ({before_count} -> {after_count})"
         );
     }
 
