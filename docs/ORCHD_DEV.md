@@ -30,7 +30,15 @@ Dispatch behavior is configured in `config/orchd-dispatch.toml`:
 - directive -> role mapping
 - role -> codex binary / token file / Forgejo login mapping
 - prompt envelopes (`prompt_envelopes.fresh_envelope`, `prompt_envelopes.followup_envelope`)
+- desktop notifications (`notifications.*`)
 - control-plane command path (`forgejoctl_bin`)
+
+Desktop notifications are emitted from `orchd` itself (no separate helper daemon):
+
+- `notifications.enabled = true` enables the loop
+- `notifications.poll_sec` controls scan cadence
+- `notifications.phases = ["completed", "failed", ...]` selects which phases notify
+- `notifications.app_name` controls the DBus app name shown in desktop notification UI
 
 ## Run
 
@@ -101,6 +109,12 @@ Tail orchestrator logs:
 
 ```bash
 tail -f ~/.local/state/orchd-dev/orchd.log
+```
+
+If desktop notifications are expected but absent, verify user-session DBus env:
+
+```bash
+systemctl --user show-environment | rg 'XDG_RUNTIME_DIR|DBUS_SESSION_BUS_ADDRESS'
 ```
 
 Inspect recent decisions:

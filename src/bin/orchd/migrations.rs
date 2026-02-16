@@ -9,7 +9,7 @@ struct Migration {
     apply: fn(&mut Connection) -> Result<()>,
 }
 
-const LATEST_SCHEMA_VERSION: i64 = 3;
+const LATEST_SCHEMA_VERSION: i64 = 4;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -26,6 +26,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 3,
         name: "drop_legacy_tmux_dispatch_columns",
         apply: migration_0003_drop_legacy_tmux_dispatch_columns,
+    },
+    Migration {
+        version: 4,
+        name: "add_dispatch_notifications_table",
+        apply: migration_0004_add_dispatch_notifications_table,
     },
 ];
 
@@ -312,6 +317,26 @@ fn migration_0003_drop_legacy_tmux_dispatch_columns(conn: &mut Connection) -> Re
     migration_result
 }
 
+fn migration_0004_add_dispatch_notifications_table(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    tx.execute_batch(
+        r"
+        CREATE TABLE IF NOT EXISTS dispatch_notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            dispatch_id INTEGER NOT NULL,
+            phase TEXT NOT NULL,
+            sent_at TEXT NOT NULL,
+            UNIQUE(dispatch_id, phase),
+            FOREIGN KEY(dispatch_id) REFERENCES dispatches(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_dispatch_notifications_phase_sent
+            ON dispatch_notifications (phase, sent_at DESC);
+        ",
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn ensure_column_exists_tx(
     tx: &rusqlite::Transaction<'_>,
     table_name: &str,
@@ -354,6 +379,18 @@ fn foreign_keys_enabled(conn: &Connection) -> Result<bool> {
 }
 
 #[cfg(test)]
+fn table_exists(conn: &Connection, table_name: &str) -> Result<bool> {
+    let found: Option<String> = conn
+        .query_row(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![table_name],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(found.is_some())
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -365,6 +402,7 @@ mod tests {
         assert!(!table_has_column(&conn, "dispatches", "tmux_window").expect("pragma"));
         assert!(table_has_column(&conn, "dispatches", "backend_kind").expect("pragma"));
         assert!(table_has_column(&conn, "dispatches", "backend_ref").expect("pragma"));
+        assert!(table_exists(&conn, "dispatch_notifications").expect("table exists"));
         assert_eq!(
             current_schema_version(&conn).expect("schema version query"),
             LATEST_SCHEMA_VERSION
@@ -452,6 +490,7 @@ mod tests {
             backend_ref.as_deref(),
             Some("codex-orch:rmain-forgejo-work-i1")
         );
+        assert!(table_exists(&conn, "dispatch_notifications").expect("table exists"));
         assert_eq!(
             current_schema_version(&conn).expect("schema version query"),
             LATEST_SCHEMA_VERSION

@@ -185,6 +185,38 @@ impl DispatchEventKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DispatchNotificationPhase {
+    Started,
+    Completed,
+    Failed,
+    Blocked,
+}
+
+impl DispatchNotificationPhase {
+    #[must_use]
+    pub const fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Blocked => "blocked",
+        }
+    }
+
+    #[must_use]
+    pub fn parse_db(value: &str) -> Option<Self> {
+        match value {
+            "started" => Some(Self::Started),
+            "completed" => Some(Self::Completed),
+            "failed" => Some(Self::Failed),
+            "blocked" => Some(Self::Blocked),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DispatchEvent {
     pub dispatch_id: i64,

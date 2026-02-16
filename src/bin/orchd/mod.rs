@@ -58,6 +58,9 @@ mod issue;
 // Logging + tracing initialization. Read when debugging orchd logs or adding new observability.
 mod telemetry;
 
+// Desktop notification loop for dispatch lifecycle transitions. Read when changing operator alerts.
+mod notifier;
+
 // Axum server (webhook ingress) + background loops. Read when changing runtime wiring or webhook handling.
 mod server;
 

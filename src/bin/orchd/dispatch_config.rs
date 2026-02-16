@@ -5,12 +5,15 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 
+use forgejo_agent::orchd_dispatch_core::DispatchNotificationPhase;
+
 use super::paths::expand_tilde_path;
 
 #[derive(Clone, Debug)]
 pub(super) struct DispatchConfig {
     pub(super) allowed_actors: Vec<String>,
     pub(super) prompt_envelopes: DispatchPromptEnvelopeConfig,
+    pub(super) notifications: DispatchNotificationsConfig,
     pub(super) roles: HashMap<String, DispatchRoleConfig>,
     pub(super) directives: HashMap<String, DispatchDirectiveConfig>,
     pub(super) forgejoctl_bin: PathBuf,
@@ -21,6 +24,14 @@ pub(super) struct DispatchPromptEnvelopeConfig {
     pub(super) preamble_file: PathBuf,
     pub(super) fresh_envelope: PathBuf,
     pub(super) followup_envelope: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct DispatchNotificationsConfig {
+    pub(super) enabled: bool,
+    pub(super) poll_sec: u64,
+    pub(super) phases: Vec<DispatchNotificationPhase>,
+    pub(super) app_name: String,
 }
 
 #[derive(Clone, Debug)]
@@ -46,6 +57,8 @@ struct DispatchConfigFile {
     allowed_actors: Vec<String>,
     #[serde(default)]
     prompt_envelopes: DispatchPromptEnvelopeConfigFile,
+    #[serde(default)]
+    notifications: DispatchNotificationsConfigFile,
     roles: HashMap<String, DispatchRoleConfigFile>,
     directives: HashMap<String, DispatchDirectiveConfigFile>,
     #[serde(default = "default_forgejoctl_bin")]
@@ -63,12 +76,36 @@ struct DispatchPromptEnvelopeConfigFile {
     followup_envelope: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DispatchNotificationsConfigFile {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default = "default_notify_poll_sec")]
+    poll_sec: u64,
+    #[serde(default = "default_notify_phases")]
+    phases: Vec<DispatchNotificationPhase>,
+    #[serde(default = "default_notify_app_name")]
+    app_name: String,
+}
+
 impl Default for DispatchPromptEnvelopeConfigFile {
     fn default() -> Self {
         Self {
             preamble_file: default_preamble_file(),
             fresh_envelope: default_fresh_envelope(),
             followup_envelope: default_followup_envelope(),
+        }
+    }
+}
+
+impl Default for DispatchNotificationsConfigFile {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            poll_sec: default_notify_poll_sec(),
+            phases: default_notify_phases(),
+            app_name: default_notify_app_name(),
         }
     }
 }
@@ -114,6 +151,21 @@ fn default_followup_envelope() -> String {
 
 const fn default_timeout_sec() -> u64 {
     3600
+}
+
+const fn default_notify_poll_sec() -> u64 {
+    10
+}
+
+fn default_notify_phases() -> Vec<DispatchNotificationPhase> {
+    vec![
+        DispatchNotificationPhase::Failed,
+        DispatchNotificationPhase::Blocked,
+    ]
+}
+
+fn default_notify_app_name() -> String {
+    "orchd".to_string()
 }
 
 pub(super) fn load_dispatch_config(path: &Path) -> Result<DispatchConfig> {
@@ -173,6 +225,10 @@ pub(super) fn load_dispatch_config(path: &Path) -> Result<DispatchConfig> {
         );
     }
 
+    let mut notification_phases = raw.notifications.phases;
+    notification_phases.sort_unstable();
+    notification_phases.dedup();
+
     Ok(DispatchConfig {
         allowed_actors: raw
             .allowed_actors
@@ -186,6 +242,12 @@ pub(super) fn load_dispatch_config(path: &Path) -> Result<DispatchConfig> {
                 &base_dir,
                 &raw.prompt_envelopes.followup_envelope,
             )?,
+        },
+        notifications: DispatchNotificationsConfig {
+            enabled: raw.notifications.enabled,
+            poll_sec: raw.notifications.poll_sec.max(1),
+            phases: notification_phases,
+            app_name: raw.notifications.app_name,
         },
         roles,
         directives,

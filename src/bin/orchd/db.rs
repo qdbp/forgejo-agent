@@ -8,7 +8,8 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use tracing::info;
 
 use forgejo_agent::orchd_dispatch_core::{
-    DispatchBackendKind, DispatchEventKind, DispatchState, RunHandle, reduce_dispatch_state,
+    DispatchBackendKind, DispatchEventKind, DispatchNotificationPhase, DispatchState, RunHandle,
+    reduce_dispatch_state,
 };
 
 use super::lexicon::{
@@ -58,6 +59,18 @@ pub(super) struct QueuedDecision {
     pub(super) decision: DecisionRecord,
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct DispatchNotificationCandidate {
+    pub(super) dispatch_id: i64,
+    pub(super) repo_full_name: String,
+    pub(super) issue_number: u64,
+    pub(super) directive: String,
+    pub(super) target_role: String,
+    pub(super) status: DispatchState,
+    pub(super) reason_code: Option<String>,
+    pub(super) phase: DispatchNotificationPhase,
+}
+
 pub(super) fn init_db(db_path: &Path) -> Result<()> {
     if let Some(parent) = db_path.parent() {
         fs::create_dir_all(parent)
@@ -76,6 +89,22 @@ fn parse_dispatch_state_literal(raw: &str, column: usize) -> rusqlite::Result<Di
             Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("invalid dispatch status in db: {raw}"),
+            )),
+        )
+    })
+}
+
+fn parse_dispatch_notification_phase_literal(
+    raw: &str,
+    column: usize,
+) -> rusqlite::Result<DispatchNotificationPhase> {
+    DispatchNotificationPhase::parse_db(raw).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid dispatch notification phase in db: {raw}"),
             )),
         )
     })
@@ -978,6 +1007,122 @@ pub(super) fn mark_dispatch_failed_runtime(
     Ok(())
 }
 
+pub(super) fn pending_dispatch_notifications(
+    db_path: &Path,
+    enabled_phases: &[DispatchNotificationPhase],
+    limit: u32,
+) -> Result<Vec<DispatchNotificationCandidate>> {
+    if enabled_phases.is_empty() {
+        return Ok(Vec::new());
+    }
+    let on_started = enabled_phases.contains(&DispatchNotificationPhase::Started);
+    let on_completed = enabled_phases.contains(&DispatchNotificationPhase::Completed);
+    let on_failed = enabled_phases.contains(&DispatchNotificationPhase::Failed);
+    let on_blocked = enabled_phases.contains(&DispatchNotificationPhase::Blocked);
+    let conn = open_db(db_path)?;
+    let mut stmt = conn.prepare(
+        r"
+        WITH phase_candidates AS (
+            SELECT
+                d.id AS dispatch_id,
+                d.repo_full_name AS repo_full_name,
+                d.issue_number AS issue_number,
+                d.directive AS directive,
+                d.target_role AS target_role,
+                d.status AS status,
+                d.reason_code AS reason_code,
+                CASE
+                    WHEN d.status IN ('starting', 'running') THEN 'started'
+                    WHEN d.status = 'completed' THEN 'completed'
+                    WHEN d.status = 'blocked' THEN 'blocked'
+                    WHEN d.status IN ('failed_start', 'failed_runtime', 'timed_out', 'canceled') THEN 'failed'
+                    ELSE NULL
+                END AS phase
+            FROM dispatches d
+            WHERE
+                ((d.status IN ('starting', 'running')) AND ?1)
+                OR (d.status = 'completed' AND ?2)
+                OR (d.status IN ('failed_start', 'failed_runtime', 'timed_out', 'canceled') AND ?3)
+                OR (d.status = 'blocked' AND ?4)
+        )
+        SELECT
+            c.dispatch_id,
+            c.repo_full_name,
+            c.issue_number,
+            c.directive,
+            c.target_role,
+            c.status,
+            c.reason_code,
+            c.phase
+        FROM phase_candidates c
+        WHERE c.phase IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1
+              FROM dispatch_notifications n
+              WHERE n.dispatch_id = c.dispatch_id
+                AND n.phase = c.phase
+          )
+        ORDER BY c.dispatch_id ASC
+        LIMIT ?5
+        ",
+    )?;
+    let rows = stmt
+        .query_map(
+            params![
+                i64::from(on_started),
+                i64::from(on_completed),
+                i64::from(on_failed),
+                i64::from(on_blocked),
+                i64::from(limit),
+            ],
+            |row| {
+                let issue_number_raw: i64 = row.get(2)?;
+                let issue_number = u64::try_from(issue_number_raw).map_err(|_| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Integer,
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("invalid issue number in db: {issue_number_raw}"),
+                        )),
+                    )
+                })?;
+                let status_raw: String = row.get(5)?;
+                let status = parse_dispatch_state_literal(&status_raw, 5)?;
+                let phase_raw: String = row.get(7)?;
+                let phase = parse_dispatch_notification_phase_literal(&phase_raw, 7)?;
+                Ok(DispatchNotificationCandidate {
+                    dispatch_id: row.get(0)?,
+                    repo_full_name: row.get(1)?,
+                    issue_number,
+                    directive: row.get(3)?,
+                    target_role: row.get(4)?,
+                    status,
+                    reason_code: row.get(6)?,
+                    phase,
+                })
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+pub(super) fn record_dispatch_notification(
+    db_path: &Path,
+    dispatch_id: i64,
+    phase: DispatchNotificationPhase,
+) -> Result<bool> {
+    let conn = open_db(db_path)?;
+    let inserted = conn.execute(
+        r"
+        INSERT OR IGNORE INTO dispatch_notifications (dispatch_id, phase, sent_at)
+        VALUES (?1, ?2, ?3)
+        ",
+        params![dispatch_id, phase.as_db_str(), Utc::now().to_rfc3339()],
+    )?;
+    Ok(inserted > 0)
+}
+
 pub(super) fn latest_issue_codex_session_id(
     db_path: &Path,
     repo_full_name: &str,
@@ -1085,7 +1230,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use chrono::Utc;
-    use forgejo_agent::orchd_dispatch_core::DispatchState;
+    use forgejo_agent::orchd_dispatch_core::{DispatchNotificationPhase, DispatchState};
     use rusqlite::params;
 
     use crate::orchd::lexicon::{
@@ -1378,6 +1523,107 @@ mod tests {
         assert_eq!(latest.status, DispatchState::Completed);
         assert_eq!(latest.target_role, "codex-orch");
         assert_eq!(latest.codex_session_id.as_deref(), Some("session-old"));
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn pending_dispatch_notifications_respects_phase_and_dedupe() {
+        let db_path = temp_db_path("dispatch-notify");
+        super::init_db(&db_path).expect("db init");
+        let decision_id = seed_decision_id(&db_path);
+
+        let started_id = insert_dispatch_row(
+            &db_path,
+            decision_id,
+            21,
+            DispatchState::Running,
+            "codex-orch",
+            None,
+        );
+        let completed_id = insert_dispatch_row(
+            &db_path,
+            decision_id,
+            22,
+            DispatchState::Completed,
+            "codex-orch",
+            Some("session-complete"),
+        );
+        let failed_id = insert_dispatch_row(
+            &db_path,
+            decision_id,
+            23,
+            DispatchState::FailedRuntime,
+            "codex-orch",
+            Some("session-failed"),
+        );
+        let blocked_id = insert_dispatch_row(
+            &db_path,
+            decision_id,
+            24,
+            DispatchState::Blocked,
+            "codex-orch",
+            Some("session-blocked"),
+        );
+
+        let rows = super::pending_dispatch_notifications(
+            &db_path,
+            &[
+                DispatchNotificationPhase::Started,
+                DispatchNotificationPhase::Completed,
+                DispatchNotificationPhase::Failed,
+                DispatchNotificationPhase::Blocked,
+            ],
+            20,
+        )
+        .expect("query pending notifications");
+        assert_eq!(rows.len(), 4);
+        assert!(
+            rows.iter().any(|row| row.dispatch_id == started_id
+                && row.phase == DispatchNotificationPhase::Started)
+        );
+        assert!(rows.iter().any(|row| row.dispatch_id == completed_id
+            && row.phase == DispatchNotificationPhase::Completed));
+        assert!(
+            rows.iter().any(|row| row.dispatch_id == failed_id
+                && row.phase == DispatchNotificationPhase::Failed)
+        );
+        assert!(
+            rows.iter().any(|row| row.dispatch_id == blocked_id
+                && row.phase == DispatchNotificationPhase::Blocked)
+        );
+
+        let inserted = super::record_dispatch_notification(
+            &db_path,
+            completed_id,
+            DispatchNotificationPhase::Completed,
+        )
+        .expect("record notification");
+        assert!(inserted);
+        let duplicate = super::record_dispatch_notification(
+            &db_path,
+            completed_id,
+            DispatchNotificationPhase::Completed,
+        )
+        .expect("record duplicate notification");
+        assert!(!duplicate);
+
+        let completed_rows = super::pending_dispatch_notifications(
+            &db_path,
+            &[DispatchNotificationPhase::Completed],
+            20,
+        )
+        .expect("query completed notifications");
+        assert!(completed_rows.is_empty());
+
+        let failed_rows = super::pending_dispatch_notifications(
+            &db_path,
+            &[DispatchNotificationPhase::Failed],
+            20,
+        )
+        .expect("query failed notifications");
+        assert_eq!(failed_rows.len(), 1);
+        assert_eq!(failed_rows[0].phase, DispatchNotificationPhase::Failed);
 
         let _ = fs::remove_file(db_path);
     }
