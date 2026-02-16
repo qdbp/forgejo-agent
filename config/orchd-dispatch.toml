@@ -12,6 +12,14 @@ preamble_file = "../prompts/orchd-preamble.md"
 fresh_envelope = "../prompts/orchd-envelope-fresh.md"
 followup_envelope = "../prompts/orchd-envelope-followup.md"
 
+[notifications]
+enabled = true
+poll_sec = 10
+phases = ["completed", "failed", "blocked"]
+app_name = "orchd"
+watch_login = "main"
+notify_send_bin = "/usr/bin/notify-send"
+
 [directives.design]
 role = "codex-orch"
 prompt_file = "../prompts/orchd-design.md"

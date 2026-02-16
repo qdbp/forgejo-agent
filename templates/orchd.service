@@ -10,6 +10,8 @@ Restart=always
 RestartSec=3
 WorkingDirectory=/home/main/forgejo-agent
 Environment=HOME=/home/main
+Environment=XDG_RUNTIME_DIR=%t
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus
 
 [Install]
 WantedBy=default.target

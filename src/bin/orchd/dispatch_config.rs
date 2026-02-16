@@ -5,12 +5,15 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 
+use forgejo_agent::orchd_dispatch_core::DispatchNotificationPhase;
+
 use super::paths::expand_tilde_path;
 
 #[derive(Clone, Debug)]
 pub(super) struct DispatchConfig {
     pub(super) allowed_actors: Vec<String>,
     pub(super) prompt_envelopes: DispatchPromptEnvelopeConfig,
+    pub(super) notifications: DispatchNotificationsConfig,
     pub(super) roles: HashMap<String, DispatchRoleConfig>,
     pub(super) directives: HashMap<String, DispatchDirectiveConfig>,
     pub(super) forgejoctl_bin: PathBuf,
@@ -30,6 +33,16 @@ impl DispatchPromptEnvelopeConfig {
             .map_or_else(|| PathBuf::from("roles"), |parent| parent.join("roles"))
             .join(format!("{role_name}.md"))
     }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct DispatchNotificationsConfig {
+    pub(super) enabled: bool,
+    pub(super) poll_sec: u64,
+    pub(super) phases: Vec<DispatchNotificationPhase>,
+    pub(super) app_name: String,
+    pub(super) watch_login: String,
+    pub(super) notify_send_bin: PathBuf,
 }
 
 #[derive(Clone, Debug)]
@@ -55,6 +68,8 @@ struct DispatchConfigFile {
     allowed_actors: Vec<String>,
     #[serde(default)]
     prompt_envelopes: DispatchPromptEnvelopeConfigFile,
+    #[serde(default)]
+    notifications: DispatchNotificationsConfigFile,
     roles: HashMap<String, DispatchRoleConfigFile>,
     directives: HashMap<String, DispatchDirectiveConfigFile>,
     #[serde(default = "default_forgejoctl_bin")]
@@ -78,6 +93,36 @@ impl Default for DispatchPromptEnvelopeConfigFile {
             preamble_file: default_preamble_file(),
             fresh_envelope: default_fresh_envelope(),
             followup_envelope: default_followup_envelope(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DispatchNotificationsConfigFile {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default = "default_notify_poll_sec")]
+    poll_sec: u64,
+    #[serde(default = "default_notify_phases")]
+    phases: Vec<DispatchNotificationPhase>,
+    #[serde(default = "default_notify_app_name")]
+    app_name: String,
+    #[serde(default = "default_watch_login")]
+    watch_login: String,
+    #[serde(default = "default_notify_send_bin")]
+    notify_send_bin: String,
+}
+
+impl Default for DispatchNotificationsConfigFile {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            poll_sec: default_notify_poll_sec(),
+            phases: default_notify_phases(),
+            app_name: default_notify_app_name(),
+            watch_login: default_watch_login(),
+            notify_send_bin: default_notify_send_bin(),
         }
     }
 }
@@ -123,6 +168,30 @@ fn default_followup_envelope() -> String {
 
 const fn default_timeout_sec() -> u64 {
     3600
+}
+
+const fn default_notify_poll_sec() -> u64 {
+    10
+}
+
+fn default_notify_phases() -> Vec<DispatchNotificationPhase> {
+    vec![
+        DispatchNotificationPhase::Completed,
+        DispatchNotificationPhase::Failed,
+        DispatchNotificationPhase::Blocked,
+    ]
+}
+
+fn default_notify_app_name() -> String {
+    "orchd".to_string()
+}
+
+fn default_watch_login() -> String {
+    "main".to_string()
+}
+
+fn default_notify_send_bin() -> String {
+    "/usr/bin/notify-send".to_string()
 }
 
 pub(super) fn load_dispatch_config(path: &Path) -> Result<DispatchConfig> {
@@ -201,6 +270,9 @@ pub(super) fn load_dispatch_config(path: &Path) -> Result<DispatchConfig> {
             ));
         }
     }
+    let mut notification_phases = raw.notifications.phases;
+    notification_phases.sort_unstable();
+    notification_phases.dedup();
 
     Ok(DispatchConfig {
         allowed_actors: raw
@@ -209,6 +281,14 @@ pub(super) fn load_dispatch_config(path: &Path) -> Result<DispatchConfig> {
             .map(|actor| actor.to_ascii_lowercase())
             .collect(),
         prompt_envelopes,
+        notifications: DispatchNotificationsConfig {
+            enabled: raw.notifications.enabled,
+            poll_sec: raw.notifications.poll_sec.max(1),
+            phases: notification_phases,
+            app_name: raw.notifications.app_name,
+            watch_login: raw.notifications.watch_login.to_ascii_lowercase(),
+            notify_send_bin: resolve_config_path(&base_dir, &raw.notifications.notify_send_bin)?,
+        },
         roles,
         directives,
         forgejoctl_bin: resolve_config_path(&base_dir, &raw.forgejoctl_bin)?,

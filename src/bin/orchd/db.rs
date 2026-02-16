@@ -8,7 +8,8 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use tracing::info;
 
 use forgejo_agent::orchd_dispatch_core::{
-    DispatchBackendKind, DispatchEventKind, DispatchState, RunHandle, reduce_dispatch_state,
+    DispatchBackendKind, DispatchEventKind, DispatchNotificationPhase, DispatchState, RunHandle,
+    reduce_dispatch_state,
 };
 
 use super::lexicon::{
@@ -58,6 +59,29 @@ pub(super) struct QueuedDecision {
     pub(super) decision: DecisionRecord,
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct DispatchPhaseNotificationRow {
+    pub(super) dedupe_key: String,
+    pub(super) dispatch_id: i64,
+    pub(super) repo_full_name: String,
+    pub(super) issue_number: u64,
+    pub(super) directive: String,
+    pub(super) target_role: String,
+    pub(super) status: DispatchState,
+    pub(super) reason_code: Option<String>,
+    pub(super) phase: DispatchNotificationPhase,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ReplyNotificationRow {
+    pub(super) dedupe_key: String,
+    pub(super) event_id: i64,
+    pub(super) repo_full_name: String,
+    pub(super) issue_number: u64,
+    pub(super) actor_login: String,
+    pub(super) event_text: String,
+}
+
 pub(super) fn init_db(db_path: &Path) -> Result<()> {
     if let Some(parent) = db_path.parent() {
         fs::create_dir_all(parent)
@@ -76,6 +100,22 @@ fn parse_dispatch_state_literal(raw: &str, column: usize) -> rusqlite::Result<Di
             Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("invalid dispatch status in db: {raw}"),
+            )),
+        )
+    })
+}
+
+fn parse_dispatch_notification_phase_literal(
+    raw: &str,
+    column: usize,
+) -> rusqlite::Result<DispatchNotificationPhase> {
+    DispatchNotificationPhase::parse_db(raw).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid dispatch notification phase in db: {raw}"),
             )),
         )
     })
@@ -1079,17 +1119,253 @@ pub(super) fn queued_impl_decisions(db_path: &Path, limit: u32) -> Result<Vec<Qu
     Ok(rows)
 }
 
+pub(super) fn record_notification_delivery(
+    db_path: &Path,
+    dedupe_key: &str,
+    category: &str,
+) -> Result<bool> {
+    let conn = open_db(db_path)?;
+    let now = Utc::now().to_rfc3339();
+    let rows = conn.execute(
+        r"
+        INSERT OR IGNORE INTO notification_deliveries (dedupe_key, category, sent_at)
+        VALUES (?1, ?2, ?3)
+        ",
+        params![dedupe_key, category, now],
+    )?;
+    Ok(rows > 0)
+}
+
+pub(super) fn pending_dispatch_phase_notifications(
+    db_path: &Path,
+    enabled_phases: &[DispatchNotificationPhase],
+    after_dispatch_id: i64,
+    limit: u32,
+) -> Result<Vec<DispatchPhaseNotificationRow>> {
+    if enabled_phases.is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+    let on_started = enabled_phases.contains(&DispatchNotificationPhase::Started);
+    let on_completed = enabled_phases.contains(&DispatchNotificationPhase::Completed);
+    let on_failed = enabled_phases.contains(&DispatchNotificationPhase::Failed);
+    let on_blocked = enabled_phases.contains(&DispatchNotificationPhase::Blocked);
+
+    let conn = open_db(db_path)?;
+    let mut stmt = conn.prepare(
+        r"
+        SELECT
+            d.id,
+            d.repo_full_name,
+            d.issue_number,
+            d.directive,
+            d.target_role,
+            d.status,
+            d.reason_code,
+            CASE
+                WHEN d.status = 'running' THEN 'started'
+                WHEN d.status = 'completed' THEN 'completed'
+                WHEN d.status = 'blocked' THEN 'blocked'
+                ELSE 'failed'
+            END AS phase
+        FROM dispatches d
+        WHERE (
+            (?1 = 1 AND d.status = 'running')
+            OR (?2 = 1 AND d.status = 'completed')
+            OR (?3 = 1 AND d.status = 'blocked')
+            OR (?4 = 1 AND d.status IN ('failed_start', 'failed_runtime', 'timed_out', 'canceled'))
+        )
+          AND d.id > ?5
+          AND NOT EXISTS (
+              SELECT 1
+              FROM notification_deliveries n
+              WHERE n.dedupe_key =
+                  'dispatch:' || d.id || ':' ||
+                  CASE
+                      WHEN d.status = 'running' THEN 'started'
+                      WHEN d.status = 'completed' THEN 'completed'
+                      WHEN d.status = 'blocked' THEN 'blocked'
+                      ELSE 'failed'
+                  END
+          )
+        ORDER BY d.id ASC
+        LIMIT ?6
+        ",
+    )?;
+
+    let rows = stmt
+        .query_map(
+            params![
+                i64::from(on_started),
+                i64::from(on_completed),
+                i64::from(on_blocked),
+                i64::from(on_failed),
+                after_dispatch_id,
+                i64::from(limit)
+            ],
+            |row| {
+                let dispatch_id: i64 = row.get(0)?;
+                let repo_full_name: String = row.get(1)?;
+                let issue_number_i64: i64 = row.get(2)?;
+                let issue_number = u64::try_from(issue_number_i64).map_err(|_| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Integer,
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("invalid issue number in dispatch row: {issue_number_i64}"),
+                        )),
+                    )
+                })?;
+                let status_raw: String = row.get(5)?;
+                let phase_raw: String = row.get(7)?;
+                let status = parse_dispatch_state_literal(&status_raw, 5)?;
+                let phase = parse_dispatch_notification_phase_literal(&phase_raw, 7)?;
+                Ok(DispatchPhaseNotificationRow {
+                    dedupe_key: format!("dispatch:{dispatch_id}:{}", phase.as_db_str()),
+                    dispatch_id,
+                    repo_full_name,
+                    issue_number,
+                    directive: row.get(3)?,
+                    target_role: row.get(4)?,
+                    status,
+                    reason_code: row.get(6)?,
+                    phase,
+                })
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+pub(super) fn pending_reply_notifications(
+    db_path: &Path,
+    watch_login: &str,
+    after_event_id: i64,
+    limit: u32,
+) -> Result<Vec<ReplyNotificationRow>> {
+    if watch_login.trim().is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+    let conn = open_db(db_path)?;
+    let watch_login = watch_login.to_ascii_lowercase();
+    let mention_pattern = format!("%@{}%", watch_login);
+    let mut stmt = conn.prepare(
+        r"
+        SELECT
+            e.id,
+            e.repo_full_name,
+            e.issue_number,
+            e.actor_login,
+            e.event_text
+        FROM events e
+        WHERE e.event_type = ?1
+          AND e.action = 'created'
+          AND e.issue_number IS NOT NULL
+          AND e.actor_login IS NOT NULL
+          AND e.id > ?5
+          AND lower(e.actor_login) GLOB 'codex-*'
+          AND lower(e.actor_login) != ?2
+          AND (
+              EXISTS (
+                  SELECT 1
+                  FROM events io
+                  WHERE io.repo_full_name = e.repo_full_name
+                    AND io.issue_number = e.issue_number
+                    AND io.event_type = ?3
+                    AND io.action = 'opened'
+                    AND lower(COALESCE(io.actor_login, '')) = ?2
+              )
+              OR lower(COALESCE(e.event_text, '')) LIKE ?4
+              OR EXISTS (
+                  SELECT 1
+                  FROM events im
+                  WHERE im.repo_full_name = e.repo_full_name
+                    AND im.issue_number = e.issue_number
+                    AND im.event_type = ?3
+                    AND lower(COALESCE(im.event_text, '')) LIKE ?4
+              )
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM notification_deliveries n
+              WHERE n.dedupe_key = 'reply:' || e.id
+          )
+        ORDER BY e.id ASC
+        LIMIT ?6
+        ",
+    )?;
+    let rows = stmt
+        .query_map(
+            params![
+                EVENT_ISSUE_COMMENT,
+                watch_login,
+                EVENT_ISSUES,
+                mention_pattern,
+                after_event_id,
+                i64::from(limit),
+            ],
+            |row| {
+                let event_id: i64 = row.get(0)?;
+                let issue_number_i64: i64 = row.get(2)?;
+                let issue_number = u64::try_from(issue_number_i64).map_err(|_| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Integer,
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("invalid issue number in event row: {issue_number_i64}"),
+                        )),
+                    )
+                })?;
+                Ok(ReplyNotificationRow {
+                    dedupe_key: format!("reply:{event_id}"),
+                    event_id,
+                    repo_full_name: row.get(1)?,
+                    issue_number,
+                    actor_login: row.get(3)?,
+                    event_text: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                })
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+pub(super) fn latest_dispatch_id(db_path: &Path) -> Result<i64> {
+    let conn = open_db(db_path)?;
+    let latest = conn
+        .query_row("SELECT MAX(id) FROM dispatches", [], |row| {
+            row.get::<_, Option<i64>>(0)
+        })
+        .optional()?
+        .flatten()
+        .unwrap_or(0);
+    Ok(latest)
+}
+
+pub(super) fn latest_event_id(db_path: &Path) -> Result<i64> {
+    let conn = open_db(db_path)?;
+    let latest = conn
+        .query_row("SELECT MAX(id) FROM events", [], |row| {
+            row.get::<_, Option<i64>>(0)
+        })
+        .optional()?
+        .flatten()
+        .unwrap_or(0);
+    Ok(latest)
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
     use chrono::Utc;
-    use forgejo_agent::orchd_dispatch_core::DispatchState;
+    use forgejo_agent::orchd_dispatch_core::{DispatchNotificationPhase, DispatchState};
     use rusqlite::params;
 
     use crate::orchd::lexicon::{
-        DECISION_ACCEPTED, DIRECTIVE_IMPL, DIRECTIVE_POKE, EVENT_ISSUE_COMMENT,
+        DECISION_ACCEPTED, DIRECTIVE_IMPL, DIRECTIVE_POKE, EVENT_ISSUE_COMMENT, EVENT_ISSUES,
     };
 
     fn temp_db_path(label: &str) -> PathBuf {
@@ -1378,6 +1654,178 @@ mod tests {
         assert_eq!(latest.status, DispatchState::Completed);
         assert_eq!(latest.target_role, "codex-orch");
         assert_eq!(latest.codex_session_id.as_deref(), Some("session-old"));
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn pending_dispatch_phase_notifications_respects_phase_and_dedupe() {
+        let db_path = temp_db_path("dispatch-notify");
+        super::init_db(&db_path).expect("db init");
+        let decision_id = seed_decision_id(&db_path);
+        let completed_id = insert_dispatch_row(
+            &db_path,
+            decision_id,
+            20,
+            DispatchState::Completed,
+            "codex-orch",
+            None,
+        );
+        let _blocked_id = insert_dispatch_row(
+            &db_path,
+            decision_id,
+            21,
+            DispatchState::Blocked,
+            "codex-orch",
+            None,
+        );
+
+        let rows = super::pending_dispatch_phase_notifications(
+            &db_path,
+            &[
+                DispatchNotificationPhase::Completed,
+                DispatchNotificationPhase::Blocked,
+            ],
+            0,
+            16,
+        )
+        .expect("query pending notifications");
+        assert!(
+            rows.iter()
+                .any(|row| row.phase == DispatchNotificationPhase::Completed)
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.phase == DispatchNotificationPhase::Blocked)
+        );
+
+        let inserted = super::record_notification_delivery(
+            &db_path,
+            &format!("dispatch:{completed_id}:completed"),
+            "dispatch_phase",
+        )
+        .expect("record notification");
+        assert!(inserted);
+
+        let after = super::pending_dispatch_phase_notifications(
+            &db_path,
+            &[
+                DispatchNotificationPhase::Completed,
+                DispatchNotificationPhase::Blocked,
+            ],
+            0,
+            16,
+        )
+        .expect("query pending notifications after dedupe");
+        assert!(
+            after
+                .iter()
+                .all(|row| row.phase != DispatchNotificationPhase::Completed),
+            "completed phase should have been deduped"
+        );
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn pending_reply_notifications_match_owned_or_mentioned_issues() {
+        let db_path = temp_db_path("reply-notify");
+        super::init_db(&db_path).expect("db init");
+        let conn = super::open_db(&db_path).expect("open db");
+        let now = Utc::now().to_rfc3339();
+
+        conn.execute(
+            r"
+            INSERT INTO events (delivery_id, event_type, repo_full_name, issue_number, action, actor_login, event_text, raw_json, received_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            ",
+            params![
+                "opened-owned",
+                EVENT_ISSUES,
+                "main/forgejo-agent",
+                40_i64,
+                "opened",
+                "main",
+                "owner issue body",
+                "{}",
+                now
+            ],
+        )
+        .expect("insert owned opened event");
+        conn.execute(
+            r"
+            INSERT INTO events (delivery_id, event_type, repo_full_name, issue_number, action, actor_login, event_text, raw_json, received_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            ",
+            params![
+                "reply-owned",
+                EVENT_ISSUE_COMMENT,
+                "main/forgejo-agent",
+                40_i64,
+                "created",
+                "codex-orch",
+                "status update on owned issue",
+                "{}",
+                now
+            ],
+        )
+        .expect("insert owned reply event");
+
+        conn.execute(
+            r"
+            INSERT INTO events (delivery_id, event_type, repo_full_name, issue_number, action, actor_login, event_text, raw_json, received_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            ",
+            params![
+                "opened-mention",
+                EVENT_ISSUES,
+                "main/forgejo-agent",
+                41_i64,
+                "opened",
+                "alice",
+                "please involve @main on this",
+                "{}",
+                now
+            ],
+        )
+        .expect("insert mentioned opened event");
+        conn.execute(
+            r"
+            INSERT INTO events (delivery_id, event_type, repo_full_name, issue_number, action, actor_login, event_text, raw_json, received_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            ",
+            params![
+                "reply-mention",
+                EVENT_ISSUE_COMMENT,
+                "main/forgejo-agent",
+                41_i64,
+                "created",
+                "codex-dev",
+                "I can take this",
+                "{}",
+                now
+            ],
+        )
+        .expect("insert mentioned reply event");
+
+        let rows = super::pending_reply_notifications(&db_path, "main", 0, 16)
+            .expect("query pending replies");
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|row| row.issue_number == 40));
+        assert!(rows.iter().any(|row| row.issue_number == 41));
+
+        let row = rows
+            .iter()
+            .find(|row| row.issue_number == 40)
+            .expect("owned row");
+        let inserted = super::record_notification_delivery(&db_path, &row.dedupe_key, "reply")
+            .expect("record reply dedupe");
+        assert!(inserted);
+
+        let after = super::pending_reply_notifications(&db_path, "main", 0, 16)
+            .expect("query pending replies after dedupe");
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].issue_number, 41);
 
         let _ = fs::remove_file(db_path);
     }

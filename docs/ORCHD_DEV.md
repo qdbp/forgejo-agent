@@ -30,7 +30,14 @@ Dispatch behavior is configured in `config/orchd-dispatch.toml`:
 - directive -> role mapping
 - role -> codex binary / token file / Forgejo login mapping
 - prompt envelopes (`prompt_envelopes.fresh_envelope`, `prompt_envelopes.followup_envelope`)
+- desktop notifications (`notifications.*`)
 - control-plane command path (`forgejoctl_bin`)
+
+Desktop notifications are emitted directly from `orchd` via `notify-send`:
+
+- lifecycle notifications for configured phases (`completed|failed|blocked` by default)
+- codex reply notifications when the watcher login opened the issue or is tagged (`@watch_login`)
+- stable per-issue replacement IDs and pastel color hints for a uniform feed
 
 ## Run
 

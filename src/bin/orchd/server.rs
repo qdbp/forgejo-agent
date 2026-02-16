@@ -23,6 +23,7 @@ use super::dispatch;
 use super::dispatch_config::load_dispatch_config;
 use super::errors::runtime_state_for_dispatch_error;
 use super::lexicon::{DIRECTIVE_IMPL, EVENT_ISSUE_COMMENT, EVENT_ISSUES};
+use super::notifier;
 use super::paths::expand_tilde_path;
 use super::projection;
 use super::state::{
@@ -110,6 +111,28 @@ pub(super) async fn run_server(cli: Cli) -> Result<()> {
     tokio::spawn(async move {
         run_dispatch_queue_loop(queue_state, cli.heartbeat_sec).await;
     });
+
+    if let Some(notifications) = state
+        .dispatch_config
+        .as_ref()
+        .map(|cfg| cfg.notifications.clone())
+        && notifications.enabled
+    {
+        let notification_state = state.clone();
+        log_line(
+            "notification_loop_start",
+            json!({
+                "poll_sec": notifications.poll_sec,
+                "phases": notifications.phases.iter().map(|phase| phase.as_db_str()).collect::<Vec<_>>(),
+                "app_name": notifications.app_name.as_str(),
+                "watch_login": notifications.watch_login.as_str(),
+                "notify_send_bin": notifications.notify_send_bin.to_string_lossy(),
+            }),
+        );
+        tokio::spawn(async move {
+            notifier::run_notification_loop(notification_state, notifications).await;
+        });
+    }
 
     let ensure_state = state.clone();
     let app = Router::new()
