@@ -26,6 +26,20 @@ Direct raw API poking is discouraged for agents.
 
 This builds release and installs `forgejoctl` to `~/.local/bin/forgejoctl`.
 
+## Push To Both Remotes
+
+This repo now treats `origin` (GitHub) as primary and `forgejo` (local Forgejo)
+as execution mirror.
+
+Use:
+
+```bash
+/home/main/forgejo-agent/scripts/push-both.sh
+```
+
+That pushes the current ref to both remotes (origin first, then forgejo with
+token-backed non-interactive auth).
+
 ## Interactive Role Isolation (No Wrappers)
 
 Use transient systemd units with injected credentials:
@@ -183,7 +197,7 @@ cargo run --bin orchd -- \
 Postmortem resume by issue (owner is fixed to `main`):
 
 ```bash
-cargo run --bin orchd -- issue resume forgejo-work 20 -- --no-alt-screen
+cargo run --bin orchd -- issue resume forgejo-agent 20 -- --no-alt-screen
 ```
 
 `issue resume` fails fast when:
