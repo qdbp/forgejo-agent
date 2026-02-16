@@ -119,6 +119,7 @@ Core behavior:
 - one active dispatch per issue (duplicates blocked while running)
 - issue-scoped codex session reuse (`codex exec resume`) from latest `codex_session_id`
 - periodic heartbeat + reconcile scan logs
+- postmortem issue resume via `orchd issue resume <repo> <issue_number> [-- <codex resume args...>]`
 
 Role launch wrapper:
 
@@ -178,6 +179,17 @@ cargo run --bin orchd -- \
   --reconcile-sec 45 \
   --dispatch-mode dry-run
 ```
+
+Postmortem resume by issue (owner is fixed to `main`):
+
+```bash
+cargo run --bin orchd -- issue resume forgejo-work 20 -- --no-alt-screen
+```
+
+`issue resume` fails fast when:
+
+- the issue has any non-terminal dispatch (`queued|launching|starting|running`)
+- no `codex_session_id` has been recorded for the issue
 
 Health check:
 

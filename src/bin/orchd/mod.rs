@@ -52,6 +52,9 @@ mod finalize;
 // Run script generation for codex offline execution + finalize handoff. Read when changing dispatch launch payload.
 mod run_script;
 
+// Operator-facing issue subcommands (postmortem session resume). Read when extending orchd obs/issue CLI surface.
+mod issue;
+
 // Logging + tracing initialization. Read when debugging orchd logs or adding new observability.
 mod telemetry;
 

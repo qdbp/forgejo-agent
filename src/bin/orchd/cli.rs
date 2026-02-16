@@ -37,7 +37,22 @@ pub(super) struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub(super) enum OrchdCommand {
-    FinalizeDispatch(FinalizeDispatchArgs),
+    FinalizeDispatch(Box<FinalizeDispatchArgs>),
+    #[command(subcommand)]
+    Issue(IssueCommand),
+}
+
+#[derive(Subcommand, Debug)]
+pub(super) enum IssueCommand {
+    Resume(IssueResumeArgs),
+}
+
+#[derive(Args, Debug)]
+pub(super) struct IssueResumeArgs {
+    pub(super) repo: String,
+    pub(super) issue_number: u64,
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub(super) codex_resume_args: Vec<String>,
 }
 
 #[derive(Args, Debug)]

@@ -1,18 +1,19 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use super::cli::{Cli, OrchdCommand};
+use super::cli::{Cli, IssueCommand, OrchdCommand};
 use super::finalize;
+use super::issue;
 use super::server;
 use super::telemetry::init_telemetry;
 
 pub(super) fn run_entry() -> Result<()> {
     init_telemetry();
-    let cli = Cli::parse();
-    if let Some(command) = cli.command {
+    let mut cli = Cli::parse();
+    if let Some(command) = cli.command.take() {
         // Subcommands are intentionally synchronous to avoid mixing reqwest::blocking
         // with a Tokio runtime.
-        return run_command(command);
+        return run_command(&cli, command);
     }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -21,8 +22,15 @@ pub(super) fn run_entry() -> Result<()> {
     runtime.block_on(server::run_server(cli))
 }
 
-fn run_command(command: OrchdCommand) -> Result<()> {
+fn run_command(cli: &Cli, command: OrchdCommand) -> Result<()> {
     match command {
-        OrchdCommand::FinalizeDispatch(args) => finalize::finalize_dispatch_command(args),
+        OrchdCommand::FinalizeDispatch(args) => finalize::finalize_dispatch_command(*args),
+        OrchdCommand::Issue(command) => run_issue_command(cli, command),
+    }
+}
+
+fn run_issue_command(cli: &Cli, command: IssueCommand) -> Result<()> {
+    match command {
+        IssueCommand::Resume(args) => issue::issue_resume_command(&cli.db_path, args),
     }
 }

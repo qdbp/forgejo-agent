@@ -22,6 +22,7 @@ Core behavior:
 - ensures per-repo policy labels exist (best-effort) and maintains per-role local checkouts under the orchd state dir
 - emits heartbeat + reconcile logs periodically
 - dispatches `reply` implicitly on new issue comments when the issue has exactly one assignee and it is a `codex-*` user (unless an explicit directive is present)
+- supports postmortem session re-entry via `orchd issue resume <repo> <issue_number>`
 
 Dispatch behavior is configured in `config/orchd-dispatch.toml`:
 
@@ -72,6 +73,21 @@ cargo run --bin orchd -- \
   --reconcile-sec 45 \
   --dispatch-mode dry-run
 ```
+
+## Postmortem Resume
+
+Re-open the latest recorded session for an issue:
+
+```bash
+cargo run --bin orchd -- issue resume forgejo-work 20 -- --no-alt-screen
+```
+
+Behavior is intentionally strict:
+
+- owner is hardcoded to `main` (`forgejo-work 20` maps to `main/forgejo-work#20`)
+- errors if any non-terminal dispatch exists for that issue
+- errors if no `codex_session_id` exists in dispatch history
+- never falls back to spawning a fresh Codex session
 
 ## Health
 

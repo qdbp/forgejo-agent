@@ -37,6 +37,20 @@ pub(super) struct InflightDispatch {
 }
 
 #[derive(Debug, Clone)]
+pub(super) struct ActiveIssueDispatch {
+    pub(super) id: i64,
+    pub(super) status: DispatchState,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct IssueResumeDispatch {
+    pub(super) id: i64,
+    pub(super) status: DispatchState,
+    pub(super) target_role: String,
+    pub(super) codex_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub(super) struct QueuedDecision {
     pub(super) decision_id: i64,
     pub(super) event_id: i64,
@@ -52,6 +66,19 @@ pub(super) fn init_db(db_path: &Path) -> Result<()> {
     let mut conn = open_db(db_path)?;
     migrations::apply_all(&mut conn)?;
     Ok(())
+}
+
+fn parse_dispatch_state_literal(raw: &str, column: usize) -> rusqlite::Result<DispatchState> {
+    DispatchState::parse_db(raw).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid dispatch status in db: {raw}"),
+            )),
+        )
+    })
 }
 
 pub(super) fn open_db(path: &Path) -> Result<Connection> {
@@ -721,17 +748,8 @@ pub(super) fn latest_issue_inflight_dispatch(
                 running_status
             ],
             |row| {
-                let status: String = row.get(3)?;
-                let status = DispatchState::parse_db(&status).ok_or_else(|| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        3,
-                        rusqlite::types::Type::Text,
-                        Box::new(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("invalid dispatch status in db: {status}"),
-                        )),
-                    )
-                })?;
+                let status_raw: String = row.get(3)?;
+                let status = parse_dispatch_state_literal(&status_raw, 3)?;
                 let backend_kind_raw: Option<String> = row.get(5)?;
                 let backend_kind = backend_kind_raw
                     .as_deref()
@@ -776,17 +794,8 @@ pub(super) fn list_inflight_dispatches(db_path: &Path) -> Result<Vec<InflightDis
         ",
     )?;
     let rows = stmt.query_map(params![starting_status, running_status], |row| {
-        let status: String = row.get(3)?;
-        let status = DispatchState::parse_db(&status).ok_or_else(|| {
-            rusqlite::Error::FromSqlConversionFailure(
-                3,
-                rusqlite::types::Type::Text,
-                Box::new(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("invalid dispatch status in db: {status}"),
-                )),
-            )
-        })?;
+        let status_raw: String = row.get(3)?;
+        let status = parse_dispatch_state_literal(&status_raw, 3)?;
         let backend_kind_raw: Option<String> = row.get(5)?;
         let backend_kind = backend_kind_raw
             .as_deref()
@@ -815,6 +824,78 @@ pub(super) fn list_inflight_dispatches(db_path: &Path) -> Result<Vec<InflightDis
     })?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
+}
+
+pub(super) fn latest_issue_active_dispatch(
+    db_path: &Path,
+    repo_full_name: &str,
+    issue_number: u64,
+) -> Result<Option<ActiveIssueDispatch>> {
+    let conn = open_db(db_path)?;
+    let dispatch = conn
+        .query_row(
+            r"
+            SELECT id, status
+            FROM dispatches
+            WHERE repo_full_name = ?1
+              AND issue_number = ?2
+              AND status IN (?3, ?4, ?5, ?6)
+            ORDER BY id DESC
+            LIMIT 1
+            ",
+            params![
+                repo_full_name,
+                i64::try_from(issue_number)?,
+                DispatchState::Queued.as_db_str(),
+                DispatchState::Launching.as_db_str(),
+                DispatchState::Starting.as_db_str(),
+                DispatchState::Running.as_db_str(),
+            ],
+            |row| {
+                let status_raw: String = row.get(1)?;
+                let status = parse_dispatch_state_literal(&status_raw, 1)?;
+                Ok(ActiveIssueDispatch {
+                    id: row.get(0)?,
+                    status,
+                })
+            },
+        )
+        .optional()?;
+    Ok(dispatch)
+}
+
+pub(super) fn latest_issue_resume_dispatch(
+    db_path: &Path,
+    repo_full_name: &str,
+    issue_number: u64,
+) -> Result<Option<IssueResumeDispatch>> {
+    let conn = open_db(db_path)?;
+    let dispatch = conn
+        .query_row(
+            r"
+            SELECT id, status, target_role, codex_session_id
+            FROM dispatches
+            WHERE repo_full_name = ?1
+              AND issue_number = ?2
+              AND codex_session_id IS NOT NULL
+              AND codex_session_id != ''
+            ORDER BY id DESC
+            LIMIT 1
+            ",
+            params![repo_full_name, i64::try_from(issue_number)?],
+            |row| {
+                let status_raw: String = row.get(1)?;
+                let status = parse_dispatch_state_literal(&status_raw, 1)?;
+                Ok(IssueResumeDispatch {
+                    id: row.get(0)?,
+                    status,
+                    target_role: row.get(2)?,
+                    codex_session_id: row.get(3)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(dispatch)
 }
 
 pub(super) fn latest_repo_inflight_impl_dispatch_id(
@@ -1044,6 +1125,38 @@ mod tests {
         .expect("reserve dispatch")
     }
 
+    fn insert_dispatch_row(
+        db_path: &Path,
+        decision_id: i64,
+        issue_number: u64,
+        status: DispatchState,
+        target_role: &str,
+        codex_session_id: Option<&str>,
+    ) -> i64 {
+        let conn = super::open_db(db_path).expect("open db");
+        conn.execute(
+            r"
+            INSERT INTO dispatches
+            (decision_id, repo_full_name, issue_number, actor_login, directive, target_role, status, codex_session_id, started_at, ended_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            ",
+            params![
+                decision_id,
+                "main/orchd-debug",
+                i64::try_from(issue_number).expect("issue number fits i64"),
+                "main",
+                DIRECTIVE_POKE,
+                target_role,
+                status.as_db_str(),
+                codex_session_id,
+                Utc::now().to_rfc3339(),
+                Utc::now().to_rfc3339(),
+            ],
+        )
+        .expect("insert dispatch");
+        conn.last_insert_rowid()
+    }
+
     fn seed_decision_id(db_path: &Path) -> i64 {
         let conn = super::open_db(db_path).expect("open db");
         let now = Utc::now().to_rfc3339();
@@ -1200,6 +1313,71 @@ mod tests {
             )
             .expect("fetch status");
         assert_eq!(status, DispatchState::FailedRuntime.as_db_str());
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn latest_issue_active_dispatch_finds_non_terminal_row() {
+        let db_path = temp_db_path("issue-active");
+        super::init_db(&db_path).expect("db init");
+        let decision_id = seed_decision_id(&db_path);
+        let _completed = insert_dispatch_row(
+            &db_path,
+            decision_id,
+            12,
+            DispatchState::Completed,
+            "codex-orch",
+            Some("019c63c6-d558-7a63-b126-0441644aa84c"),
+        );
+        let active_id = insert_dispatch_row(
+            &db_path,
+            decision_id,
+            12,
+            DispatchState::Running,
+            "codex-orch",
+            Some("019c63c6-d558-7a63-b126-0441644aa84c"),
+        );
+
+        let active = super::latest_issue_active_dispatch(&db_path, "main/orchd-debug", 12)
+            .expect("query active dispatch")
+            .expect("active dispatch present");
+        assert_eq!(active.id, active_id);
+        assert_eq!(active.status, DispatchState::Running);
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn latest_issue_resume_dispatch_returns_latest_session_row() {
+        let db_path = temp_db_path("issue-resume-row");
+        super::init_db(&db_path).expect("db init");
+        let decision_id = seed_decision_id(&db_path);
+        let first_id = insert_dispatch_row(
+            &db_path,
+            decision_id,
+            15,
+            DispatchState::Completed,
+            "codex-orch",
+            Some("session-old"),
+        );
+        let second_id = insert_dispatch_row(
+            &db_path,
+            decision_id,
+            15,
+            DispatchState::FailedRuntime,
+            "codex-orch",
+            None,
+        );
+
+        let latest = super::latest_issue_resume_dispatch(&db_path, "main/orchd-debug", 15)
+            .expect("query latest dispatch")
+            .expect("latest dispatch present");
+        assert_eq!(second_id, first_id + 1);
+        assert_eq!(latest.id, first_id);
+        assert_eq!(latest.status, DispatchState::Completed);
+        assert_eq!(latest.target_role, "codex-orch");
+        assert_eq!(latest.codex_session_id.as_deref(), Some("session-old"));
 
         let _ = fs::remove_file(db_path);
     }
