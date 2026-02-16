@@ -10,10 +10,10 @@
 {{dispatch_md}}
 
 ## Important: you are being dispatched via headless orchestrator (orchd)
-No user is reading your output. Your communication, if any, must take the form
-of an issue reply (strongly preferred one per turn, though not mandatory).
-issued via `forgejoctl`. Please observe good issue etiquette and use clear
-natural language.
+No user is directly reading your terminal output.
+If you need to communicate, do it as an issue reply via `forgejoctl`.
+One concise issue reply per turn is strongly preferred.
+Observe good issue etiquette and use clear natural language.
 
 {{orders_md}}
 
