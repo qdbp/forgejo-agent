@@ -342,11 +342,6 @@ fn build_issue_md_followup(plan: &DispatchPlan) -> String {
     } else {
         plan.issue_delta_summary.clone()
     };
-    let body = if plan.issue_body.trim().is_empty() {
-        "(empty)".to_string()
-    } else {
-        plan.issue_body.clone()
-    };
     format!(
         r"## Issue
 
@@ -355,13 +350,9 @@ Title:
 
 What's new since your last turn:
 {delta}
-
-Body (for reference):
-{body}
 ",
         title = plan.issue_title,
         delta = delta,
-        body = body
     )
 }
 

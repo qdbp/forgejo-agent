@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
@@ -384,31 +385,79 @@ pub(super) fn issue_delta_rows(
 }
 
 pub(super) fn summarize_issue_delta(rows: &[IssueEventDeltaRow]) -> String {
+    const MAX_DELTA_LINES: usize = 32;
+    const MAX_LINE_CHARS: usize = 220;
+
+    fn normalize_single_line(raw: &str) -> String {
+        raw.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    fn truncate_for_line(mut text: String) -> String {
+        if text.chars().count() > MAX_LINE_CHARS {
+            text = format!(
+                "{}...",
+                text.chars().take(MAX_LINE_CHARS).collect::<String>()
+            );
+        }
+        text
+    }
+
     if rows.is_empty() {
         return "(no new issue events since last handled dispatch)".to_string();
     }
 
-    rows.iter()
-        .map(|row| {
-            let timestamp = row
-                .source_created_at
-                .as_deref()
-                .filter(|text| !text.trim().is_empty())
-                .unwrap_or(row.received_at.as_str());
-            let actor = row
-                .actor_login
-                .as_deref()
-                .filter(|text| !text.trim().is_empty())
-                .unwrap_or("unknown");
-            let mut text = row.event_text.as_deref().unwrap_or("").replace('\n', " ");
-            text = text.trim().to_string();
-            if text.chars().count() > 220 {
-                text = format!("{}...", text.chars().take(220).collect::<String>());
-            }
-            format!("- [{}] {} {}: {}", timestamp, actor, row.event_type, text)
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut seen = HashSet::<(String, String, String)>::new();
+    let mut lines = Vec::<String>::new();
+
+    for row in rows {
+        let timestamp = row
+            .source_created_at
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+            .unwrap_or(row.received_at.as_str());
+        let actor = row
+            .actor_login
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+            .unwrap_or("unknown");
+        let normalized = normalize_single_line(row.event_text.as_deref().unwrap_or(""));
+        if normalized.is_empty() {
+            continue;
+        }
+        let dedupe_key = (
+            row.event_type.clone(),
+            actor.to_string(),
+            normalized.clone(),
+        );
+        if !seen.insert(dedupe_key) {
+            continue;
+        }
+        lines.push(format!(
+            "- [{}] {} {}: {}",
+            timestamp,
+            actor,
+            row.event_type,
+            truncate_for_line(normalized)
+        ));
+        if lines.len() >= MAX_DELTA_LINES {
+            break;
+        }
+    }
+
+    if lines.is_empty() {
+        return "(no new issue events since last handled dispatch)".to_string();
+    }
+
+    let omitted_total = rows.len().saturating_sub(lines.len());
+    if omitted_total > 0 {
+        lines.push(format!(
+            "- (omitted {} additional or duplicate event{})",
+            omitted_total,
+            if omitted_total == 1 { "" } else { "s" }
+        ));
+    }
+
+    lines.join("\n")
 }
 
 struct DispatchTransitionPlan {
@@ -2009,5 +2058,37 @@ mod tests {
         assert_eq!(queued[0].record.issue_number, Some(1));
 
         let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn summarize_issue_delta_dedupes_repeated_rows() {
+        let rows = vec![
+            super::IssueEventDeltaRow {
+                event_type: EVENT_ISSUES.to_string(),
+                actor_login: Some("codex-orch".to_string()),
+                event_text: Some("same body text".to_string()),
+                received_at: "2026-01-01T00:00:00Z".to_string(),
+                source_created_at: Some("2026-01-01T00:00:00Z".to_string()),
+            },
+            super::IssueEventDeltaRow {
+                event_type: EVENT_ISSUES.to_string(),
+                actor_login: Some("codex-orch".to_string()),
+                event_text: Some("same body text".to_string()),
+                received_at: "2026-01-01T00:00:01Z".to_string(),
+                source_created_at: Some("2026-01-01T00:00:01Z".to_string()),
+            },
+            super::IssueEventDeltaRow {
+                event_type: EVENT_ISSUE_COMMENT.to_string(),
+                actor_login: Some("main".to_string()),
+                event_text: Some("please do x".to_string()),
+                received_at: "2026-01-01T00:00:02Z".to_string(),
+                source_created_at: Some("2026-01-01T00:00:02Z".to_string()),
+            },
+        ];
+
+        let summary = super::summarize_issue_delta(&rows);
+        assert_eq!(summary.matches("codex-orch issues").count(), 1);
+        assert_eq!(summary.matches("main issue_comment").count(), 1);
+        assert!(summary.contains("omitted 1 additional or duplicate event"));
     }
 }
