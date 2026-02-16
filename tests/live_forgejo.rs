@@ -865,6 +865,7 @@ fn write_orchd_dispatch_toml(path: &Path, inputs: OrchdDispatchTomlInputs<'_>) -
     use std::fmt::Write as _;
 
     let prompts_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("prompts");
+    let preamble = prompts_dir.join("orchd-preamble.md");
     let fresh_env = prompts_dir.join("orchd-envelope-fresh.md");
     let follow_env = prompts_dir.join("orchd-envelope-followup.md");
 
@@ -882,6 +883,7 @@ fn write_orchd_dispatch_toml(path: &Path, inputs: OrchdDispatchTomlInputs<'_>) -
     writeln!(&mut out, "remain_on_exit = false\n")?;
 
     writeln!(&mut out, "[prompt_envelopes]")?;
+    writeln!(&mut out, "preamble_file = \"{}\"", preamble.display())?;
     writeln!(&mut out, "fresh_envelope = \"{}\"", fresh_env.display())?;
     writeln!(
         &mut out,
