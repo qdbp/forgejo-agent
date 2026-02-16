@@ -52,7 +52,10 @@ pub(super) async fn run_server(cli: Cli) -> Result<()> {
     };
     let config_override = cli.config.clone();
     let cfg = AgentConfig::load(cli.config, cli.token_file)?;
-    enforce_machine_identity(&cfg)?;
+    let identity_cfg = cfg.clone();
+    tokio::task::spawn_blocking(move || enforce_machine_identity(&identity_cfg))
+        .await
+        .context("startup identity guard task failed")??;
     let dispatch_config_path = expand_tilde_path(&cli.dispatch_config)?;
     let dispatch_config = match cli.dispatch_mode {
         DispatchMode::DryRun => None,

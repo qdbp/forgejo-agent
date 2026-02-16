@@ -1018,6 +1018,9 @@ fn write_orchd_dispatch_toml(path: &Path, inputs: OrchdDispatchTomlInputs<'_>) -
     let preamble = prompts_dir.join("orchd-preamble.md");
     let fresh_env = prompts_dir.join("orchd-envelope-fresh.md");
     let follow_env = prompts_dir.join("orchd-envelope-followup.md");
+    let turn_context = prompts_dir.join("orchd-turn-context.md");
+    let issue_fresh = prompts_dir.join("orchd-issue-fresh.md");
+    let issue_followup = prompts_dir.join("orchd-issue-followup.md");
 
     let mut out = String::new();
     writeln!(&mut out, "version = 1")?;
@@ -1031,10 +1034,17 @@ fn write_orchd_dispatch_toml(path: &Path, inputs: OrchdDispatchTomlInputs<'_>) -
     writeln!(&mut out, "[prompt_envelopes]")?;
     writeln!(&mut out, "preamble_file = \"{}\"", preamble.display())?;
     writeln!(&mut out, "fresh_envelope = \"{}\"", fresh_env.display())?;
+    writeln!(&mut out, "followup_envelope = \"{}\"", follow_env.display())?;
     writeln!(
         &mut out,
-        "followup_envelope = \"{}\"\n",
-        follow_env.display()
+        "turn_context_file = \"{}\"",
+        turn_context.display()
+    )?;
+    writeln!(&mut out, "issue_fresh_file = \"{}\"", issue_fresh.display())?;
+    writeln!(
+        &mut out,
+        "issue_followup_file = \"{}\"\n",
+        issue_followup.display()
     )?;
 
     writeln!(&mut out, "[roles.codex-orch]")?;
@@ -1852,6 +1862,36 @@ fn live_orchd_impl_autoland_updates_remote_main() -> Result<()> {
     let git = GitWorkspace::from_fixture(&harness.fixture, &harness.repo_name)?;
     let before_head = git.bare_head_main()?;
     let before_count = git.bare_commit_count_main()?;
+    let backup_origin = harness
+        .fixture
+        .work_path
+        .join(format!("{}-origin-backup.git", harness.repo_name));
+    let mut init_backup = Command::new("git");
+    init_backup.args(["init", "--bare"]).arg(&backup_origin);
+    run_command_checked(&mut init_backup, "git init --bare backup origin remote")?;
+    let backup_origin_str = backup_origin.to_string_lossy().into_owned();
+    git_output_checked(
+        &harness.principal_workdir,
+        &["push", &backup_origin_str, "main:main"],
+        "git push main to backup origin remote",
+    )?;
+    git_output_checked(
+        &harness.principal_workdir,
+        &["remote", "set-url", "origin", &backup_origin_str],
+        "git remote set-url origin <backup>",
+    )?;
+    let forgejo_bare = harness.fixture.repo_git_dir(&harness.repo_name);
+    let forgejo_bare_str = forgejo_bare.to_string_lossy().into_owned();
+    git_output_checked(
+        &harness.principal_workdir,
+        &["remote", "add", "forgejo", &forgejo_bare_str],
+        "git remote add forgejo <fixture bare>",
+    )?;
+    git_output_checked(
+        &harness.principal_workdir,
+        &["fetch", "origin", "main"],
+        "git fetch origin main (backup remote)",
+    )?;
 
     let fake_codex = ensure_fake_codex_bin()?;
     let forgejoctl = forgejo_agent_bin()?;
@@ -1924,6 +1964,16 @@ fn live_orchd_impl_autoland_updates_remote_main() -> Result<()> {
     if principal_head != after_head {
         bail!(
             "expected principal workspace to sync to landed commit (principal={principal_head} remote={after_head})"
+        );
+    }
+    let origin_head = stdout_trim(&git_output_checked(
+        &harness.principal_workdir,
+        &["rev-parse", "origin/main"],
+        "git rev-parse origin/main (backup remote)",
+    )?)?;
+    if origin_head == after_head {
+        bail!(
+            "expected principal sync source to be Forgejo, but principal landed on origin/main (origin={origin_head} landed={after_head})"
         );
     }
 

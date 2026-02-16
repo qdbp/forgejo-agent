@@ -383,6 +383,10 @@ pub(super) fn autoland_and_sync_principal(
         dispatch_workdir,
         &["rev-parse", "--short", "HEAD"],
     )?);
+    let dispatch_remote_url = git_stdout_trim(&git_checked(
+        dispatch_workdir,
+        &["remote", "get-url", remote],
+    )?);
     let _ = git_checked_with_token(
         db_path,
         token_file,
@@ -425,30 +429,28 @@ pub(super) fn autoland_and_sync_principal(
         db_path,
         token_file,
         Some(principal_workdir),
-        &["fetch", remote, base_branch],
+        &["fetch", &dispatch_remote_url, base_branch],
     )?;
+    let fetched_head = git_stdout_trim(&git_checked(
+        principal_workdir,
+        &["rev-parse", "FETCH_HEAD"],
+    )?);
     let principal_before = git_stdout_trim(&git_checked(
         principal_workdir,
         &["rev-parse", "--short", "HEAD"],
     )?);
-    let remote_ref = format!("{remote}/{base_branch}");
-    git_checked(principal_workdir, &["merge", "--ff-only", &remote_ref])?;
+    git_checked(principal_workdir, &["merge", "--ff-only", "FETCH_HEAD"])?;
     let principal_after = git_stdout_trim(&git_checked(principal_workdir, &["rev-parse", "HEAD"])?);
     let principal_after_short = git_stdout_trim(&git_checked(
         principal_workdir,
         &["rev-parse", "--short", "HEAD"],
     )?);
-    let remote_after = git_stdout_trim(&git_checked(
-        principal_workdir,
-        &["rev-parse", &remote_ref],
-    )?);
 
-    if principal_after != remote_after {
+    if principal_after != fetched_head {
         return Err(anyhow!(
-            "principal workspace sync mismatch: HEAD={} but {}={}",
+            "principal workspace sync mismatch: HEAD={} but FETCH_HEAD={}",
             principal_after,
-            remote_ref,
-            remote_after
+            fetched_head
         ));
     }
     if principal_after != dispatch_head {
@@ -462,7 +464,7 @@ pub(super) fn autoland_and_sync_principal(
     Ok(vec![
         format!("autoland: pushed {dispatch_head_short} -> {remote}/{base_branch}"),
         format!(
-            "workspace_sync: {} {} -> {}",
+            "workspace_sync: {} {} -> {} (source={dispatch_remote_url})",
             principal_workdir.display(),
             principal_before,
             principal_after_short
