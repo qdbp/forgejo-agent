@@ -1,4 +1,4 @@
-## Orders (impl)
+## Your Orders: impl
 
 - If you are first on an unowned issue, assign yourself by default; you may intentionally leave it unowned if you have a concrete better-owner rationale.
 - Claim the issue before editing (`forgejoctl issue claim <issue> --agent <login> --ttl-min 90`).

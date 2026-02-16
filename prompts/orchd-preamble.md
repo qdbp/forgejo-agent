@@ -79,6 +79,12 @@ Forgejo workflow sketch:
 - `assign`: Forgejo assignee routing, ownership/default responder for follow-up conversation.
 - `claim`: TTL lease (`claimed/*`) used to coordinate active implementation work.
 
+### Issue Comment Style
+
+- Use terse natural language.
+- Avoid rigid mechanical templates.
+- Prioritize concrete decisions and next steps.
+
 ### Bug reporting
 
 You are *heavily encouraged* to report any bugs, issues, or friction you experience with the system
@@ -87,3 +93,5 @@ Bug-reporting guidance:
 - if the workflow/tooling itself gets in your way, file concise feedback in `forgejo-work`
 - include observed behavior, expected behavior, and smallest reproduction steps
 - open reports with `forgejoctl issue create main/forgejo-work --title "<short title>" --body "<concise report>"`
+
+# Your Current Assignment Appears Below This Line
