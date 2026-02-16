@@ -1,13 +1,17 @@
-# orchd Core Refactor Plan (SQLite-First Telemetry)
+# orchd Core Refactor Plan (SQLite-First Telemetry, Historical)
 
-> Historical note: this plan predates tmux removal. Current runtime path is `exec` with `systemd`/`local` backends.
+Status: historical design record.
+
+Use `docs/ORCHD_DEV.md` for current runtime/operator behavior.
+This document captures refactor intent and rationale; some sections mention
+paths (for example tmux backend) that were later removed.
 
 ## 1. Goals
 
 - Refactor orchd into a typed, backend-agnostic orchestration core.
 - Keep SQLite as the sole dispatch/lock source of truth.
 - Keep telemetry SQLite-first (queryable by agents); avoid OTel for now.
-- Preserve tmux/TUI operator ergonomics while enabling deterministic local tests.
+- Preserve deterministic local tests and restart-resilient dispatch execution.
 - Keep issue comments natural-language; no model-output parsing contract.
 
 ## 2. Non-goals (This Phase)
@@ -68,7 +72,7 @@ requiring a metrics backend in early dogfooding.
 
 ## 5. Backend Strategy
 
-- `TmuxBackend`: operator-facing default backend.
+- `SystemdBackend`: restart-resilient default backend.
 - `LocalBackend`: detached process backend for deterministic integration tests.
 - Optional `MockBackend`: only if LocalBackend + fake-codex leaves gaps.
 
@@ -116,12 +120,12 @@ Exit criteria:
 
 ## CP3: Backend abstraction + adapters
 
-- Introduce backend trait and plug in `TmuxBackend`.
+- Introduce backend trait and plug in runtime adapters.
 - Add `LocalBackend` for integration harness.
 
 Exit criteria:
 
-- Coordinator no longer issues raw tmux/process commands directly.
+- Coordinator no longer issues raw backend-specific commands directly.
 
 ## CP4: Remove shell-owned control-plane side effects
 
@@ -162,7 +166,7 @@ Exit criteria:
 
 - Tier 0: `python3 scripts/check.py` on every commit.
 - Tier 1: live Forgejo + orchd LocalBackend integration tests for core orchd changes.
-- Tier 2: tmux adapter smoke tests (env-gated/manual or nightly).
+- Tier 2: backend adapter smoke tests (env-gated/manual or nightly).
 - Keep timing budgets visible to prevent test-latency drift.
 
 ## 8. Open decisions to resolve before/within CP1

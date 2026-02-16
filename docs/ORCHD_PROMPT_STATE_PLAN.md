@@ -1,6 +1,8 @@
-# orchd Prompt + State Plan (Draft)
+# orchd Prompt + State Plan (Historical Draft)
 
-Status: draft v0.1
+Status: historical draft, partially implemented.
+
+Use `docs/ORCHD_DEV.md` for current canonical runtime behavior.
 
 ## Intent
 
@@ -104,7 +106,7 @@ Fresh envelope must include:
 
 1. org/authority snapshot
 2. Forgejo workflow sketch + doc pointers
-3. bug-reporting guidance (`forgejo-work` feedback encouraged)
+3. bug-reporting guidance (`forgejo-agent` feedback encouraged)
 4. directive contract (`design`/`impl`/`poke`)
 5. task payload
 
@@ -181,7 +183,6 @@ Acceptance:
 - Timebox-based forced blocking.
 - Multi-role dispatch graph execution.
 - Replacing sqlite as dispatch lock source of truth.
-- Auto-poke from assignment/reply heuristics.
 
 ## Risks + Mitigations
 

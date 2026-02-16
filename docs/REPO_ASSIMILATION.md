@@ -59,7 +59,18 @@ Do this once per installation, not per repo:
 cargo run --bin orchd -- role check
 ```
 
-### Role Credential Bootstrap (No Root Path)
+Preferred role onboarding path (before repo assimilation):
+
+```bash
+cargo run --bin orchd -- role add \
+  --role codex-dev \
+  --rank OF-2 \
+  --forgejo-login codex-dev \
+  --admin-token-file ~/.config/forgejo-agent/creds/codex-orch.token \
+  --create-user
+```
+
+### Role Credential Bootstrap (No Root Path, Manual Fallback)
 
 If a role exists in Forgejo but `~/.config/forgejo-agent/creds/<role>.token` is
 missing, bootstrap it in-band:

@@ -18,7 +18,7 @@ This picks one `state/ready` issue (without `claimed/*`), prints the Codex promp
   --workdir /home/main/programming/projects/your-repo \
   --execute \
   --interval-sec 45 \
-  --agent codex-main
+  --agent codex-dev
 ```
 
 Optional: auto-close issues after successful run.

@@ -60,7 +60,7 @@ sudo -u forgejo forgejo admin user create \
 TOKEN="$(sudo -u forgejo forgejo admin user generate-access-token \
   --config /etc/forgejo/app.ini \
   --username main \
-  --token-name "codex-main-$(date +%Y%m%d-%H%M%S)" \
+  --token-name "main-admin-$(date +%Y%m%d-%H%M%S)" \
   --scopes all \
   --raw)"
 
@@ -180,7 +180,7 @@ sudo chmod 0644 /home/codex-dev/.config/forgejo-agent/config.env
 sudo tee /home/codex-orch/.config/forgejo-agent/config.env >/dev/null <<'EOF'
 FORGEJO_BASE_URL=http://127.0.0.1:3000
 FORGEJO_DEFAULT_OWNER=main
-FORGEJO_DEFAULT_REPO=forgejo-work
+FORGEJO_DEFAULT_REPO=forgejo-agent
 FORGEJO_AGENT_NAME=codex-orch
 FORGEJO_LEASE_MINUTES=90
 EOF
@@ -190,7 +190,7 @@ sudo chmod 0644 /home/codex-orch/.config/forgejo-agent/config.env
 sudo tee /home/codex-lead/.config/forgejo-agent/config.env >/dev/null <<'EOF'
 FORGEJO_BASE_URL=http://127.0.0.1:3000
 FORGEJO_DEFAULT_OWNER=main
-FORGEJO_DEFAULT_REPO=forgejo-work
+FORGEJO_DEFAULT_REPO=forgejo-agent
 FORGEJO_AGENT_NAME=codex-lead
 FORGEJO_LEASE_MINUTES=90
 EOF

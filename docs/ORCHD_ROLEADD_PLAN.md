@@ -1,5 +1,18 @@
 # orchd `roleadd` Design (v0)
 
+Status: active design + implementation notes.
+
+Implemented now:
+- `orchd role list`
+- `orchd role check`
+- `orchd role add` (with local rollback on failure)
+- strict dispatch-config invariants for role token/login mapping
+
+Still pending:
+- remote compensation for minted tokens/users on late failure
+- optional startup-enforced role checks
+- assimilation-script preflight integration
+
 ## Why this exists
 
 Role drift caused a control-plane integrity failure:
@@ -78,7 +91,7 @@ Optional:
 - `--token-file <path>` (default `~/.config/forgejo-agent/creds/<role>.token`)
 - `--codex-bin <path>` (default from dispatch config)
 - `--can-dispatch` (if role should be in `allowed_actors`)
-- `--scream-repo <owner/repo>` (default `main/forgejo-work`)
+- `--scream-repo <owner/repo>` (default `main/forgejo-agent`)
 - `--scream-permission <read|write>` (default `write`)
 - `--admin-token-file <path>` (required for Forgejo provisioning)
 - `--create-user` (create Forgejo user if missing)

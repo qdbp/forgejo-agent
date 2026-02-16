@@ -30,9 +30,11 @@ Run Tier 0 + Tier 1 if a change touches any of:
 - `tests/live_forgejo.rs`
 
 Run Tier 0 + Tier 2 if a change touches any of:
-- `src/bin/orchd.rs`
+- `src/bin/orchd/*.rs`
 - `config/orchd-dispatch.toml`
 - `prompts/orchd-*.md`
+- `prompts/roles/*.md`
+- `templates/role-card-template.md`
 
 Run all three tiers if a change touches both `forgejoctl` and `orchd` surfaces.
 

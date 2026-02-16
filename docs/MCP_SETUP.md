@@ -16,7 +16,7 @@ Wrapper resolution order:
 1. `FORGEJO_MCP_BIN` from config/env
 2. `forgejo-mcp` on `PATH`
 3. `~/.local/bin/forgejo-mcp`
-4. legacy fallback `~/go/bin/forgejo-mcp`
+4. legacy fallback `~/go/bin/forgejo-mcp` (deprecated compatibility path)
 
 ## 2) Use token-aware wrapper
 
@@ -56,7 +56,7 @@ codex mcp list
 
 Then in a Codex session, ask it to list/open Forgejo issues using MCP tools.
 
-## 5) Optional migration away from `~/go`
+## 5) Optional migration away from `~/go` (recommended)
 
 If you previously used `go install`, move the binary:
 

@@ -142,12 +142,12 @@ cargo run --bin orchd -- \
 Re-open the latest recorded session for an issue:
 
 ```bash
-cargo run --bin orchd -- issue resume forgejo-work 20 -- --no-alt-screen
+cargo run --bin orchd -- issue resume forgejo-agent 20 -- --no-alt-screen
 ```
 
 Behavior is intentionally strict:
 
-- owner is hardcoded to `main` (`forgejo-work 20` maps to `main/forgejo-work#20`)
+- owner is hardcoded to `main` (`forgejo-agent 20` maps to `main/forgejo-agent#20`)
 - errors if any non-terminal dispatch exists for that issue
 - errors if no `codex_session_id` exists in dispatch history
 - never falls back to spawning a fresh Codex session

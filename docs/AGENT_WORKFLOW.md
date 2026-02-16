@@ -4,7 +4,7 @@
 
 - Every work issue must include acceptance checks.
 - Prefer filing issues in the repo that will be modified (orchd maps repo -> local checkout automatically).
-- For cross-repo/system issues (for example `main/forgejo-work`), explicitly name the target repo(s).
+- For cross-repo/system issues (for example `main/forgejo-agent`), explicitly name the target repo(s).
 - If blocked, agent must transition the issue to `state/blocked` and post a terse natural-language unblock comment.
 - Agents must claim before editing, then release or close when done.
 - Branches and commits must reference issue ID.

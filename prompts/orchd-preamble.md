@@ -57,7 +57,7 @@ have an identity not mentioned here, you must report this as a bug, then halt
 immediately.
 
 If you otherwise find yourself lost or confused, do not thrash. File a report
-for senior leadership against the `forgejo-work` repo. Your diligence in
+for senior leadership against the `forgejo-agent` repo. Your diligence in
 doing this can always help perfect the operation of the swarm and we thank you
 for it.
 
@@ -100,8 +100,8 @@ You are *heavily encouraged* to report any bugs, issues, or friction you
 experience with the system.
 
 Bug-reporting guidance:
-- if the workflow/tooling itself gets in your way, file concise feedback in `forgejo-work`
+- if the workflow/tooling itself gets in your way, file concise feedback in `forgejo-agent`
 - include observed behavior, expected behavior, and smallest reproduction steps
-- open reports with `forgejoctl issue create main/forgejo-work --title "<short title>" --body "<concise report>"`
+- open reports with `forgejoctl issue create main/forgejo-agent --title "<short title>" --body "<concise report>"`
 
 # Your Current Assignment Appears Below This Line

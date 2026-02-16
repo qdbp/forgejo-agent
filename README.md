@@ -92,8 +92,8 @@ EOF
 /home/main/.local/bin/forgejoctl issue orchd-state main/backlog#1 --to running
 
 # Claim/release and blocker flow
-/home/main/.local/bin/forgejoctl issue claim main/backlog#1 --agent codex-main
-/home/main/.local/bin/forgejoctl issue release main/backlog#1 --agent codex-main
+/home/main/.local/bin/forgejoctl issue claim main/backlog#1 --agent codex-dev
+/home/main/.local/bin/forgejoctl issue release main/backlog#1 --agent codex-dev
 /home/main/.local/bin/forgejoctl issue blocker main/backlog#1 --title "Need Y" --body "Details"
 
 # Safe multiline body via stdin (no \n escaping footguns)
@@ -112,7 +112,7 @@ EOF
   --workdir /home/main/programming/projects/your-repo \
   --execute \
   --interval-sec 45 \
-  --agent codex-main
+  --agent codex-dev
 ```
 
 ## `orchd` Dev Mode
@@ -121,7 +121,7 @@ EOF
 
 Current mode supports both:
 
-- `dry-run`: parse directives and post intent comments only
+- `dry-run`: parse directives and persist decisions only (no dispatch launch)
 - `exec` (default): explicit non-interactive dispatch (`codex exec`)
 
 Core behavior:
@@ -139,6 +139,14 @@ Role launch wrapper:
 
 - `orchd` dispatches Codex through the repo-managed wrapper `bin/codex-role` (configured in `config/orchd-dispatch.toml`), not by clobbering `/usr/bin/codex`.
 - `orchd` service auth uses `~/.config/forgejo-agent/creds/orchd.token` so orchestrator actions never impersonate `main`.
+
+Role hygiene commands:
+
+```bash
+cargo run --bin orchd -- role list
+cargo run --bin orchd -- role check
+cargo run --bin orchd -- role check --role codex-dev --json
+```
 
 Run (`exec`, default + restart-resilient backend):
 
@@ -303,8 +311,9 @@ python3 /home/main/forgejo-agent/scripts/check.py
 - `docs/AGENT_WORKFLOW.md`
 - `docs/WORKER_LOOP.md`
 - `docs/ORCHD_DEV.md`
-- `docs/ORCHD_PROMPT_STATE_PLAN.md`
-- `docs/ORCHD_REFACTOR_PLAN.md`
+- `docs/ORCHD_ROLEADD_PLAN.md`
+- `docs/ORCHD_PROMPT_STATE_PLAN.md` (historical draft)
+- `docs/ORCHD_REFACTOR_PLAN.md` (historical design record)
 - `docs/MCP_SETUP.md`
 - `docs/SECURITY.md`
 - `docs/skill-sync/checklist.md`

@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/home/main/.local/bin/forgejoctl worker run --repo main/backlog --workdir /home/main/programming/projects/REPLACE_ME --execute --interval-sec 45 --agent codex-main
+ExecStart=/home/main/.local/bin/forgejoctl worker run --repo main/backlog --workdir /home/main/programming/projects/REPLACE_ME --execute --interval-sec 45 --agent codex-dev
 Restart=always
 RestartSec=5
 WorkingDirectory=/home/main
