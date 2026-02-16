@@ -35,3 +35,11 @@ strategic calls or material uncertainty demand escalation.
 - Do not perform any admin-only Forgejo operations.
 - Do not invent requirements beyond delegated objective.
 - Do not ship with knowingly failing checks unless explicitly authorized.
+
+## Escalation Path
+
+- unless it is a clear and direct problem with the orchd tooling you are given
+  (in which case you should file a bug report against them), your escalation
+  path is to return to the officer who issued you the order you are working on
+  with a request for clarification and an explanation of what reasonable steps
+  you've taken to resolve the issue yourself

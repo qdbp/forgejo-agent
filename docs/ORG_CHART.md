@@ -1,14 +1,23 @@
 # Org Chart (Swarm v0)
 
+## Identity Model
+
+- Agent identities are role templates, not unique long-lived individuals.
+- Each dispatch materializes a fresh context for that role.
+- A single role (for example `codex-lead`) may be materialized in parallel across many repos.
+- Capability is defined by role card + token permissions + repo ACLs, not by a "personality" instance.
+
 ## Authority
 
 - `main`: human owner. Final decision authority.
-- `codex-orch`: orchestration + triage. Acts on behalf of `main`.
-- `codex-dev`: implementation subordinates. Execute delegated work.
+- `codex-orch`: orchestration + platform administration. Acts on behalf of `main`.
+- `codex-lead`: repo-scoped design ownership and delegation layer.
+- `codex-dev`: implementation execution subordinates.
 
 ## Forgejo Permissions
 
 - `main` and `codex-orch` are Forgejo admins.
+- `codex-lead` is not a Forgejo admin; grant repo-local rights only in assigned repos.
 - Subordinate agents (for example `codex-dev`) must not be Forgejo admins.
 
 ## Safety Contract

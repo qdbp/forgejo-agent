@@ -96,9 +96,11 @@ Create local OS users for role separation:
 
 ```bash
 id -u codex-dev >/dev/null 2>&1 || sudo useradd --create-home --shell /bin/bash codex-dev
+id -u codex-lead >/dev/null 2>&1 || sudo useradd --create-home --shell /bin/bash codex-lead
 id -u codex-orch >/dev/null 2>&1 || sudo useradd --create-home --shell /bin/bash codex-orch
 
 sudo install -d -m 0755 -o codex-dev -g codex-dev /home/codex-dev/.config/forgejo-agent
+sudo install -d -m 0755 -o codex-lead -g codex-lead /home/codex-lead/.config/forgejo-agent
 sudo install -d -m 0755 -o codex-orch -g codex-orch /home/codex-orch/.config/forgejo-agent
 ```
 
@@ -106,6 +108,7 @@ Create Forgejo users and tokens (run admin CLI as `forgejo`):
 
 ```bash
 DEV_PW="$(openssl rand -base64 24)"
+LEAD_PW="$(openssl rand -base64 24)"
 ORCH_PW="$(openssl rand -base64 24)"
 
 sudo -u forgejo forgejo admin user create \
@@ -114,6 +117,13 @@ sudo -u forgejo forgejo admin user create \
   --email codex-dev@localhost \
   --must-change-password=false \
   --password "$DEV_PW" || true
+
+sudo -u forgejo forgejo admin user create \
+  --config /etc/forgejo/app.ini \
+  --username codex-lead \
+  --email codex-lead@localhost \
+  --must-change-password=false \
+  --password "$LEAD_PW" || true
 
 sudo -u forgejo forgejo admin user create \
   --config /etc/forgejo/app.ini \
@@ -130,6 +140,13 @@ DEV_TOKEN="$(sudo -u forgejo forgejo admin user generate-access-token \
   --scopes all \
   --raw)"
 
+LEAD_TOKEN="$(sudo -u forgejo forgejo admin user generate-access-token \
+  --config /etc/forgejo/app.ini \
+  --username codex-lead \
+  --token-name "codex-lead-$(date +%Y%m%d-%H%M%S)" \
+  --scopes all \
+  --raw)"
+
 ORCH_TOKEN="$(sudo -u forgejo forgejo admin user generate-access-token \
   --config /etc/forgejo/app.ini \
   --username codex-orch \
@@ -143,6 +160,7 @@ Store tokens as root-managed credentials:
 ```bash
 sudo install -d -m 0750 -o root -g root /etc/forgejo-agent/creds
 printf '%s\n' "$DEV_TOKEN" | sudo install -m 0640 -o root -g codex-dev /dev/stdin /etc/forgejo-agent/creds/codex-dev.token
+printf '%s\n' "$LEAD_TOKEN" | sudo install -m 0640 -o root -g codex-lead /dev/stdin /etc/forgejo-agent/creds/codex-lead.token
 printf '%s\n' "$ORCH_TOKEN" | sudo install -m 0640 -o root -g codex-orch /dev/stdin /etc/forgejo-agent/creds/codex-orch.token
 ```
 
@@ -168,6 +186,16 @@ FORGEJO_LEASE_MINUTES=90
 EOF
 sudo chown codex-orch:codex-orch /home/codex-orch/.config/forgejo-agent/config.env
 sudo chmod 0644 /home/codex-orch/.config/forgejo-agent/config.env
+
+sudo tee /home/codex-lead/.config/forgejo-agent/config.env >/dev/null <<'EOF'
+FORGEJO_BASE_URL=http://127.0.0.1:3000
+FORGEJO_DEFAULT_OWNER=main
+FORGEJO_DEFAULT_REPO=forgejo-work
+FORGEJO_AGENT_NAME=codex-lead
+FORGEJO_LEASE_MINUTES=90
+EOF
+sudo chown codex-lead:codex-lead /home/codex-lead/.config/forgejo-agent/config.env
+sudo chmod 0644 /home/codex-lead/.config/forgejo-agent/config.env
 ```
 
 Launch an isolated interactive dev session:

@@ -227,6 +227,21 @@ For Rust changes in this repo, run:
 python3 /home/main/forgejo-agent/scripts/check.py
 ```
 
+## Repo Assimilation
+
+To onboard another repository into orchd/Forgejo "it just works" mode, use the
+single-package runbook:
+
+- `docs/REPO_ASSIMILATION.md`
+
+Primary command:
+
+```bash
+/home/main/forgejo-agent/scripts/assimilate-repo.sh \
+  --repo owner/repo \
+  --local-path /home/main/programming/projects/repo
+```
+
 ## Live Forgejo Integration Test
 
 `tests/live_forgejo.rs` provides the first full round-trip test:

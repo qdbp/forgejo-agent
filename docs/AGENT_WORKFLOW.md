@@ -69,6 +69,8 @@ Start a line with one of these shorthands in an issue body/comment:
 - `@codex-orch investigate` (or `codex-orch investigate`)
 - `@codex-orch impl` (or `codex-orch impl`)
 - `@codex-orch poke` (or `codex-orch poke`)
+- `@codex-lead design` (or `codex-lead design`)
+- `@codex-dev impl` (or `codex-dev impl`)
 
 You can add suffix text on the same line only when the directive is immediately
 followed by `,`, `.`, `:`, or `;` (for example `@codex-orch design, open ended`).
@@ -79,6 +81,9 @@ Current semantics:
 - `investigate`: run bounded feasibility/current-state/options discovery in read-only mode; include evidence and concrete next-step guidance without auto-advancing workflow state.
 - `impl`: execute implementation loop and autoland to `main` on success (multiple impl turns may run in parallel; conflicts are handled via follow-up rebase turns).
 - `poke`: conversational “status/next action” response (read-only).
+
+Role note:
+- Roles are templates, not singular "people"; one role can be materialized in many parallel issue contexts.
 
 ## Traceability
 
