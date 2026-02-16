@@ -395,6 +395,47 @@ impl ForgejoFixture {
             .join(format!("{repo_name}.git"))
     }
 
+    fn create_principal_checkout(&self, repo_name: &str) -> Result<PathBuf> {
+        let bare_repo = self.repo_git_dir(repo_name);
+        if !bare_repo.is_dir() {
+            bail!(
+                "expected bare repo at {}, but it does not exist",
+                bare_repo.display()
+            );
+        }
+
+        let checkout = self.work_path.join("principal").join(repo_name);
+        if checkout.exists() {
+            fs::remove_dir_all(&checkout).with_context(|| {
+                format!("failed removing stale checkout {}", checkout.display())
+            })?;
+        }
+        if let Some(parent) = checkout.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed creating {}", parent.display()))?;
+        }
+
+        let mut clone = Command::new("git");
+        clone.args(["clone"]).arg(&bare_repo).arg(&checkout);
+        run_command_checked(&mut clone, "git clone principal checkout")?;
+
+        let head = stdout_trim(&git_output_checked(
+            &checkout,
+            &["rev-parse", "--abbrev-ref", "HEAD"],
+            "git rev-parse --abbrev-ref HEAD",
+        )?)?;
+        if head != "main" {
+            git_output_checked(
+                &checkout,
+                &["branch", "-f", "main", "HEAD"],
+                "git branch -f main HEAD",
+            )?;
+            git_output_checked(&checkout, &["checkout", "main"], "git checkout main")?;
+        }
+
+        Ok(checkout)
+    }
+
     fn authed_get(&self, path: &str) -> Result<Value> {
         let client = Client::builder()
             .timeout(Duration::from_secs(3))
@@ -758,6 +799,7 @@ struct LiveHarness {
     fixture: ForgejoFixture,
     repo_name: String,
     repo_ref: String,
+    principal_workdir: PathBuf,
     config_path: PathBuf,
     token_path: PathBuf,
 }
@@ -775,12 +817,14 @@ impl LiveHarness {
             run_cli_plain(&config_path, &token_path, &["repo", "ensure", &repo_ref])?;
         timer.record("repo.ensure", start)?;
         ensure_contains(&ensure_output, "repo ensured", "repo ensure output")?;
+        let principal_workdir = fixture.create_principal_checkout(&repo_name)?;
 
         Ok(Self {
             timer,
             fixture,
             repo_name,
             repo_ref,
+            principal_workdir,
             config_path,
             token_path,
         })
@@ -890,6 +934,8 @@ impl OrchdTestDirective {
 struct OrchdDispatchTomlInputs<'a> {
     actor: &'a str,
     forgejo_login: &'a str,
+    repo_ref: &'a str,
+    principal_workdir: &'a Path,
     codex_bin: &'a Path,
     token_file: &'a Path,
     forgejoctl: &'a Path,
@@ -928,6 +974,17 @@ fn write_orchd_dispatch_toml(path: &Path, inputs: OrchdDispatchTomlInputs<'_>) -
     writeln!(&mut out, "codex_role_arg = \"orch\"")?;
     writeln!(&mut out, "forgejo_login = \"{}\"", inputs.forgejo_login)?;
     writeln!(&mut out, "token_file = \"{}\"", inputs.token_file.display())?;
+    writeln!(&mut out)?;
+
+    writeln!(&mut out, "[[repo_bindings]]")?;
+    writeln!(&mut out, "repo = \"{}\"", inputs.repo_ref)?;
+    writeln!(
+        &mut out,
+        "local_path = \"{}\"",
+        inputs.principal_workdir.display()
+    )?;
+    writeln!(&mut out, "git_remote = \"origin\"")?;
+    writeln!(&mut out, "git_base = \"main\"")?;
     writeln!(&mut out)?;
 
     for directive in inputs.directives {
@@ -1388,6 +1445,8 @@ fn live_orchd_local_backend_smoke() -> Result<()> {
         OrchdDispatchTomlInputs {
             actor: harness.fixture.owner.as_str(),
             forgejo_login: harness.fixture.owner.as_str(),
+            repo_ref: harness.repo_ref.as_str(),
+            principal_workdir: &harness.principal_workdir,
             codex_bin: &fake_codex,
             token_file: &harness.token_path,
             forgejoctl: &forgejoctl,
@@ -1457,6 +1516,8 @@ fn live_orchd_reply_autodispatches_to_assignee() -> Result<()> {
             // Deliberately *not* the real actor: reply is expected to bypass allowlist.
             actor: "nobody",
             forgejo_login: harness.fixture.owner.as_str(),
+            repo_ref: harness.repo_ref.as_str(),
+            principal_workdir: &harness.principal_workdir,
             codex_bin: &fake_codex,
             token_file: &harness.token_path,
             forgejoctl: &forgejoctl,
@@ -1598,6 +1659,8 @@ fn live_orchd_impl_autoland_updates_remote_main() -> Result<()> {
         OrchdDispatchTomlInputs {
             actor: harness.fixture.owner.as_str(),
             forgejo_login: harness.fixture.owner.as_str(),
+            repo_ref: harness.repo_ref.as_str(),
+            principal_workdir: &harness.principal_workdir,
             codex_bin: &fake_codex,
             token_file: &harness.token_path,
             forgejoctl: &forgejoctl,
@@ -1650,6 +1713,16 @@ fn live_orchd_impl_autoland_updates_remote_main() -> Result<()> {
     if after_count != before_count + 1 {
         bail!("expected main commit count to increase by 1 ({before_count} -> {after_count})");
     }
+    let principal_head = stdout_trim(&git_output_checked(
+        &harness.principal_workdir,
+        &["rev-parse", "HEAD"],
+        "git rev-parse HEAD (principal workspace)",
+    )?)?;
+    if principal_head != after_head {
+        bail!(
+            "expected principal workspace to sync to landed commit (principal={principal_head} remote={after_head})"
+        );
+    }
 
     let final_issue = harness.get_issue(issue_number)?;
     if !issue_has_label(&final_issue, "state/review")? {
@@ -1688,6 +1761,8 @@ fn live_orchd_pr_pushes_branch_and_opens_pr() -> Result<()> {
         OrchdDispatchTomlInputs {
             actor: harness.fixture.owner.as_str(),
             forgejo_login: harness.fixture.owner.as_str(),
+            repo_ref: harness.repo_ref.as_str(),
+            principal_workdir: &harness.principal_workdir,
             codex_bin: &fake_codex,
             token_file: &harness.token_path,
             forgejoctl: &forgejoctl,
@@ -1807,6 +1882,8 @@ fn live_orchd_impl_serializes_queue_per_repo() -> Result<()> {
         OrchdDispatchTomlInputs {
             actor: harness.fixture.owner.as_str(),
             forgejo_login: harness.fixture.owner.as_str(),
+            repo_ref: harness.repo_ref.as_str(),
+            principal_workdir: &harness.principal_workdir,
             codex_bin: &fake_codex,
             token_file: &harness.token_path,
             forgejoctl: &forgejoctl,
@@ -1899,6 +1976,18 @@ fn live_orchd_impl_serializes_queue_per_repo() -> Result<()> {
     if after_count != before_count + 2 {
         bail!(
             "expected two queued impl runs to autoland two commits ({before_count} -> {after_count})"
+        );
+    }
+    let principal_count = stdout_trim(&git_output_checked(
+        &harness.principal_workdir,
+        &["rev-list", "--count", "HEAD"],
+        "git rev-list --count HEAD (principal workspace)",
+    )?)?
+    .parse::<u64>()
+    .context("principal commit count was not a u64")?;
+    if principal_count != after_count {
+        bail!(
+            "principal workspace diverged from remote main count (principal_count={principal_count} remote_count={after_count})"
         );
     }
 

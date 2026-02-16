@@ -99,6 +99,8 @@ pub(super) struct FinalizeDispatchArgs {
     pub(super) forgejo_config: Option<PathBuf>,
     #[arg(long = "token-file")]
     pub(super) token_file: PathBuf,
+    #[arg(long = "principal-workdir")]
+    pub(super) principal_workdir: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]

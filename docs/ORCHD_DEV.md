@@ -29,9 +29,13 @@ Dispatch behavior is configured in `config/orchd-dispatch.toml`:
 - actor allowlist (`allowed_actors`)
 - directive -> role mapping
 - role -> codex binary / token file / Forgejo login mapping
+- repo -> principal workspace binding (`[[repo_bindings]]`) for `impl` writeback
 - prompt envelopes (`prompt_envelopes.fresh_envelope`, `prompt_envelopes.followup_envelope`)
 - desktop notifications (`notifications.*`)
 - control-plane command path (`forgejoctl_bin`)
+
+For `impl` dispatches, `repo_bindings` is mandatory. `orchd` fails planning if
+no principal workspace is bound for the target repo.
 
 Desktop notifications are emitted directly from `orchd` via `notify-send`:
 

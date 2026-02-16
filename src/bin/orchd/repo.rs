@@ -370,27 +370,104 @@ fn git_stdout_trim(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-pub(super) fn autoland_to_main(
+pub(super) fn autoland_and_sync_principal(
     db_path: &Path,
     token_file: &Path,
-    workdir: &Path,
+    dispatch_workdir: &Path,
+    principal_workdir: &Path,
     remote: &str,
     base_branch: &str,
-) -> Result<String> {
-    let head = git_stdout_trim(&git_checked(workdir, &["rev-parse", "--short", "HEAD"])?);
+) -> Result<Vec<String>> {
+    let dispatch_head = git_stdout_trim(&git_checked(dispatch_workdir, &["rev-parse", "HEAD"])?);
+    let dispatch_head_short = git_stdout_trim(&git_checked(
+        dispatch_workdir,
+        &["rev-parse", "--short", "HEAD"],
+    )?);
     let _ = git_checked_with_token(
         db_path,
         token_file,
-        Some(workdir),
+        Some(dispatch_workdir),
         &["fetch", remote, base_branch],
     );
     git_checked_with_token(
         db_path,
         token_file,
-        Some(workdir),
+        Some(dispatch_workdir),
         &["push", remote, &format!("HEAD:{base_branch}")],
     )?;
-    Ok(format!("autoland: pushed {head} -> {remote}/{base_branch}"))
+
+    let _ = git_checked(principal_workdir, &["rev-parse", "--is-inside-work-tree"])?;
+    let status = git_stdout_trim(&git_checked(
+        principal_workdir,
+        &["status", "--porcelain", "--untracked-files=no"],
+    )?);
+    if !status.is_empty() {
+        return Err(anyhow!(
+            "principal workspace {} has uncommitted changes",
+            principal_workdir.display()
+        ));
+    }
+
+    let current_branch = git_stdout_trim(&git_checked(
+        principal_workdir,
+        &["rev-parse", "--abbrev-ref", "HEAD"],
+    )?);
+    if current_branch != base_branch {
+        return Err(anyhow!(
+            "principal workspace {} is on branch '{}' (expected '{}')",
+            principal_workdir.display(),
+            current_branch,
+            base_branch
+        ));
+    }
+
+    git_checked_with_token(
+        db_path,
+        token_file,
+        Some(principal_workdir),
+        &["fetch", remote, base_branch],
+    )?;
+    let principal_before = git_stdout_trim(&git_checked(
+        principal_workdir,
+        &["rev-parse", "--short", "HEAD"],
+    )?);
+    let remote_ref = format!("{remote}/{base_branch}");
+    git_checked(principal_workdir, &["merge", "--ff-only", &remote_ref])?;
+    let principal_after = git_stdout_trim(&git_checked(principal_workdir, &["rev-parse", "HEAD"])?);
+    let principal_after_short = git_stdout_trim(&git_checked(
+        principal_workdir,
+        &["rev-parse", "--short", "HEAD"],
+    )?);
+    let remote_after = git_stdout_trim(&git_checked(
+        principal_workdir,
+        &["rev-parse", &remote_ref],
+    )?);
+
+    if principal_after != remote_after {
+        return Err(anyhow!(
+            "principal workspace sync mismatch: HEAD={} but {}={}",
+            principal_after,
+            remote_ref,
+            remote_after
+        ));
+    }
+    if principal_after != dispatch_head {
+        return Err(anyhow!(
+            "principal workspace sync mismatch: dispatch head {} differs from local head {}",
+            dispatch_head,
+            principal_after
+        ));
+    }
+
+    Ok(vec![
+        format!("autoland: pushed {dispatch_head_short} -> {remote}/{base_branch}"),
+        format!(
+            "workspace_sync: {} {} -> {}",
+            principal_workdir.display(),
+            principal_before,
+            principal_after_short
+        ),
+    ])
 }
 
 pub(super) fn push_branch(

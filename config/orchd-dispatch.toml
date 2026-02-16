@@ -7,6 +7,12 @@ codex_bin = "/home/main/forgejo-agent/bin/codex-role"
 codex_role_arg = "orch"
 token_file = "/home/main/.config/forgejo-agent/creds/codex-orch.token"
 
+[[repo_bindings]]
+repo = "main/forgejo-agent"
+local_path = "/home/main/forgejo-agent"
+git_remote = "origin"
+git_base = "main"
+
 [prompt_envelopes]
 preamble_file = "../prompts/orchd-preamble.md"
 fresh_envelope = "../prompts/orchd-envelope-fresh.md"

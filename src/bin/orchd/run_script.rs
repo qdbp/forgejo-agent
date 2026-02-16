@@ -18,6 +18,7 @@ pub(super) struct DispatchRunScriptInputs<'a> {
     pub(super) forgejo_config_file: Option<&'a Path>,
     pub(super) token_file: &'a Path,
     pub(super) workdir: &'a Path,
+    pub(super) principal_workdir: Option<&'a Path>,
     pub(super) codex_sandbox: &'a str,
     pub(super) git_remote: &'a str,
     pub(super) git_base: &'a str,
@@ -39,6 +40,9 @@ fn shell_quote(value: &str) -> String {
 pub(super) fn build_exec_run_script(inputs: &DispatchRunScriptInputs<'_>) -> String {
     let forgejo_config_file = inputs
         .forgejo_config_file
+        .map_or(Cow::Borrowed(""), |path| path.to_string_lossy());
+    let principal_workdir = inputs
+        .principal_workdir
         .map_or(Cow::Borrowed(""), |path| path.to_string_lossy());
     format!(
         r#"#!/usr/bin/env bash
@@ -62,6 +66,7 @@ FORGEJOCTL_BIN={forgejoctl_bin}
 FORGEJO_CONFIG_FILE={forgejo_config_file}
 TOKEN_FILE={token_file}
 WORKDIR={workdir}
+PRINCIPAL_WORKDIR={principal_workdir}
 CODEX_SANDBOX={codex_sandbox}
 GIT_WORKDIR={git_workdir}
 GIT_REMOTE={git_remote}
@@ -157,7 +162,12 @@ if [[ -n "$FORGEJO_CONFIG_FILE" ]]; then
   config_args+=(--forgejo-config "$FORGEJO_CONFIG_FILE")
 fi
 
-"$ORCHD_BIN" finalize-dispatch "${{config_args[@]}}" \
+principal_args=()
+if [[ -n "$PRINCIPAL_WORKDIR" ]]; then
+  principal_args+=(--principal-workdir "$PRINCIPAL_WORKDIR")
+fi
+
+"$ORCHD_BIN" finalize-dispatch "${{config_args[@]}}" "${{principal_args[@]}}" \
   --db-path "$DB_PATH" \
   --dispatch-id "$DISPATCH_ID" \
   --status "$status" \
@@ -197,6 +207,7 @@ fi
         forgejo_config_file = shell_quote(forgejo_config_file.as_ref()),
         token_file = shell_quote(&inputs.token_file.to_string_lossy()),
         workdir = shell_quote(&inputs.workdir.to_string_lossy()),
+        principal_workdir = shell_quote(principal_workdir.as_ref()),
         codex_sandbox = shell_quote(inputs.codex_sandbox),
         git_workdir = shell_quote(&inputs.workdir.to_string_lossy()),
         git_remote = shell_quote(inputs.git_remote),

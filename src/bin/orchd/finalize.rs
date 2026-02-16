@@ -68,19 +68,6 @@ fn append_completion_section(completion_file: &Path, header: &str, lines: &[Stri
     Ok(())
 }
 
-fn work_state_target_for_terminal_status(
-    directive: &str,
-    status: DispatchState,
-) -> Option<&'static str> {
-    if !directive_uses_worktree(directive) {
-        return None;
-    }
-    Some(match status {
-        DispatchState::Completed => "review",
-        _ => "blocked",
-    })
-}
-
 fn create_pull_request_for_dispatch(args: &FinalizeDispatchArgs) -> Result<String> {
     let forgejo_config = args
         .forgejo_config
@@ -156,46 +143,58 @@ pub(super) fn finalize_dispatch_command(args: FinalizeDispatchArgs) -> Result<()
         return Ok(());
     }
 
+    let mut landing_ok = true;
     let mut landing_lines: Vec<String> = Vec::new();
     if status_spec.state_literal == DispatchState::Completed {
         match args.directive.as_str() {
-            DIRECTIVE_IMPL => match repo::autoland_to_main(
-                &args.db_path,
-                &args.token_file,
-                &args.git_workdir,
-                &args.git_remote,
-                &args.git_base,
-            ) {
-                Ok(line) => landing_lines.push(line),
-                Err(err) => {
-                    landing_lines.push(format!("autoland failed: {err:#}"));
+            DIRECTIVE_IMPL => {
+                if let Some(principal_workdir) = args.principal_workdir.as_deref() {
+                    match repo::autoland_and_sync_principal(
+                        &args.db_path,
+                        &args.token_file,
+                        &args.git_workdir,
+                        principal_workdir,
+                        &args.git_remote,
+                        &args.git_base,
+                    ) {
+                        Ok(lines) => landing_lines.extend(lines),
+                        Err(err) => {
+                            landing_ok = false;
+                            landing_lines.push(format!("autoland failed: {err:#}"));
+                        }
+                    }
+                } else {
+                    landing_ok = false;
+                    landing_lines.push(
+                        "autoland failed: missing --principal-workdir for impl dispatch"
+                            .to_string(),
+                    );
                 }
-            },
+            }
             DIRECTIVE_PR => {
                 if args.git_branch.trim().is_empty() {
+                    landing_ok = false;
                     landing_lines.push("missing git branch; cannot create PR".to_string());
                 } else {
-                    let push_ok = match repo::push_branch(
+                    match repo::push_branch(
                         &args.db_path,
                         &args.token_file,
                         &args.git_workdir,
                         &args.git_remote,
                         &args.git_branch,
                     ) {
-                        Ok(line) => {
-                            landing_lines.push(line);
-                            true
-                        }
+                        Ok(line) => landing_lines.push(line),
                         Err(err) => {
+                            landing_ok = false;
                             landing_lines.push(format!("push failed: {err:#}"));
-                            false
                         }
-                    };
-                    if push_ok {
+                    }
+                    if landing_ok {
                         let pr_url = create_pull_request_for_dispatch(&args);
                         match pr_url {
                             Ok(url) => landing_lines.push(format!("pull request: {url}")),
                             Err(err) => {
+                                landing_ok = false;
                                 landing_lines.push(format!("PR create failed: {err:#}"));
                             }
                         }
@@ -204,14 +203,21 @@ pub(super) fn finalize_dispatch_command(args: FinalizeDispatchArgs) -> Result<()
             }
             _ => {}
         }
+    } else if directive_uses_worktree(args.directive.as_str()) {
+        landing_ok = false;
     }
 
     if let Err(err) = append_completion_section(&args.completion_file, "Landing", &landing_lines) {
         eprintln!("finalize-dispatch: failed appending landing info: {err}");
     }
 
-    let work_state_target =
-        work_state_target_for_terminal_status(args.directive.as_str(), status_spec.state_literal);
+    let work_state_target = directive_uses_worktree(args.directive.as_str()).then_some(
+        if status_spec.state_literal == DispatchState::Completed && landing_ok {
+            "review"
+        } else {
+            "blocked"
+        },
+    );
 
     if let Some(work_state_target) = work_state_target {
         let phase_transition_start = Instant::now();
@@ -271,46 +277,4 @@ pub(super) fn finalize_dispatch_command(args: FinalizeDispatchArgs) -> Result<()
     }
     info!("finalize dispatch completed");
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::work_state_target_for_terminal_status;
-    use forgejo_agent::orchd_dispatch_core::DispatchState;
-
-    #[test]
-    fn completed_worktree_directives_transition_to_review() {
-        assert_eq!(
-            work_state_target_for_terminal_status("impl", DispatchState::Completed),
-            Some("review")
-        );
-        assert_eq!(
-            work_state_target_for_terminal_status("pr", DispatchState::Completed),
-            Some("review")
-        );
-    }
-
-    #[test]
-    fn non_completed_worktree_directives_transition_to_blocked() {
-        assert_eq!(
-            work_state_target_for_terminal_status("impl", DispatchState::TimedOut),
-            Some("blocked")
-        );
-        assert_eq!(
-            work_state_target_for_terminal_status("pr", DispatchState::FailedRuntime),
-            Some("blocked")
-        );
-    }
-
-    #[test]
-    fn non_worktree_directives_do_not_transition_workflow_state() {
-        assert_eq!(
-            work_state_target_for_terminal_status("design", DispatchState::Completed),
-            None
-        );
-        assert_eq!(
-            work_state_target_for_terminal_status("poke", DispatchState::FailedRuntime),
-            None
-        );
-    }
 }

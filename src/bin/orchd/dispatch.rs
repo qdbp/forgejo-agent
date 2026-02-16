@@ -38,6 +38,7 @@ struct DispatchPlan {
     directive: DispatchDirectiveConfig,
     role: DispatchRoleConfig,
     workdir: PathBuf,
+    principal_workdir: Option<PathBuf>,
     git_remote: String,
     git_base: String,
     git_branch: String,
@@ -572,6 +573,13 @@ async fn plan_dispatch(
         policy_snapshot: Some("cp2".to_string()),
     };
 
+    let repo_binding = dispatch_config.repo_bindings.get(&intent.repo_full_name);
+    if intent.directive == lexicon::DIRECTIVE_IMPL && repo_binding.is_none() {
+        return Err(DispatchError::RepoBindingMissing(
+            intent.repo_full_name.clone(),
+        ));
+    }
+
     if let Some(dispatch_id) = find_issue_inflight_dispatch_with_healing(
         &state.db_path,
         &intent.repo_full_name,
@@ -705,8 +713,14 @@ async fn plan_dispatch(
     }
     let (workdir, git_remote, git_base, git_branch) =
         if lexicon::directive_uses_worktree(&intent.directive) {
-            let git_remote = repo::DEFAULT_GIT_REMOTE.to_string();
-            let git_base = repo::DEFAULT_GIT_BASE_BRANCH.to_string();
+            let git_remote = repo_binding.map_or_else(
+                || repo::DEFAULT_GIT_REMOTE.to_string(),
+                |binding| binding.git_remote.clone(),
+            );
+            let git_base = repo_binding.map_or_else(
+                || repo::DEFAULT_GIT_BASE_BRANCH.to_string(),
+                |binding| binding.git_base.clone(),
+            );
             let git_branch = repo::dispatch_worktree_branch(
                 &intent.repo_full_name,
                 intent.issue_number,
@@ -732,6 +746,11 @@ async fn plan_dispatch(
                 String::new(),
             )
         };
+    let principal_workdir = if intent.directive == lexicon::DIRECTIVE_IMPL {
+        repo_binding.map(|binding| binding.local_path.clone())
+    } else {
+        None
+    };
 
     Ok(DispatchPlan {
         actor,
@@ -739,6 +758,7 @@ async fn plan_dispatch(
         directive,
         role,
         workdir,
+        principal_workdir,
         git_remote,
         git_base,
         git_branch,
@@ -842,6 +862,7 @@ fn materialize_run_artifacts(
         forgejo_config_file: state.forgejo_config_file.as_deref(),
         token_file: &plan.role.token_file,
         workdir: &plan.workdir,
+        principal_workdir: plan.principal_workdir.as_deref(),
         codex_sandbox: codex_sandbox_for_directive(&plan.intent.directive),
         git_remote: &plan.git_remote,
         git_base: &plan.git_base,

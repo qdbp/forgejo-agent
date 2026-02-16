@@ -6,6 +6,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 
 use forgejo_agent::orchd_dispatch_core::DispatchNotificationPhase;
+use forgejo_agent::types::RepoRef;
 
 use super::paths::expand_tilde_path;
 
@@ -16,6 +17,7 @@ pub(super) struct DispatchConfig {
     pub(super) notifications: DispatchNotificationsConfig,
     pub(super) roles: HashMap<String, DispatchRoleConfig>,
     pub(super) directives: HashMap<String, DispatchDirectiveConfig>,
+    pub(super) repo_bindings: HashMap<String, DispatchRepoBindingConfig>,
     pub(super) forgejoctl_bin: PathBuf,
 }
 
@@ -24,15 +26,6 @@ pub(super) struct DispatchPromptEnvelopeConfig {
     pub(super) preamble_file: PathBuf,
     pub(super) fresh_envelope: PathBuf,
     pub(super) followup_envelope: PathBuf,
-}
-
-impl DispatchPromptEnvelopeConfig {
-    pub(super) fn role_card_file_for(&self, role_name: &str) -> PathBuf {
-        self.preamble_file
-            .parent()
-            .map_or_else(|| PathBuf::from("roles"), |parent| parent.join("roles"))
-            .join(format!("{role_name}.md"))
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -60,6 +53,13 @@ pub(super) struct DispatchDirectiveConfig {
     pub(super) timeout_sec: u64,
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct DispatchRepoBindingConfig {
+    pub(super) local_path: PathBuf,
+    pub(super) git_remote: String,
+    pub(super) git_base: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DispatchConfigFile {
@@ -72,6 +72,8 @@ struct DispatchConfigFile {
     notifications: DispatchNotificationsConfigFile,
     roles: HashMap<String, DispatchRoleConfigFile>,
     directives: HashMap<String, DispatchDirectiveConfigFile>,
+    #[serde(default)]
+    repo_bindings: Vec<DispatchRepoBindingConfigFile>,
     #[serde(default = "default_forgejoctl_bin")]
     forgejoctl_bin: String,
 }
@@ -146,6 +148,17 @@ struct DispatchDirectiveConfigFile {
     timeout_sec: u64,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DispatchRepoBindingConfigFile {
+    repo: String,
+    local_path: String,
+    #[serde(default = "default_git_remote")]
+    git_remote: String,
+    #[serde(default = "default_git_base")]
+    git_base: String,
+}
+
 fn default_codex_bin() -> String {
     "/home/main/forgejo-agent/bin/codex-role".to_string()
 }
@@ -164,6 +177,14 @@ fn default_fresh_envelope() -> String {
 
 fn default_followup_envelope() -> String {
     "../prompts/orchd-envelope-followup.md".to_string()
+}
+
+fn default_git_remote() -> String {
+    "origin".to_string()
+}
+
+fn default_git_base() -> String {
+    "main".to_string()
 }
 
 const fn default_timeout_sec() -> u64 {
@@ -251,25 +272,41 @@ pub(super) fn load_dispatch_config(path: &Path) -> Result<DispatchConfig> {
         );
     }
 
-    let prompt_envelopes = DispatchPromptEnvelopeConfig {
-        preamble_file: resolve_config_path(&base_dir, &raw.prompt_envelopes.preamble_file)?,
-        fresh_envelope: resolve_config_path(&base_dir, &raw.prompt_envelopes.fresh_envelope)?,
-        followup_envelope: resolve_config_path(&base_dir, &raw.prompt_envelopes.followup_envelope)?,
-    };
-
-    let mut role_names: Vec<_> = roles.keys().cloned().collect();
-    role_names.sort();
-    for role_name in role_names {
-        let role_card_file = prompt_envelopes.role_card_file_for(&role_name);
-        if !role_card_file.is_file() {
+    let mut repo_bindings = HashMap::new();
+    for binding in raw.repo_bindings {
+        let repo = RepoRef::parse(&binding.repo)
+            .with_context(|| format!("invalid repo binding repo '{}'", binding.repo))?;
+        let repo_full_name = repo.to_string();
+        if repo_bindings.contains_key(&repo_full_name) {
             return Err(anyhow!(
-                "dispatch config {} missing role card for role {} at {}",
-                path.display(),
-                role_name,
-                role_card_file.display()
+                "duplicate repo binding for {repo_full_name} in {}",
+                path.display()
             ));
         }
+        let git_remote = binding.git_remote.trim().to_string();
+        if git_remote.is_empty() {
+            return Err(anyhow!(
+                "repo binding for {repo_full_name} has empty git_remote in {}",
+                path.display()
+            ));
+        }
+        let git_base = binding.git_base.trim().to_string();
+        if git_base.is_empty() {
+            return Err(anyhow!(
+                "repo binding for {repo_full_name} has empty git_base in {}",
+                path.display()
+            ));
+        }
+        repo_bindings.insert(
+            repo_full_name,
+            DispatchRepoBindingConfig {
+                local_path: resolve_config_path(&base_dir, &binding.local_path)?,
+                git_remote,
+                git_base,
+            },
+        );
     }
+
     let mut notification_phases = raw.notifications.phases;
     notification_phases.sort_unstable();
     notification_phases.dedup();
@@ -280,7 +317,14 @@ pub(super) fn load_dispatch_config(path: &Path) -> Result<DispatchConfig> {
             .into_iter()
             .map(|actor| actor.to_ascii_lowercase())
             .collect(),
-        prompt_envelopes,
+        prompt_envelopes: DispatchPromptEnvelopeConfig {
+            preamble_file: resolve_config_path(&base_dir, &raw.prompt_envelopes.preamble_file)?,
+            fresh_envelope: resolve_config_path(&base_dir, &raw.prompt_envelopes.fresh_envelope)?,
+            followup_envelope: resolve_config_path(
+                &base_dir,
+                &raw.prompt_envelopes.followup_envelope,
+            )?,
+        },
         notifications: DispatchNotificationsConfig {
             enabled: raw.notifications.enabled,
             poll_sec: raw.notifications.poll_sec.max(1),
@@ -291,6 +335,7 @@ pub(super) fn load_dispatch_config(path: &Path) -> Result<DispatchConfig> {
         },
         roles,
         directives,
+        repo_bindings,
         forgejoctl_bin: resolve_config_path(&base_dir, &raw.forgejoctl_bin)?,
     })
 }
@@ -307,101 +352,93 @@ fn resolve_config_path(base_dir: &Path, raw: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::Path;
+    use std::path::PathBuf;
 
-    use anyhow::Result;
-    use tempfile::tempdir;
+    fn temp_config_path(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock drift")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "forgejo-agent-dispatch-config-{label}-{}-{nanos}.toml",
+            std::process::id()
+        ))
+    }
 
-    use super::{DispatchPromptEnvelopeConfig, load_dispatch_config};
+    fn write_config(path: &PathBuf, repo_bindings_block: &str) {
+        let body = format!(
+            r#"
+version = 1
+allowed_actors = ["main"]
 
-    #[test]
-    fn role_card_file_for_uses_roles_subdir_next_to_preamble() {
-        let envelopes = DispatchPromptEnvelopeConfig {
-            preamble_file: Path::new("/tmp/prompts/orchd-preamble.md").to_path_buf(),
-            fresh_envelope: Path::new("/tmp/prompts/orchd-envelope-fresh.md").to_path_buf(),
-            followup_envelope: Path::new("/tmp/prompts/orchd-envelope-followup.md").to_path_buf(),
-        };
+[prompt_envelopes]
+preamble_file = "../prompts/orchd-preamble.md"
+fresh_envelope = "../prompts/orchd-envelope-fresh.md"
+followup_envelope = "../prompts/orchd-envelope-followup.md"
 
-        let card = envelopes.role_card_file_for("codex-orch");
-        assert_eq!(card, Path::new("/tmp/prompts/roles/codex-orch.md"));
+[roles.codex-orch]
+codex_bin = "/tmp/fake-codex"
+codex_role_arg = "orch"
+token_file = "/tmp/fake-token"
+
+[directives.impl]
+role = "codex-orch"
+prompt_file = "../prompts/orchd-impl.md"
+timeout_sec = 60
+{repo_bindings_block}
+"#
+        );
+        fs::write(path, body).expect("write config");
     }
 
     #[test]
-    fn load_dispatch_config_rejects_missing_role_card() -> Result<()> {
-        let temp = tempdir()?;
-        let root = temp.path();
-        let config_path = root.join("dispatch.toml");
-        let prompts_dir = root.join("prompts");
-        fs::create_dir_all(&prompts_dir)?;
-
-        let config_toml = format!(
-            r#"version = 1
-allowed_actors = ["main"]
-forgejoctl_bin = "/home/main/.local/bin/forgejoctl"
-
-[prompt_envelopes]
-preamble_file = "{preamble}"
-fresh_envelope = "{fresh}"
-followup_envelope = "{followup}"
-
-[roles.codex-orch]
-token_file = "{token}"
-
-[directives.design]
-role = "codex-orch"
-prompt_file = "{design_prompt}"
+    fn load_dispatch_config_parses_repo_bindings() {
+        let path = temp_config_path("repo-bindings");
+        write_config(
+            &path,
+            r#"
+[[repo_bindings]]
+repo = "main/forgejo-agent"
+local_path = "/home/main/forgejo-agent"
+git_remote = "origin"
+git_base = "main"
 "#,
-            preamble = prompts_dir.join("orchd-preamble.md").display(),
-            fresh = prompts_dir.join("orchd-envelope-fresh.md").display(),
-            followup = prompts_dir.join("orchd-envelope-followup.md").display(),
-            token = root.join("token.txt").display(),
-            design_prompt = prompts_dir.join("orchd-design.md").display(),
         );
-        fs::write(&config_path, config_toml)?;
-
-        let err = load_dispatch_config(&config_path).expect_err("config should fail");
-        let err_text = err.to_string();
-        assert!(err_text.contains("missing role card for role codex-orch"));
-        Ok(())
+        let cfg = super::load_dispatch_config(&path).expect("load config");
+        let binding = cfg
+            .repo_bindings
+            .get("main/forgejo-agent")
+            .expect("repo binding present");
+        assert_eq!(
+            binding.local_path,
+            PathBuf::from("/home/main/forgejo-agent")
+        );
+        assert_eq!(binding.git_remote, "origin");
+        assert_eq!(binding.git_base, "main");
+        let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn load_dispatch_config_accepts_present_role_card() -> Result<()> {
-        let temp = tempdir()?;
-        let root = temp.path();
-        let config_path = root.join("dispatch.toml");
-        let prompts_dir = root.join("prompts");
-        let roles_dir = prompts_dir.join("roles");
-        fs::create_dir_all(&roles_dir)?;
-        fs::write(roles_dir.join("codex-orch.md"), "# codex-orch role card\n")?;
+    fn load_dispatch_config_rejects_duplicate_repo_binding() {
+        let path = temp_config_path("duplicate-repo-bindings");
+        write_config(
+            &path,
+            r#"
+[[repo_bindings]]
+repo = "main/forgejo-agent"
+local_path = "/home/main/forgejo-agent"
 
-        let config_toml = format!(
-            r#"version = 1
-allowed_actors = ["main"]
-forgejoctl_bin = "/home/main/.local/bin/forgejoctl"
-
-[prompt_envelopes]
-preamble_file = "{preamble}"
-fresh_envelope = "{fresh}"
-followup_envelope = "{followup}"
-
-[roles.codex-orch]
-token_file = "{token}"
-
-[directives.design]
-role = "codex-orch"
-prompt_file = "{design_prompt}"
+[[repo_bindings]]
+repo = "main/forgejo-agent"
+local_path = "/home/main/forgejo-agent"
 "#,
-            preamble = prompts_dir.join("orchd-preamble.md").display(),
-            fresh = prompts_dir.join("orchd-envelope-fresh.md").display(),
-            followup = prompts_dir.join("orchd-envelope-followup.md").display(),
-            token = root.join("token.txt").display(),
-            design_prompt = prompts_dir.join("orchd-design.md").display(),
         );
-        fs::write(&config_path, config_toml)?;
-
-        let config = load_dispatch_config(&config_path)?;
-        assert!(config.roles.contains_key("codex-orch"));
-        Ok(())
+        let err = super::load_dispatch_config(&path).expect_err("duplicate should fail");
+        assert!(
+            err.to_string()
+                .contains("duplicate repo binding for main/forgejo-agent"),
+            "unexpected error: {err:#}"
+        );
+        let _ = fs::remove_file(path);
     }
 }
