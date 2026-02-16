@@ -71,6 +71,42 @@ pub const ORCHD_CONTROL_LABELS: [(&str, &str, &str, bool); 2] = [
     ),
 ];
 
+pub const ORCHD_FAILURE_LABEL_PREFIX: &str = "orchd/failure/";
+
+#[must_use]
+pub fn is_orchd_failure_label(name: &str) -> bool {
+    name.starts_with(ORCHD_FAILURE_LABEL_PREFIX)
+}
+
+#[must_use]
+pub fn orchd_failure_label(reason_code: &str) -> Option<String> {
+    let normalized = normalize_reason_code_label_segment(reason_code);
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(format!("{ORCHD_FAILURE_LABEL_PREFIX}{normalized}"))
+    }
+}
+
+#[must_use]
+fn normalize_reason_code_label_segment(reason_code: &str) -> String {
+    let mut out = String::new();
+    let mut last_was_dash = false;
+    for ch in reason_code.trim().chars() {
+        let lower = ch.to_ascii_lowercase();
+        if lower.is_ascii_lowercase() || lower.is_ascii_digit() || lower == '_' {
+            out.push(lower);
+            last_was_dash = false;
+            continue;
+        }
+        if !last_was_dash {
+            out.push('-');
+            last_was_dash = true;
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
 #[must_use]
 pub const fn can_transition(from: Option<WorkflowState>, to: WorkflowState) -> bool {
     use WorkflowState as S;
@@ -186,5 +222,18 @@ mod tests {
         ));
         assert_eq!(can_transition(None, WorkflowState::Triage), true);
         assert_eq!(can_transition(None, WorkflowState::Blocked), false);
+    }
+
+    #[test]
+    fn orchd_failure_label_normalizes_reason_code() {
+        assert_eq!(
+            orchd_failure_label("prompt_template_error"),
+            Some("orchd/failure/prompt_template_error".to_string())
+        );
+        assert_eq!(
+            orchd_failure_label("registered_trigger:custom.closed"),
+            Some("orchd/failure/registered_trigger-custom-closed".to_string())
+        );
+        assert_eq!(orchd_failure_label("   "), None);
     }
 }

@@ -16,6 +16,7 @@ use forgejo_agent::config::AgentConfig;
 use forgejo_agent::policy;
 use forgejo_agent::policy::{
     ORCHD_CONTROL_LABELS, ORCHD_STATE_LABELS, OTHER_LABELS, STATE_LABEL_COLOR,
+    is_orchd_failure_label, orchd_failure_label,
 };
 use forgejo_agent::types::{
     ApiIssue, IssueRef, ListState, OpenState, OrchdRuntimeState, RepoRef, WorkflowState,
@@ -160,6 +161,8 @@ struct IssueOrchdStateArgs {
     issue: IssueRef,
     #[arg(long)]
     to: OrchdRuntimeState,
+    #[arg(long = "reason-code")]
+    reason_code: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -387,6 +390,7 @@ fn set_issue_orchd_state(
     cfg: &AgentConfig,
     issue_ref: &IssueRef,
     target: OrchdRuntimeState,
+    reason_code: Option<&str>,
 ) -> Result<Option<OrchdRuntimeState>> {
     ensure_policy_labels(api, cfg, &issue_ref.repo)?;
     let issue = api.get_issue(cfg, issue_ref)?;
@@ -408,13 +412,36 @@ fn set_issue_orchd_state(
         )?
         .id;
 
+    let failure_reason_label_id = if target == OrchdRuntimeState::Failed {
+        if let Some(reason_label_name) = reason_code.and_then(orchd_failure_label) {
+            Some(
+                api.ensure_label(
+                    cfg,
+                    &issue_ref.repo,
+                    &reason_label_name,
+                    "8a1c2d",
+                    "dispatch failed for this reason",
+                    false,
+                )?
+                .id,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let mut replacement_ids = issue
         .labels
         .iter()
-        .filter(|label| !is_orchd_state_label(&label.name))
+        .filter(|label| !is_orchd_state_label(&label.name) && !is_orchd_failure_label(&label.name))
         .map(|label| label.id)
         .collect::<Vec<_>>();
     replacement_ids.push(target_id);
+    if let Some(reason_label_id) = failure_reason_label_id {
+        replacement_ids.push(reason_label_id);
+    }
     replacement_ids.sort_unstable();
     replacement_ids.dedup();
 
@@ -731,7 +758,7 @@ fn cmd_issue_orchd_state(
     cfg: &AgentConfig,
     args: IssueOrchdStateArgs,
 ) -> Result<()> {
-    let from = set_issue_orchd_state(api, cfg, &args.issue, args.to)?;
+    let from = set_issue_orchd_state(api, cfg, &args.issue, args.to, args.reason_code.as_deref())?;
     let from = from
         .map(|state| state.to_string())
         .unwrap_or_else(|| "none".to_string());

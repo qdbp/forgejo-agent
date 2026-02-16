@@ -1819,6 +1819,12 @@ fn live_orchd_prompt_template_failure_marks_failed_start() -> Result<()> {
         "orchd/state/failed",
         Duration::from_secs(30),
     )?;
+    let _ = wait_for_issue_label(
+        &harness,
+        issue_number,
+        "orchd/failure/prompt_template_error",
+        Duration::from_secs(30),
+    )?;
 
     let status_reason =
         orchd_latest_dispatch_status_reason(&db_path, &harness.repo_ref, issue_number)?

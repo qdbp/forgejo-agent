@@ -5,6 +5,7 @@ use anyhow::{Context, Result, anyhow};
 use serde_json::json;
 
 use forgejo_agent::api::ForgejoClient;
+use forgejo_agent::policy::{is_orchd_failure_label, orchd_failure_label};
 use forgejo_agent::types::{IssueRef, OrchdRuntimeState, RepoRef};
 
 use super::state::{AppState, DecisionRecord};
@@ -59,58 +60,79 @@ pub(super) async fn project_issue_runtime_state(
     repo_full_name: &str,
     issue_number: u64,
     runtime_state: OrchdRuntimeState,
+    runtime_reason_code: Option<&str>,
     identity: Option<CommentIdentity>,
 ) -> Result<()> {
-    if let Some(identity) = identity {
-        match project_issue_runtime_state_as_role(
-            repo_full_name,
-            issue_number,
-            runtime_state,
-            identity,
-        )
-        .await
-        {
-            Ok(()) => {
-                return Ok(());
-            }
-            Err(role_err) => {
+    match project_issue_runtime_state_with_api(
+        state.clone(),
+        repo_full_name,
+        issue_number,
+        runtime_state,
+        runtime_reason_code,
+    )
+    .await
+    {
+        Ok(()) => Ok(()),
+        Err(api_err) => {
+            if let Some(identity) = identity {
                 log_line(
-                    "runtime_state_projection_role_fallback",
+                    "runtime_state_projection_api_fallback",
                     json!({
                         "repo": repo_full_name,
                         "issue_number": issue_number,
                         "runtime_state": runtime_state.as_str(),
-                        "error": role_err.to_string(),
+                        "runtime_reason_code": runtime_reason_code,
+                        "error": api_err.to_string(),
                     }),
                 );
+                project_issue_runtime_state_as_role(
+                    repo_full_name,
+                    issue_number,
+                    runtime_state,
+                    runtime_reason_code,
+                    identity,
+                )
+                .await
+            } else {
+                Err(api_err)
             }
         }
     }
-    project_issue_runtime_state_with_api(state, repo_full_name, issue_number, runtime_state).await
 }
 
 async fn project_issue_runtime_state_as_role(
     repo_full_name: &str,
     issue_number: u64,
     runtime_state: OrchdRuntimeState,
+    runtime_reason_code: Option<&str>,
     identity: CommentIdentity,
 ) -> Result<()> {
     let issue_ref = format!("{repo_full_name}#{issue_number}");
     let runtime_state_name = runtime_state.as_str().to_string();
+    let runtime_reason_code = runtime_reason_code
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut cmd = Command::new(&identity.forgejoctl_bin);
         if let Some(config_file) = identity.config_file.as_ref() {
             cmd.arg("--config").arg(config_file);
         }
+        let mut args = vec![
+            "--token-file".to_string(),
+            identity.token_file.to_string_lossy().into_owned(),
+            "issue".to_string(),
+            "orchd-state".to_string(),
+            issue_ref.clone(),
+            "--to".to_string(),
+            runtime_state_name.clone(),
+        ];
+        if let Some(reason_code) = runtime_reason_code.as_deref() {
+            args.push("--reason-code".to_string());
+            args.push(reason_code.to_string());
+        }
         let output = cmd
-            .args(["--token-file", &identity.token_file.to_string_lossy()])
-            .args([
-                "issue",
-                "orchd-state",
-                &issue_ref,
-                "--to",
-                &runtime_state_name,
-            ])
+            .args(&args)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .output()
@@ -139,8 +161,13 @@ async fn project_issue_runtime_state_with_api(
     repo_full_name: &str,
     issue_number: u64,
     runtime_state: OrchdRuntimeState,
+    runtime_reason_code: Option<&str>,
 ) -> Result<()> {
     let repo_full_name = repo_full_name.to_string();
+    let runtime_reason_code = runtime_reason_code
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
     tokio::task::spawn_blocking(move || -> Result<()> {
         let api = ForgejoClient::new(&state.cfg)?;
         let repo = RepoRef::parse(&repo_full_name)?;
@@ -160,14 +187,40 @@ async fn project_issue_runtime_state_with_api(
                 exclusive,
             )?
             .id;
+        let failure_reason_label_id = if runtime_state == OrchdRuntimeState::Failed {
+            if let Some(reason_label_name) =
+                runtime_reason_code.as_deref().and_then(orchd_failure_label)
+            {
+                Some(
+                    api.ensure_label(
+                        &state.cfg,
+                        &issue.repo,
+                        &reason_label_name,
+                        "8a1c2d",
+                        "dispatch failed for this reason",
+                        false,
+                    )?
+                    .id,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         let mut replacement_ids = existing
             .labels
             .iter()
-            .filter(|label| !is_orchd_state_label(&label.name))
+            .filter(|label| {
+                !is_orchd_state_label(&label.name) && !is_orchd_failure_label(&label.name)
+            })
             .map(|label| label.id)
             .collect::<Vec<_>>();
         replacement_ids.push(target_id);
+        if let Some(reason_label_id) = failure_reason_label_id {
+            replacement_ids.push(reason_label_id);
+        }
         replacement_ids.sort_unstable();
         replacement_ids.dedup();
         let _ = api.replace_issue_label_ids(&state.cfg, &issue, replacement_ids)?;

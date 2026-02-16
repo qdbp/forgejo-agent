@@ -492,6 +492,7 @@ async fn process_webhook(
                 &record.repo_full_name,
                 issue_number,
                 OrchdRuntimeState::Queued,
+                None,
                 dispatch_identity.clone(),
             )
             .await
@@ -547,6 +548,7 @@ async fn process_webhook(
                                     &record.repo_full_name,
                                     issue_number,
                                     OrchdRuntimeState::Running,
+                                    None,
                                     dispatch_identity.clone(),
                                 )
                                 .await
@@ -578,6 +580,7 @@ async fn process_webhook(
                                     &record.repo_full_name,
                                     issue_number,
                                     runtime_state_for_dispatch_error(&err),
+                                    Some(err.reason_code()),
                                     dispatch_identity.clone(),
                                 )
                                 .await;
@@ -713,6 +716,7 @@ async fn dispatch_queue_once(state: &AppState) -> Result<()> {
                     &item.record.repo_full_name,
                     issue_number,
                     OrchdRuntimeState::Running,
+                    None,
                     dispatch_identity.clone(),
                 )
                 .await;

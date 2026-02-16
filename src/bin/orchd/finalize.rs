@@ -292,18 +292,39 @@ pub(super) fn finalize_dispatch_command(args: FinalizeDispatchArgs) -> Result<()
     }
 
     let phase_state_start = Instant::now();
-    if let Err(err) = forgejoctl_cmd::run_forgejoctl(
-        &args.forgejoctl_bin,
-        args.forgejo_config.as_deref(),
-        &args.token_file,
-        &[
-            "issue",
-            "orchd-state",
-            &args.issue_ref.to_string(),
-            "--to",
-            status_spec.runtime_state.as_str(),
-        ],
-    ) {
+    let issue_ref = args.issue_ref.to_string();
+    let orchd_state_result = if status_spec.runtime_state == OrchdRuntimeState::Failed
+        && !status_spec.reason_code.trim().is_empty()
+    {
+        forgejoctl_cmd::run_forgejoctl(
+            &args.forgejoctl_bin,
+            args.forgejo_config.as_deref(),
+            &args.token_file,
+            &[
+                "issue",
+                "orchd-state",
+                &issue_ref,
+                "--to",
+                status_spec.runtime_state.as_str(),
+                "--reason-code",
+                status_spec.reason_code.as_str(),
+            ],
+        )
+    } else {
+        forgejoctl_cmd::run_forgejoctl(
+            &args.forgejoctl_bin,
+            args.forgejo_config.as_deref(),
+            &args.token_file,
+            &[
+                "issue",
+                "orchd-state",
+                &issue_ref,
+                "--to",
+                status_spec.runtime_state.as_str(),
+            ],
+        )
+    };
+    if let Err(err) = orchd_state_result {
         eprintln!("finalize-dispatch: orchd-state projection failed: {err}");
         record_phase_latency_ms(
             "finalize_orchd_state",
