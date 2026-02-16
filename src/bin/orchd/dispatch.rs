@@ -289,7 +289,25 @@ fn render_fresh_preamble(
     render_prompt(&preamble_template, &[("role_card_md", &role_card_md)])
 }
 
-fn build_dispatch_md(plan: &DispatchPlan, prompt_mode: &str) -> String {
+fn render_prompt_file(
+    template_path: &Path,
+    values: &[(&str, &str)],
+    label: &str,
+) -> Result<String, DispatchError> {
+    let template = fs::read_to_string(template_path).map_err(|err| {
+        DispatchError::Io(format!(
+            "failed reading {label} template {}: {err}",
+            template_path.display()
+        ))
+    })?;
+    render_prompt(&template, values)
+}
+
+fn render_dispatch_md(
+    prompt_envelopes: &DispatchPromptEnvelopeConfig,
+    plan: &DispatchPlan,
+    prompt_mode: &str,
+) -> Result<String, DispatchError> {
     let turn_type = if prompt_mode == "fresh" {
         "first turn in this issue"
     } else {
@@ -300,60 +318,48 @@ fn build_dispatch_md(plan: &DispatchPlan, prompt_mode: &str) -> String {
         lexicon::EVENT_ISSUES => "an issue event triggered dispatch",
         _ => "a Forgejo webhook event triggered dispatch",
     };
-    format!(
-        r"## Turn Context
-
-You are working on `{issue_ref}`.
-
-Requester: `{actor}`
-Turn type: {turn_type}
-Why you were invoked: {trigger}
-",
-        actor = plan.actor,
-        issue_ref = plan.issue_ref,
-        turn_type = turn_type,
-        trigger = trigger,
+    let issue_ref = plan.issue_ref.to_string();
+    render_prompt_file(
+        &prompt_envelopes.turn_context_file,
+        &[
+            ("actor", &plan.actor),
+            ("issue_ref", &issue_ref),
+            ("turn_type", turn_type),
+            ("trigger", trigger),
+        ],
+        "turn context",
     )
 }
 
-fn build_issue_md_fresh(plan: &DispatchPlan) -> String {
-    let body = if plan.issue_body.trim().is_empty() {
-        "(empty)".to_string()
+fn render_issue_md(
+    prompt_envelopes: &DispatchPromptEnvelopeConfig,
+    plan: &DispatchPlan,
+    prompt_mode: &str,
+) -> Result<String, DispatchError> {
+    let issue_title = plan.issue_title.as_str();
+    if prompt_mode == "fresh" {
+        let issue_body = if plan.issue_body.trim().is_empty() {
+            "(empty)"
+        } else {
+            plan.issue_body.as_str()
+        };
+        render_prompt_file(
+            &prompt_envelopes.issue_fresh_file,
+            &[("issue_title", issue_title), ("issue_body", issue_body)],
+            "issue fresh",
+        )
     } else {
-        plan.issue_body.clone()
-    };
-    format!(
-        r"## Issue
-
-Title:
-{title}
-
-Body:
-{body}
-",
-        title = plan.issue_title,
-        body = body
-    )
-}
-
-fn build_issue_md_followup(plan: &DispatchPlan) -> String {
-    let delta = if plan.issue_delta_summary.trim().is_empty() {
-        "(no new issue activity)".to_string()
-    } else {
-        plan.issue_delta_summary.clone()
-    };
-    format!(
-        r"## Issue
-
-Title:
-{title}
-
-What's new since your last turn:
-{delta}
-",
-        title = plan.issue_title,
-        delta = delta,
-    )
+        let issue_delta = if plan.issue_delta_summary.trim().is_empty() {
+            "(no new issue activity)"
+        } else {
+            plan.issue_delta_summary.as_str()
+        };
+        render_prompt_file(
+            &prompt_envelopes.issue_followup_file,
+            &[("issue_title", issue_title), ("issue_delta", issue_delta)],
+            "issue followup",
+        )
+    }
 }
 
 async fn fetch_issue(state: AppState, issue: IssueRef) -> Result<ApiIssue, DispatchError> {
@@ -820,12 +826,8 @@ fn materialize_run_artifacts(
         String::new()
     };
 
-    let dispatch_md = build_dispatch_md(plan, prompt_mode);
-    let issue_md = if prompt_mode == "fresh" {
-        build_issue_md_fresh(plan)
-    } else {
-        build_issue_md_followup(plan)
-    };
+    let dispatch_md = render_dispatch_md(&dispatch_config.prompt_envelopes, plan, prompt_mode)?;
+    let issue_md = render_issue_md(&dispatch_config.prompt_envelopes, plan, prompt_mode)?;
 
     let envelope_template = fs::read_to_string(envelope_path).map_err(|err| {
         DispatchError::Io(format!(

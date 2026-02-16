@@ -17,6 +17,9 @@ git_base = "main"
 preamble_file = "../prompts/orchd-preamble.md"
 fresh_envelope = "../prompts/orchd-envelope-fresh.md"
 followup_envelope = "../prompts/orchd-envelope-followup.md"
+turn_context_file = "../prompts/orchd-turn-context.md"
+issue_fresh_file = "../prompts/orchd-issue-fresh.md"
+issue_followup_file = "../prompts/orchd-issue-followup.md"
 
 [notifications]
 enabled = true

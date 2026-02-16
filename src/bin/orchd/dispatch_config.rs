@@ -27,6 +27,9 @@ pub(super) struct DispatchPromptEnvelopeConfig {
     pub(super) preamble_file: PathBuf,
     pub(super) fresh_envelope: PathBuf,
     pub(super) followup_envelope: PathBuf,
+    pub(super) turn_context_file: PathBuf,
+    pub(super) issue_fresh_file: PathBuf,
+    pub(super) issue_followup_file: PathBuf,
 }
 
 impl DispatchPromptEnvelopeConfig {
@@ -104,6 +107,12 @@ struct DispatchPromptEnvelopeConfigFile {
     fresh_envelope: String,
     #[serde(default = "default_followup_envelope")]
     followup_envelope: String,
+    #[serde(default = "default_turn_context_file")]
+    turn_context_file: String,
+    #[serde(default = "default_issue_fresh_file")]
+    issue_fresh_file: String,
+    #[serde(default = "default_issue_followup_file")]
+    issue_followup_file: String,
 }
 
 impl Default for DispatchPromptEnvelopeConfigFile {
@@ -112,6 +121,9 @@ impl Default for DispatchPromptEnvelopeConfigFile {
             preamble_file: default_preamble_file(),
             fresh_envelope: default_fresh_envelope(),
             followup_envelope: default_followup_envelope(),
+            turn_context_file: default_turn_context_file(),
+            issue_fresh_file: default_issue_fresh_file(),
+            issue_followup_file: default_issue_followup_file(),
         }
     }
 }
@@ -200,6 +212,18 @@ fn default_fresh_envelope() -> String {
 
 fn default_followup_envelope() -> String {
     "../prompts/orchd-envelope-followup.md".to_string()
+}
+
+fn default_turn_context_file() -> String {
+    "../prompts/orchd-turn-context.md".to_string()
+}
+
+fn default_issue_fresh_file() -> String {
+    "../prompts/orchd-issue-fresh.md".to_string()
+}
+
+fn default_issue_followup_file() -> String {
+    "../prompts/orchd-issue-followup.md".to_string()
 }
 
 fn default_git_remote() -> String {
@@ -299,6 +323,12 @@ pub(super) fn load_dispatch_config(path: &Path) -> Result<DispatchConfig> {
         preamble_file: resolve_config_path(&base_dir, &raw.prompt_envelopes.preamble_file)?,
         fresh_envelope: resolve_config_path(&base_dir, &raw.prompt_envelopes.fresh_envelope)?,
         followup_envelope: resolve_config_path(&base_dir, &raw.prompt_envelopes.followup_envelope)?,
+        turn_context_file: resolve_config_path(&base_dir, &raw.prompt_envelopes.turn_context_file)?,
+        issue_fresh_file: resolve_config_path(&base_dir, &raw.prompt_envelopes.issue_fresh_file)?,
+        issue_followup_file: resolve_config_path(
+            &base_dir,
+            &raw.prompt_envelopes.issue_followup_file,
+        )?,
     };
 
     let control_plane = raw
@@ -320,6 +350,19 @@ pub(super) fn load_dispatch_config(path: &Path) -> Result<DispatchConfig> {
                 path.display(),
                 role_name,
                 role_card_file.display()
+            ));
+        }
+    }
+    for template_file in [
+        &prompt_envelopes.turn_context_file,
+        &prompt_envelopes.issue_fresh_file,
+        &prompt_envelopes.issue_followup_file,
+    ] {
+        if !template_file.is_file() {
+            return Err(anyhow!(
+                "dispatch config {} missing prompt template {}",
+                path.display(),
+                template_file.display()
             ));
         }
     }
@@ -428,6 +471,18 @@ mod tests {
             "# followup\n",
         )
         .expect("write followup envelope");
+        fs::write(
+            prompts_dir.join("orchd-turn-context.md"),
+            "# turn context\n",
+        )
+        .expect("write turn context template");
+        fs::write(prompts_dir.join("orchd-issue-fresh.md"), "# issue fresh\n")
+            .expect("write issue fresh template");
+        fs::write(
+            prompts_dir.join("orchd-issue-followup.md"),
+            "# issue followup\n",
+        )
+        .expect("write issue followup template");
         fs::write(prompts_dir.join("orchd-impl.md"), "# impl\n").expect("write impl prompt");
         fs::write(roles_dir.join("codex-orch.md"), "# role card\n").expect("write role card");
 
@@ -440,6 +495,9 @@ allowed_actors = ["main"]
 preamble_file = "prompts/orchd-preamble.md"
 fresh_envelope = "prompts/orchd-envelope-fresh.md"
 followup_envelope = "prompts/orchd-envelope-followup.md"
+turn_context_file = "prompts/orchd-turn-context.md"
+issue_fresh_file = "prompts/orchd-issue-fresh.md"
+issue_followup_file = "prompts/orchd-issue-followup.md"
 
 [roles.codex-orch]
 codex_bin = "/tmp/fake-codex"
@@ -513,6 +571,9 @@ local_path = "/home/main/forgejo-agent"
             preamble_file: Path::new("/tmp/prompts/orchd-preamble.md").to_path_buf(),
             fresh_envelope: Path::new("/tmp/prompts/orchd-envelope-fresh.md").to_path_buf(),
             followup_envelope: Path::new("/tmp/prompts/orchd-envelope-followup.md").to_path_buf(),
+            turn_context_file: Path::new("/tmp/prompts/orchd-turn-context.md").to_path_buf(),
+            issue_fresh_file: Path::new("/tmp/prompts/orchd-issue-fresh.md").to_path_buf(),
+            issue_followup_file: Path::new("/tmp/prompts/orchd-issue-followup.md").to_path_buf(),
         };
 
         let card = envelopes.role_card_file_for("codex-orch");
@@ -526,6 +587,15 @@ local_path = "/home/main/forgejo-agent"
         let config_path = root.join("dispatch.toml");
         let prompts_dir = root.join("prompts");
         fs::create_dir_all(&prompts_dir)?;
+        fs::write(
+            prompts_dir.join("orchd-turn-context.md"),
+            "# turn context\n",
+        )?;
+        fs::write(prompts_dir.join("orchd-issue-fresh.md"), "# issue fresh\n")?;
+        fs::write(
+            prompts_dir.join("orchd-issue-followup.md"),
+            "# issue followup\n",
+        )?;
 
         let config_toml = format!(
             r#"version = 1
@@ -536,6 +606,9 @@ forgejoctl_bin = "/home/main/.local/bin/forgejoctl"
 preamble_file = "{preamble}"
 fresh_envelope = "{fresh}"
 followup_envelope = "{followup}"
+turn_context_file = "{turn_context}"
+issue_fresh_file = "{issue_fresh}"
+issue_followup_file = "{issue_followup}"
 
 [roles.codex-orch]
 token_file = "{token}"
@@ -547,6 +620,9 @@ prompt_file = "{design_prompt}"
             preamble = prompts_dir.join("orchd-preamble.md").display(),
             fresh = prompts_dir.join("orchd-envelope-fresh.md").display(),
             followup = prompts_dir.join("orchd-envelope-followup.md").display(),
+            turn_context = prompts_dir.join("orchd-turn-context.md").display(),
+            issue_fresh = prompts_dir.join("orchd-issue-fresh.md").display(),
+            issue_followup = prompts_dir.join("orchd-issue-followup.md").display(),
             token = root.join("token.txt").display(),
             design_prompt = prompts_dir.join("orchd-design.md").display(),
         );
@@ -567,6 +643,15 @@ prompt_file = "{design_prompt}"
         let roles_dir = prompts_dir.join("roles");
         fs::create_dir_all(&roles_dir)?;
         fs::write(roles_dir.join("codex-orch.md"), "# codex-orch role card\n")?;
+        fs::write(
+            prompts_dir.join("orchd-turn-context.md"),
+            "# turn context\n",
+        )?;
+        fs::write(prompts_dir.join("orchd-issue-fresh.md"), "# issue fresh\n")?;
+        fs::write(
+            prompts_dir.join("orchd-issue-followup.md"),
+            "# issue followup\n",
+        )?;
 
         let config_toml = format!(
             r#"version = 1
@@ -577,6 +662,9 @@ forgejoctl_bin = "/home/main/.local/bin/forgejoctl"
 preamble_file = "{preamble}"
 fresh_envelope = "{fresh}"
 followup_envelope = "{followup}"
+turn_context_file = "{turn_context}"
+issue_fresh_file = "{issue_fresh}"
+issue_followup_file = "{issue_followup}"
 
 [roles.codex-orch]
 token_file = "{token}"
@@ -588,6 +676,9 @@ prompt_file = "{design_prompt}"
             preamble = prompts_dir.join("orchd-preamble.md").display(),
             fresh = prompts_dir.join("orchd-envelope-fresh.md").display(),
             followup = prompts_dir.join("orchd-envelope-followup.md").display(),
+            turn_context = prompts_dir.join("orchd-turn-context.md").display(),
+            issue_fresh = prompts_dir.join("orchd-issue-fresh.md").display(),
+            issue_followup = prompts_dir.join("orchd-issue-followup.md").display(),
             token = root.join("token.txt").display(),
             design_prompt = prompts_dir.join("orchd-design.md").display(),
         );
