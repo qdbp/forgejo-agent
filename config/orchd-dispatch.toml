@@ -61,3 +61,21 @@ timeout_sec = 1200
 role = "codex-orch"
 prompt_file = "../prompts/orchd-poke.md"
 timeout_sec = 1200
+
+[trigger_guardrails]
+max_depth_per_issue = 6
+max_dispatches_per_window = 12
+window_sec = 3600
+cooldown_sec = 60
+deny_immediate_self_loop = true
+
+[[triggers]]
+id = "closed_issue_poke"
+event = "issues"
+actions = ["closed"]
+priority = 0
+apply_guardrails = true
+
+[triggers.action]
+directive = "poke"
+target_role = "codex-orch"

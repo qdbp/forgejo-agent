@@ -9,7 +9,7 @@ struct Migration {
     apply: fn(&mut Connection) -> Result<()>,
 }
 
-const LATEST_SCHEMA_VERSION: i64 = 5;
+const LATEST_SCHEMA_VERSION: i64 = 4;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -29,13 +29,8 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 4,
-        name: "add_notification_deliveries_table",
-        apply: migration_0004_add_notification_deliveries_table,
-    },
-    Migration {
-        version: 5,
-        name: "ensure_notification_deliveries_table",
-        apply: migration_0005_ensure_notification_deliveries_table,
+        name: "add_trigger_dispatch_dedupe_table",
+        apply: migration_0004_add_trigger_dispatch_dedupe_table,
     },
 ];
 
@@ -322,21 +317,22 @@ fn migration_0003_drop_legacy_tmux_dispatch_columns(conn: &mut Connection) -> Re
     migration_result
 }
 
-fn migration_0004_add_notification_deliveries_table(conn: &mut Connection) -> Result<()> {
-    migration_0005_ensure_notification_deliveries_table(conn)
-}
-
-fn migration_0005_ensure_notification_deliveries_table(conn: &mut Connection) -> Result<()> {
+fn migration_0004_add_trigger_dispatch_dedupe_table(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     tx.execute_batch(
         r"
-        CREATE TABLE IF NOT EXISTS notification_deliveries (
-            dedupe_key TEXT PRIMARY KEY,
-            category TEXT NOT NULL,
-            sent_at TEXT NOT NULL
+        CREATE TABLE IF NOT EXISTS trigger_dispatch_dedupes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            dedupe_key TEXT NOT NULL UNIQUE,
+            trigger_id TEXT NOT NULL,
+            event_id INTEGER NOT NULL,
+            repo_full_name TEXT NOT NULL,
+            issue_number INTEGER,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(event_id) REFERENCES events(id)
         );
-        CREATE INDEX IF NOT EXISTS idx_notification_deliveries_category_sent
-            ON notification_deliveries (category, sent_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_trigger_dispatch_dedupe_issue
+            ON trigger_dispatch_dedupes (repo_full_name, issue_number, id DESC);
         ",
     )?;
     tx.commit()?;
@@ -385,19 +381,6 @@ fn foreign_keys_enabled(conn: &Connection) -> Result<bool> {
 }
 
 #[cfg(test)]
-fn table_exists(conn: &Connection, table_name: &str) -> Result<bool> {
-    let exists = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
-            params![table_name],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()?
-        .unwrap_or(0);
-    Ok(exists != 0)
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -405,11 +388,11 @@ mod tests {
     fn apply_all_creates_latest_schema_on_new_db() {
         let mut conn = Connection::open_in_memory().expect("open in-memory db");
         apply_all(&mut conn).expect("apply all migrations");
-        assert!(table_exists(&conn, "notification_deliveries").expect("table exists"));
         assert!(!table_has_column(&conn, "dispatches", "tmux_session").expect("pragma"));
         assert!(!table_has_column(&conn, "dispatches", "tmux_window").expect("pragma"));
         assert!(table_has_column(&conn, "dispatches", "backend_kind").expect("pragma"));
         assert!(table_has_column(&conn, "dispatches", "backend_ref").expect("pragma"));
+        assert!(table_has_column(&conn, "trigger_dispatch_dedupes", "dedupe_key").expect("pragma"));
         assert_eq!(
             current_schema_version(&conn).expect("schema version query"),
             LATEST_SCHEMA_VERSION
@@ -482,9 +465,9 @@ mod tests {
 
         apply_all(&mut conn).expect("apply all migrations");
 
-        assert!(table_exists(&conn, "notification_deliveries").expect("table exists"));
         assert!(!table_has_column(&conn, "dispatches", "tmux_session").expect("pragma"));
         assert!(!table_has_column(&conn, "dispatches", "tmux_window").expect("pragma"));
+        assert!(table_has_column(&conn, "trigger_dispatch_dedupes", "dedupe_key").expect("pragma"));
 
         let (kind, backend_ref): (Option<String>, Option<String>) = conn
             .query_row(

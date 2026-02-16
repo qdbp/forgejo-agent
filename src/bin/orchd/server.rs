@@ -8,22 +8,21 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use chrono::Utc;
+use chrono::{DateTime, TimeDelta, Utc};
 use rusqlite::OptionalExtension;
 use rusqlite::params;
 use serde_json::json;
 
 use forgejo_agent::api::ForgejoClient;
 use forgejo_agent::config::AgentConfig;
-use forgejo_agent::orchd_dispatch_core::DispatchState;
 use forgejo_agent::types::{OrchdRuntimeState, RepoRef};
 
 use super::cli::{Cli, DispatchMode};
 use super::db;
 use super::dispatch;
-use super::dispatch_config::load_dispatch_config;
+use super::dispatch_config::{DispatchTriggerGuardrailsConfig, load_dispatch_config};
 use super::errors::runtime_state_for_dispatch_error;
-use super::lexicon::{EVENT_ISSUE_COMMENT, EVENT_ISSUES};
+use super::lexicon::{DIRECTIVE_IMPL, EVENT_ISSUE_COMMENT, EVENT_ISSUES};
 use super::notifier;
 use super::paths::expand_tilde_path;
 use super::projection;
@@ -33,7 +32,7 @@ use super::state::{
 use super::telemetry::log_line;
 use super::webhook::{
     decide, extract_event_context, extract_header, load_secret, synthetic_delivery_id,
-    verify_signature,
+    trigger_dedupe_key, verify_signature,
 };
 
 pub(super) async fn run_server(cli: Cli) -> Result<()> {
@@ -329,54 +328,73 @@ async fn webhook_handler(
     }
 }
 
-const fn terminal_runtime_state_for_dispatch_status(
-    status: DispatchState,
-) -> Option<OrchdRuntimeState> {
-    match status {
-        DispatchState::Completed => Some(OrchdRuntimeState::Completed),
-        DispatchState::Blocked => Some(OrchdRuntimeState::Blocked),
-        DispatchState::FailedStart
-        | DispatchState::FailedRuntime
-        | DispatchState::TimedOut
-        | DispatchState::Canceled => Some(OrchdRuntimeState::Failed),
-        DispatchState::Queued
-        | DispatchState::Launching
-        | DispatchState::Starting
-        | DispatchState::Running => None,
+const fn default_trigger_guardrails() -> DispatchTriggerGuardrailsConfig {
+    DispatchTriggerGuardrailsConfig {
+        max_depth_per_issue: 6,
+        max_dispatches_per_window: 12,
+        window_sec: 3600,
+        cooldown_sec: 60,
+        deny_immediate_self_loop: true,
     }
 }
 
-async fn project_post_launch_runtime_state(
-    state: AppState,
-    repo_full_name: &str,
-    issue_number: u64,
-    dispatch_identity: Option<projection::CommentIdentity>,
-) -> Result<()> {
-    projection::project_issue_runtime_state(
-        state.clone(),
-        repo_full_name,
-        issue_number,
-        OrchdRuntimeState::Running,
-        dispatch_identity.clone(),
-    )
-    .await?;
+fn apply_trigger_guardrails(
+    state: &AppState,
+    record: &EventRecord,
+    decision: &super::state::DecisionRecord,
+) -> Result<Option<String>> {
+    if !decision.trigger_apply_guardrails {
+        return Ok(None);
+    }
+    let Some(issue_number) = record.issue_number else {
+        return Ok(None);
+    };
+    let Some(directive) = decision.directive.as_deref() else {
+        return Ok(None);
+    };
+    let Some(target_role) = decision.target_role.as_deref() else {
+        return Ok(None);
+    };
 
-    let maybe_status =
-        db::latest_issue_dispatch_status(&state.db_path, repo_full_name, issue_number)?;
-    if let Some(status) = maybe_status
-        && let Some(terminal_state) = terminal_runtime_state_for_dispatch_status(status)
+    let guardrails = state
+        .dispatch_config
+        .as_ref()
+        .map(|config| config.trigger_guardrails.clone())
+        .unwrap_or_else(default_trigger_guardrails);
+    let lookback = TimeDelta::seconds(i64::try_from(guardrails.window_sec).unwrap_or(i64::MAX));
+    let since = (Utc::now() - lookback).to_rfc3339();
+    let guardrail_stats = db::issue_trigger_guardrail_stats(
+        &state.db_path,
+        &record.repo_full_name,
+        issue_number,
+        &since,
+    )?;
+
+    if guardrail_stats.total >= u64::from(guardrails.max_depth_per_issue) {
+        return Ok(Some("guardrail_depth".to_string()));
+    }
+    if guardrail_stats.recent >= u64::from(guardrails.max_dispatches_per_window) {
+        return Ok(Some("guardrail_rate".to_string()));
+    }
+    if guardrails.deny_immediate_self_loop
+        && guardrail_stats.last_directive.as_deref() == Some(directive)
+        && guardrail_stats.last_target_role.as_deref() == Some(target_role)
     {
-        projection::project_issue_runtime_state(
-            state,
-            repo_full_name,
-            issue_number,
-            terminal_state,
-            dispatch_identity,
-        )
-        .await?;
+        return Ok(Some("guardrail_self_loop".to_string()));
+    }
+    if guardrails.cooldown_sec > 0
+        && let Some(last_created_at) = guardrail_stats.last_created_at.as_deref()
+        && let Ok(parsed) = DateTime::parse_from_rfc3339(last_created_at)
+    {
+        let elapsed = Utc::now().signed_duration_since(parsed.with_timezone(&Utc));
+        let cooldown =
+            TimeDelta::seconds(i64::try_from(guardrails.cooldown_sec).unwrap_or(i64::MAX));
+        if elapsed < cooldown {
+            return Ok(Some("guardrail_cooldown".to_string()));
+        }
     }
 
-    Ok(())
+    Ok(None)
 }
 
 async fn process_webhook(
@@ -402,6 +420,10 @@ async fn process_webhook(
             .as_ref()
             .map_or_else(|| "<unknown>".to_string(), |ctx| ctx.repo_full_name.clone()),
         issue_number: context.as_ref().and_then(|ctx| ctx.issue_number),
+        source_issue_id: context.as_ref().and_then(|ctx| ctx.source_issue_id),
+        source_issue_anchor_at: context
+            .as_ref()
+            .and_then(|ctx| ctx.source_issue_anchor_at.clone()),
         action: payload.action.clone(),
         actor_login: context.as_ref().and_then(|ctx| ctx.actor_login.clone()),
         event_text: context.as_ref().and_then(|ctx| ctx.text.clone()),
@@ -424,7 +446,40 @@ async fn process_webhook(
     };
     let _ = db::upsert_repo_seen(&state.db_path, &record.repo_full_name);
 
-    let decision = decide(&event_type, record.action.as_deref(), context.as_ref());
+    let mut decision = decide(
+        &event_type,
+        record.action.as_deref(),
+        context.as_ref(),
+        state
+            .dispatch_config
+            .as_ref()
+            .map(|config| config.triggers.as_slice()),
+    );
+
+    if decision.would_dispatch
+        && let Some(trigger_id) = decision.trigger_id.as_deref()
+    {
+        let dedupe_key = trigger_dedupe_key(&record, trigger_id);
+        decision.trigger_dedupe_key = Some(dedupe_key.clone());
+        let accepted = db::claim_trigger_dispatch_dedupe(
+            &state.db_path,
+            event_id,
+            trigger_id,
+            &dedupe_key,
+            &record.repo_full_name,
+            record.issue_number,
+        )?;
+        if !accepted {
+            decision.suppress_dispatch("trigger_duplicate");
+        }
+    }
+
+    if decision.would_dispatch
+        && let Some(reason) = apply_trigger_guardrails(state, &record, &decision)?
+    {
+        decision.suppress_dispatch(reason);
+    }
+
     let decision_id = db::insert_decision(&state.db_path, event_id, &record, &decision)?;
 
     let mut status_projected = false;
@@ -448,67 +503,98 @@ async fn process_webhook(
             match state.dispatch_mode {
                 DispatchMode::DryRun => {}
                 DispatchMode::Exec => {
-                    match dispatch::dispatch_issue(
-                        state.clone(),
-                        decision_id,
-                        event_id,
-                        &record,
-                        &decision,
-                    )
-                    .await
-                    {
-                        Ok(()) => {
-                            if let Err(err) = project_post_launch_runtime_state(
-                                state.clone(),
-                                &record.repo_full_name,
-                                issue_number,
-                                dispatch_identity.clone(),
-                            )
-                            .await
-                            {
-                                if status_error.is_none() {
-                                    status_error = Some(err.to_string());
-                                }
-                            } else {
-                                status_projected = true;
+                    let defer_impl = match decision.directive.as_deref() {
+                        Some(DIRECTIVE_IMPL) => match db::latest_repo_inflight_impl_dispatch_id(
+                            &state.db_path,
+                            &record.repo_full_name,
+                        ) {
+                            Ok(Some(inflight)) => {
+                                log_line(
+                                    "dispatch_deferred_repo_busy",
+                                    json!({
+                                        "repo": record.repo_full_name,
+                                        "issue_number": issue_number,
+                                        "directive": DIRECTIVE_IMPL,
+                                        "inflight_dispatch_id": inflight,
+                                    }),
+                                );
+                                true
                             }
-                            if let Some(role_name) = decision.target_role.as_deref()
-                                && let Err(err) = db::upsert_issue_role_cursor_event_id(
-                                    &state.db_path,
+                            Ok(None) => false,
+                            Err(err) => {
+                                status_error = Some(format!(
+                                    "failed checking repo inflight impl dispatch: {err}"
+                                ));
+                                false
+                            }
+                        },
+                        _ => false,
+                    };
+
+                    if !defer_impl {
+                        match dispatch::dispatch_issue(
+                            state.clone(),
+                            decision_id,
+                            event_id,
+                            &record,
+                            &decision,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                if let Err(err) = projection::project_issue_runtime_state(
+                                    state.clone(),
                                     &record.repo_full_name,
                                     issue_number,
-                                    role_name,
-                                    event_id,
+                                    OrchdRuntimeState::Running,
+                                    dispatch_identity.clone(),
                                 )
-                                && status_error.is_none()
-                            {
-                                status_error = Some(format!(
-                                    "failed updating issue cursor for role {role_name}: {err}"
-                                ));
-                            }
-                        }
-                        Err(err) => {
-                            let projection = projection::project_issue_runtime_state(
-                                state.clone(),
-                                &record.repo_full_name,
-                                issue_number,
-                                runtime_state_for_dispatch_error(&err),
-                                dispatch_identity.clone(),
-                            )
-                            .await;
-                            match projection {
-                                Ok(()) => {
+                                .await
+                                {
+                                    if status_error.is_none() {
+                                        status_error = Some(err.to_string());
+                                    }
+                                } else {
                                     status_projected = true;
                                 }
-                                Err(projection_err) => {
-                                    if status_error.is_none() {
-                                        status_error = Some(projection_err.to_string());
-                                    }
+                                if let Some(role_name) = decision.target_role.as_deref()
+                                    && let Err(err) = db::upsert_issue_role_cursor_event_id(
+                                        &state.db_path,
+                                        &record.repo_full_name,
+                                        issue_number,
+                                        role_name,
+                                        event_id,
+                                    )
+                                    && status_error.is_none()
+                                {
+                                    status_error = Some(format!(
+                                        "failed updating issue cursor for role {role_name}: {err}"
+                                    ));
                                 }
                             }
-                            if status_error.is_none() {
-                                status_error =
-                                    Some(format!("dispatch {}: {}", err.reason_code(), err));
+                            Err(err) => {
+                                let projection = projection::project_issue_runtime_state(
+                                    state.clone(),
+                                    &record.repo_full_name,
+                                    issue_number,
+                                    runtime_state_for_dispatch_error(&err),
+                                    dispatch_identity.clone(),
+                                )
+                                .await;
+                                match projection {
+                                    Ok(()) => {
+                                        status_projected = true;
+                                    }
+                                    Err(projection_err) => {
+                                        if status_error.is_none() {
+                                            status_error = Some(projection_err.to_string());
+                                        }
+                                    }
+                                }
+                                if status_error.is_none() {
+                                    status_error =
+                                        Some(format!("dispatch {}: {}", err.reason_code(), err));
+                                }
                             }
                         }
                     }
@@ -537,6 +623,9 @@ async fn process_webhook(
             "actor": record.actor_login,
             "decision": decision.decision,
             "reason_code": decision.reason_code,
+            "decision_source": decision.decision_source,
+            "trigger_id": decision.trigger_id,
+            "trigger_dedupe_key": decision.trigger_dedupe_key,
             "directive": decision.directive,
             "target_role": decision.target_role,
             "status_projected": status_projected,
@@ -589,6 +678,21 @@ async fn dispatch_queue_once(state: &AppState) -> Result<()> {
     }
     let items = db::queued_impl_decisions(&state.db_path, 10)?;
     for item in items {
+        let repo_full_name = item.record.repo_full_name.clone();
+        if let Ok(Some(inflight)) =
+            db::latest_repo_inflight_impl_dispatch_id(&state.db_path, &repo_full_name)
+        {
+            log_line(
+                "dispatch_queue_repo_busy",
+                json!({
+                    "repo": repo_full_name,
+                    "decision_id": item.decision_id,
+                    "event_id": item.event_id,
+                    "inflight_dispatch_id": inflight,
+                }),
+            );
+            continue;
+        }
         let issue_number = item
             .record
             .issue_number
@@ -604,10 +708,11 @@ async fn dispatch_queue_once(state: &AppState) -> Result<()> {
         .await
         {
             Ok(()) => {
-                let _ = project_post_launch_runtime_state(
+                let _ = projection::project_issue_runtime_state(
                     state.clone(),
                     &item.record.repo_full_name,
                     issue_number,
+                    OrchdRuntimeState::Running,
                     dispatch_identity.clone(),
                 )
                 .await;

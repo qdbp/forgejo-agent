@@ -29,6 +29,10 @@ pub(super) fn directive_uses_worktree(directive: &str) -> bool {
     directive == DIRECTIVE_IMPL
 }
 
+pub(super) fn directive_serializes_repo(directive: &str) -> bool {
+    directive_uses_worktree(directive)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

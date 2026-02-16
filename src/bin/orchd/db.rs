@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
@@ -13,7 +12,9 @@ use forgejo_agent::orchd_dispatch_core::{
     reduce_dispatch_state,
 };
 
-use super::lexicon::{DIRECTIVE_IMPL, EVENT_ISSUE_COMMENT, EVENT_ISSUES};
+use super::lexicon::{
+    DIRECTIVE_IMPL, EVENT_ISSUE_COMMENT, EVENT_ISSUES, directive_serializes_repo,
+};
 use super::migrations;
 use super::state::{DecisionRecord, EventRecord, IssueEventDeltaRow};
 
@@ -21,6 +22,7 @@ use super::state::{DecisionRecord, EventRecord, IssueEventDeltaRow};
 pub(super) enum DispatchReservation {
     Started(i64),
     InFlightIssue(i64),
+    InFlightRepo(i64),
 }
 
 #[derive(Debug)]
@@ -78,6 +80,15 @@ pub(super) struct ReplyNotificationRow {
     pub(super) issue_number: u64,
     pub(super) actor_login: String,
     pub(super) event_text: String,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct IssueTriggerGuardrailStats {
+    pub(super) total: u64,
+    pub(super) recent: u64,
+    pub(super) last_created_at: Option<String>,
+    pub(super) last_directive: Option<String>,
+    pub(super) last_target_role: Option<String>,
 }
 
 pub(super) fn init_db(db_path: &Path) -> Result<()> {
@@ -262,6 +273,130 @@ pub(super) fn insert_decision(
     Ok(conn.last_insert_rowid())
 }
 
+pub(super) fn claim_trigger_dispatch_dedupe(
+    db_path: &Path,
+    event_id: i64,
+    trigger_id: &str,
+    dedupe_key: &str,
+    repo_full_name: &str,
+    issue_number: Option<u64>,
+) -> Result<bool> {
+    let conn = open_db(db_path)?;
+    let inserted = conn.execute(
+        r"
+        INSERT INTO trigger_dispatch_dedupes
+            (dedupe_key, trigger_id, event_id, repo_full_name, issue_number, created_at)
+        VALUES
+            (?1, ?2, ?3, ?4, ?5, ?6)
+        ",
+        params![
+            dedupe_key,
+            trigger_id,
+            event_id,
+            repo_full_name,
+            issue_number.and_then(|value| i64::try_from(value).ok()),
+            Utc::now().to_rfc3339(),
+        ],
+    );
+
+    match inserted {
+        Ok(_) => Ok(true),
+        Err(err) => {
+            let duplicate = matches!(
+                err,
+                rusqlite::Error::SqliteFailure(sqlite_err, _)
+                    if sqlite_err.extended_code == 2067
+            );
+            if duplicate {
+                Ok(false)
+            } else {
+                Err(err.into())
+            }
+        }
+    }
+}
+
+pub(super) fn issue_trigger_guardrail_stats(
+    db_path: &Path,
+    repo_full_name: &str,
+    issue_number: u64,
+    since_created_at: &str,
+) -> Result<IssueTriggerGuardrailStats> {
+    let conn = open_db(db_path)?;
+    let issue_number = i64::try_from(issue_number)?;
+    let trigger_filter = r"
+        would_dispatch = 1
+        AND decision = 'accepted'
+        AND (
+            reason_code = 'assignee_reply'
+            OR reason_code LIKE 'registered_trigger:%'
+        )
+    ";
+
+    let total: u64 = conn.query_row(
+        &format!(
+            r"
+            SELECT COUNT(*)
+            FROM decisions
+            WHERE repo_full_name = ?1
+              AND issue_number = ?2
+              AND {trigger_filter}
+            "
+        ),
+        params![repo_full_name, issue_number],
+        |row| row.get(0),
+    )?;
+
+    let recent: u64 = conn.query_row(
+        &format!(
+            r"
+            SELECT COUNT(*)
+            FROM decisions
+            WHERE repo_full_name = ?1
+              AND issue_number = ?2
+              AND {trigger_filter}
+              AND created_at >= ?3
+            "
+        ),
+        params![repo_full_name, issue_number, since_created_at],
+        |row| row.get(0),
+    )?;
+
+    let latest = conn
+        .query_row(
+            &format!(
+                r"
+                SELECT created_at, directive, target_role
+                FROM decisions
+                WHERE repo_full_name = ?1
+                  AND issue_number = ?2
+                  AND {trigger_filter}
+                ORDER BY id DESC
+                LIMIT 1
+                "
+            ),
+            params![repo_full_name, issue_number],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+
+    let (last_created_at, last_directive, last_target_role) = latest.unwrap_or((None, None, None));
+
+    Ok(IssueTriggerGuardrailStats {
+        total,
+        recent,
+        last_created_at,
+        last_directive,
+        last_target_role,
+    })
+}
+
 pub(super) fn update_decision_comment_status(
     db_path: &Path,
     decision_id: i64,
@@ -382,114 +517,31 @@ pub(super) fn issue_delta_rows(
 }
 
 pub(super) fn summarize_issue_delta(rows: &[IssueEventDeltaRow]) -> String {
-    const MAX_CONTEXT_LINES: usize = 24;
-    const MAX_CONTEXT_LINE_CHARS: usize = 220;
-
-    fn normalize_single_line(raw: &str) -> String {
-        raw.split_whitespace().collect::<Vec<_>>().join(" ")
-    }
-
-    fn truncate_for_context_line(mut text: String) -> String {
-        if text.chars().count() > MAX_CONTEXT_LINE_CHARS {
-            text = format!(
-                "{}...",
-                text.chars()
-                    .take(MAX_CONTEXT_LINE_CHARS)
-                    .collect::<String>()
-            );
-        }
-        text
-    }
-
-    fn format_comment_line(timestamp: &str, actor: &str, raw_text: &str) -> String {
-        let text = raw_text.trim();
-        if text.is_empty() {
-            return format!("- [{timestamp}] {actor} issue_comment: (empty)");
-        }
-        let mut rendered = format!("- [{timestamp}] {actor} issue_comment:");
-        for line in text.lines() {
-            rendered.push_str("\n  | ");
-            rendered.push_str(line);
-        }
-        rendered
-    }
-
     if rows.is_empty() {
         return "(no new issue events since last handled dispatch)".to_string();
     }
 
-    let mut seen_context = HashSet::<(String, String, String)>::new();
-    let mut comment_lines = Vec::<String>::new();
-    let mut context_lines = Vec::<String>::new();
-    let mut omitted_context_total = 0_usize;
-
-    for row in rows {
-        let timestamp = row
-            .source_created_at
-            .as_deref()
-            .filter(|text| !text.trim().is_empty())
-            .unwrap_or(row.received_at.as_str());
-        let actor = row
-            .actor_login
-            .as_deref()
-            .filter(|text| !text.trim().is_empty())
-            .unwrap_or("unknown");
-        let raw_text = row.event_text.as_deref().unwrap_or("");
-        if raw_text.trim().is_empty() {
-            continue;
-        }
-        if row.event_type == EVENT_ISSUE_COMMENT {
-            comment_lines.push(format_comment_line(timestamp, actor, raw_text));
-            continue;
-        }
-        let normalized = normalize_single_line(raw_text);
-        if normalized.is_empty() {
-            continue;
-        }
-        let dedupe_key = (
-            row.event_type.clone(),
-            actor.to_string(),
-            normalized.clone(),
-        );
-        if !seen_context.insert(dedupe_key) {
-            omitted_context_total += 1;
-            continue;
-        }
-        if context_lines.len() >= MAX_CONTEXT_LINES {
-            omitted_context_total += 1;
-            continue;
-        }
-        context_lines.push(format!(
-            "- [{}] {} {}: {}",
-            timestamp,
-            actor,
-            row.event_type,
-            truncate_for_context_line(normalized)
-        ));
-    }
-
-    if comment_lines.is_empty() && context_lines.is_empty() {
-        return "(no new issue events since last handled dispatch)".to_string();
-    }
-
-    let mut sections = Vec::<String>::new();
-    if !comment_lines.is_empty() {
-        sections.push("New comments (verbatim):".to_string());
-        sections.extend(comment_lines);
-    }
-    if !context_lines.is_empty() || omitted_context_total > 0 {
-        sections.push("Other issue activity (context, may be truncated):".to_string());
-        sections.extend(context_lines);
-    }
-    if omitted_context_total > 0 {
-        sections.push(format!(
-            "- (omitted {} older or duplicate context event{})",
-            omitted_context_total,
-            if omitted_context_total == 1 { "" } else { "s" }
-        ));
-    }
-
-    sections.join("\n")
+    rows.iter()
+        .map(|row| {
+            let timestamp = row
+                .source_created_at
+                .as_deref()
+                .filter(|text| !text.trim().is_empty())
+                .unwrap_or(row.received_at.as_str());
+            let actor = row
+                .actor_login
+                .as_deref()
+                .filter(|text| !text.trim().is_empty())
+                .unwrap_or("unknown");
+            let mut text = row.event_text.as_deref().unwrap_or("").replace('\n', " ");
+            text = text.trim().to_string();
+            if text.chars().count() > 220 {
+                text = format!("{}...", text.chars().take(220).collect::<String>());
+            }
+            format!("- [{}] {} {}: {}", timestamp, actor, row.event_type, text)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 struct DispatchTransitionPlan {
@@ -608,6 +660,33 @@ pub(super) fn reserve_dispatch_starting(
     if let Some(dispatch_id) = inflight_id {
         tx.commit()?;
         return Ok(DispatchReservation::InFlightIssue(dispatch_id));
+    }
+
+    if directive_serializes_repo(insert.directive) {
+        let repo_inflight = tx
+            .query_row(
+                r"
+                SELECT id
+                FROM dispatches
+                WHERE repo_full_name = ?1
+                  AND directive = ?2
+                  AND status IN (?3, ?4)
+                ORDER BY id DESC
+                LIMIT 1
+                ",
+                params![
+                    insert.repo_full_name,
+                    insert.directive,
+                    starting_status,
+                    running_status
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        if let Some(dispatch_id) = repo_inflight {
+            tx.commit()?;
+            return Ok(DispatchReservation::InFlightRepo(dispatch_id));
+        }
     }
 
     tx.execute(
@@ -958,32 +1037,6 @@ pub(super) fn latest_issue_active_dispatch(
     Ok(dispatch)
 }
 
-pub(super) fn latest_issue_dispatch_status(
-    db_path: &Path,
-    repo_full_name: &str,
-    issue_number: u64,
-) -> Result<Option<DispatchState>> {
-    let conn = open_db(db_path)?;
-    let status = conn
-        .query_row(
-            r"
-            SELECT status
-            FROM dispatches
-            WHERE repo_full_name = ?1
-              AND issue_number = ?2
-            ORDER BY id DESC
-            LIMIT 1
-            ",
-            params![repo_full_name, i64::try_from(issue_number)?],
-            |row| {
-                let status_raw: String = row.get(0)?;
-                parse_dispatch_state_literal(&status_raw, 0)
-            },
-        )
-        .optional()?;
-    Ok(status)
-}
-
 pub(super) fn latest_issue_resume_dispatch(
     db_path: &Path,
     repo_full_name: &str,
@@ -1016,6 +1069,35 @@ pub(super) fn latest_issue_resume_dispatch(
         )
         .optional()?;
     Ok(dispatch)
+}
+
+pub(super) fn latest_repo_inflight_impl_dispatch_id(
+    db_path: &Path,
+    repo_full_name: &str,
+) -> Result<Option<i64>> {
+    let conn = open_db(db_path)?;
+    let starting_status = DispatchState::Starting.as_db_str();
+    let running_status = DispatchState::Running.as_db_str();
+    conn.query_row(
+        r"
+        SELECT id
+        FROM dispatches
+        WHERE repo_full_name = ?1
+          AND directive = ?2
+          AND status IN (?3, ?4)
+        ORDER BY id DESC
+        LIMIT 1
+        ",
+        params![
+            repo_full_name,
+            DIRECTIVE_IMPL,
+            starting_status,
+            running_status
+        ],
+        |row| row.get::<_, i64>(0),
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
 pub(super) fn mark_dispatch_failed_runtime(
@@ -1144,6 +1226,8 @@ pub(super) fn queued_impl_decisions(db_path: &Path, limit: u32) -> Result<Vec<Qu
                 issue_number: row
                     .get::<_, Option<i64>>(5)?
                     .and_then(|n| u64::try_from(n).ok()),
+                source_issue_id: None,
+                source_issue_anchor_at: None,
                 action: row.get(6)?,
                 actor_login: row.get(7)?,
                 event_text: row.get(8)?,
@@ -1158,6 +1242,10 @@ pub(super) fn queued_impl_decisions(db_path: &Path, limit: u32) -> Result<Vec<Qu
                 directive: row.get(14)?,
                 target_role: row.get(15)?,
                 would_dispatch: would_dispatch_int != 0,
+                decision_source: "db".to_string(),
+                trigger_id: None,
+                trigger_dedupe_key: None,
+                trigger_apply_guardrails: false,
             };
             Ok(QueuedDecision {
                 decision_id,
@@ -1412,11 +1500,11 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use chrono::Utc;
-    use forgejo_agent::orchd_dispatch_core::{DispatchNotificationPhase, DispatchState};
+    use forgejo_agent::orchd_dispatch_core::DispatchState;
     use rusqlite::params;
 
     use crate::orchd::lexicon::{
-        DECISION_ACCEPTED, DIRECTIVE_IMPL, DIRECTIVE_POKE, EVENT_ISSUE_COMMENT, EVENT_ISSUES,
+        DECISION_ACCEPTED, DIRECTIVE_IMPL, DIRECTIVE_POKE, EVENT_ISSUE_COMMENT,
     };
 
     fn temp_db_path(label: &str) -> PathBuf {
@@ -1551,7 +1639,8 @@ mod tests {
         let first = reserve_sample_dispatch(&db_path, first_decision_id, 7, DIRECTIVE_POKE);
         let first_id = match first {
             super::DispatchReservation::Started(id) => id,
-            super::DispatchReservation::InFlightIssue(_) => {
+            super::DispatchReservation::InFlightIssue(_)
+            | super::DispatchReservation::InFlightRepo(_) => {
                 panic!("expected first reservation to start")
             }
         };
@@ -1566,6 +1655,39 @@ mod tests {
             super::DispatchReservation::Started(_) => {
                 panic!("expected second reservation to be blocked")
             }
+            super::DispatchReservation::InFlightRepo(_) => {
+                panic!("expected issue-level inflight, not repo-level inflight")
+            }
+        }
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn reserve_dispatch_blocks_second_inflight_impl_for_repo() {
+        let db_path = temp_db_path("dispatch-reserve-repo");
+        super::init_db(&db_path).expect("db init");
+        let first_decision_id = seed_decision_id(&db_path);
+        let second_decision_id = seed_decision_id(&db_path);
+
+        let first = reserve_sample_dispatch(&db_path, first_decision_id, 7, DIRECTIVE_IMPL);
+        let first_id = match first {
+            super::DispatchReservation::Started(id) => id,
+            super::DispatchReservation::InFlightIssue(_)
+            | super::DispatchReservation::InFlightRepo(_) => {
+                panic!("expected first reservation to start")
+            }
+        };
+
+        let second = reserve_sample_dispatch(&db_path, second_decision_id, 8, DIRECTIVE_IMPL);
+        match second {
+            super::DispatchReservation::InFlightRepo(id) => assert_eq!(id, first_id),
+            super::DispatchReservation::Started(_) => {
+                panic!("expected repo-level inflight block")
+            }
+            super::DispatchReservation::InFlightIssue(_) => {
+                panic!("expected repo-level inflight, not issue-level inflight")
+            }
         }
 
         let _ = fs::remove_file(db_path);
@@ -1578,7 +1700,8 @@ mod tests {
         let decision_id = seed_decision_id(&db_path);
         let started_id = match reserve_sample_dispatch(&db_path, decision_id, 9, DIRECTIVE_POKE) {
             super::DispatchReservation::Started(id) => id,
-            super::DispatchReservation::InFlightIssue(_) => {
+            super::DispatchReservation::InFlightIssue(_)
+            | super::DispatchReservation::InFlightRepo(_) => {
                 panic!("expected started dispatch")
             }
         };
@@ -1641,35 +1764,6 @@ mod tests {
     }
 
     #[test]
-    fn latest_issue_dispatch_status_returns_latest_row_status() {
-        let db_path = temp_db_path("issue-latest-status");
-        super::init_db(&db_path).expect("db init");
-        let decision_id = seed_decision_id(&db_path);
-        insert_dispatch_row(
-            &db_path,
-            decision_id,
-            13,
-            DispatchState::Running,
-            "codex-orch",
-            None,
-        );
-        insert_dispatch_row(
-            &db_path,
-            decision_id,
-            13,
-            DispatchState::Completed,
-            "codex-orch",
-            None,
-        );
-
-        let latest = super::latest_issue_dispatch_status(&db_path, "main/orchd-debug", 13)
-            .expect("query latest status");
-        assert_eq!(latest, Some(DispatchState::Completed));
-
-        let _ = fs::remove_file(db_path);
-    }
-
-    #[test]
     fn latest_issue_resume_dispatch_returns_latest_session_row() {
         let db_path = temp_db_path("issue-resume-row");
         super::init_db(&db_path).expect("db init");
@@ -1704,194 +1798,21 @@ mod tests {
     }
 
     #[test]
-    fn pending_dispatch_phase_notifications_respects_phase_and_dedupe() {
-        let db_path = temp_db_path("dispatch-notify");
-        super::init_db(&db_path).expect("db init");
-        let decision_id = seed_decision_id(&db_path);
-        let completed_id = insert_dispatch_row(
-            &db_path,
-            decision_id,
-            20,
-            DispatchState::Completed,
-            "codex-orch",
-            None,
-        );
-        let _blocked_id = insert_dispatch_row(
-            &db_path,
-            decision_id,
-            21,
-            DispatchState::Blocked,
-            "codex-orch",
-            None,
-        );
-
-        let rows = super::pending_dispatch_phase_notifications(
-            &db_path,
-            &[
-                DispatchNotificationPhase::Completed,
-                DispatchNotificationPhase::Blocked,
-            ],
-            0,
-            16,
-        )
-        .expect("query pending notifications");
-        assert!(
-            rows.iter()
-                .any(|row| row.phase == DispatchNotificationPhase::Completed)
-        );
-        assert!(
-            rows.iter()
-                .any(|row| row.phase == DispatchNotificationPhase::Blocked)
-        );
-
-        let inserted = super::record_notification_delivery(
-            &db_path,
-            &format!("dispatch:{completed_id}:completed"),
-            "dispatch_phase",
-        )
-        .expect("record notification");
-        assert!(inserted);
-
-        let after = super::pending_dispatch_phase_notifications(
-            &db_path,
-            &[
-                DispatchNotificationPhase::Completed,
-                DispatchNotificationPhase::Blocked,
-            ],
-            0,
-            16,
-        )
-        .expect("query pending notifications after dedupe");
-        assert!(
-            after
-                .iter()
-                .all(|row| row.phase != DispatchNotificationPhase::Completed),
-            "completed phase should have been deduped"
-        );
-
-        let _ = fs::remove_file(db_path);
-    }
-
-    #[test]
-    fn pending_reply_notifications_match_owned_or_mentioned_issues() {
-        let db_path = temp_db_path("reply-notify");
+    fn trigger_dedupe_claim_is_idempotent() {
+        let db_path = temp_db_path("trigger-dedupe");
         super::init_db(&db_path).expect("db init");
         let conn = super::open_db(&db_path).expect("open db");
         let now = Utc::now().to_rfc3339();
-
-        conn.execute(
-            r"
-            INSERT INTO events (delivery_id, event_type, repo_full_name, issue_number, action, actor_login, event_text, raw_json, received_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-            ",
-            params![
-                "opened-owned",
-                EVENT_ISSUES,
-                "main/forgejo-agent",
-                40_i64,
-                "opened",
-                "main",
-                "owner issue body",
-                "{}",
-                now
-            ],
-        )
-        .expect("insert owned opened event");
-        conn.execute(
-            r"
-            INSERT INTO events (delivery_id, event_type, repo_full_name, issue_number, action, actor_login, event_text, raw_json, received_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-            ",
-            params![
-                "reply-owned",
-                EVENT_ISSUE_COMMENT,
-                "main/forgejo-agent",
-                40_i64,
-                "created",
-                "codex-orch",
-                "status update on owned issue",
-                "{}",
-                now
-            ],
-        )
-        .expect("insert owned reply event");
-
-        conn.execute(
-            r"
-            INSERT INTO events (delivery_id, event_type, repo_full_name, issue_number, action, actor_login, event_text, raw_json, received_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-            ",
-            params![
-                "opened-mention",
-                EVENT_ISSUES,
-                "main/forgejo-agent",
-                41_i64,
-                "opened",
-                "alice",
-                "please involve @main on this",
-                "{}",
-                now
-            ],
-        )
-        .expect("insert mentioned opened event");
-        conn.execute(
-            r"
-            INSERT INTO events (delivery_id, event_type, repo_full_name, issue_number, action, actor_login, event_text, raw_json, received_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-            ",
-            params![
-                "reply-mention",
-                EVENT_ISSUE_COMMENT,
-                "main/forgejo-agent",
-                41_i64,
-                "created",
-                "codex-dev",
-                "I can take this",
-                "{}",
-                now
-            ],
-        )
-        .expect("insert mentioned reply event");
-
-        let rows = super::pending_reply_notifications(&db_path, "main", 0, 16)
-            .expect("query pending replies");
-        assert_eq!(rows.len(), 2);
-        assert!(rows.iter().any(|row| row.issue_number == 40));
-        assert!(rows.iter().any(|row| row.issue_number == 41));
-
-        let row = rows
-            .iter()
-            .find(|row| row.issue_number == 40)
-            .expect("owned row");
-        let inserted = super::record_notification_delivery(&db_path, &row.dedupe_key, "reply")
-            .expect("record reply dedupe");
-        assert!(inserted);
-
-        let after = super::pending_reply_notifications(&db_path, "main", 0, 16)
-            .expect("query pending replies after dedupe");
-        assert_eq!(after.len(), 1);
-        assert_eq!(after[0].issue_number, 41);
-
-        let _ = fs::remove_file(db_path);
-    }
-
-    fn seed_impl_decision(db_path: &Path, repo_full_name: &str, issue_number: u64) -> i64 {
-        let conn = super::open_db(db_path).expect("open db");
-        let now = Utc::now().to_rfc3339();
-        let delivery_id = format!(
-            "test-delivery-{repo_full_name}-{issue_number}-{}",
-            Utc::now().timestamp_nanos_opt().unwrap_or(0)
-        );
         conn.execute(
             r"
             INSERT INTO events (delivery_id, event_type, repo_full_name, issue_number, action, actor_login, raw_json, received_at)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
             ",
             params![
-                delivery_id,
+                "dedupe-delivery-1",
                 EVENT_ISSUE_COMMENT,
-                repo_full_name,
-                i64::try_from(issue_number).expect("issue number fits i64"),
+                "main/orchd-debug",
+                26_i64,
                 "created",
                 "main",
                 "{}",
@@ -1900,157 +1821,101 @@ mod tests {
         )
         .expect("insert event");
         let event_id = conn.last_insert_rowid();
-        conn.execute(
-            r"
-            INSERT INTO decisions
-            (event_id, repo_full_name, issue_number, actor_login, directive, target_role, decision, reason_code, would_dispatch, created_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-            ",
-            params![
-                event_id,
-                repo_full_name,
-                i64::try_from(issue_number).expect("issue number fits i64"),
-                "main",
-                DIRECTIVE_IMPL,
-                "codex-orch",
-                DECISION_ACCEPTED,
-                "explicit_directive",
-                1_i64,
-                Utc::now().to_rfc3339(),
-            ],
-        )
-        .expect("insert decision");
-        conn.last_insert_rowid()
-    }
 
-    fn insert_dispatch_row_for_repo(
-        db_path: &Path,
-        decision_id: i64,
-        repo_full_name: &str,
-        issue_number: u64,
-        status: DispatchState,
-        directive: &str,
-    ) -> i64 {
-        let conn = super::open_db(db_path).expect("open db");
-        conn.execute(
-            r"
-            INSERT INTO dispatches
-            (decision_id, repo_full_name, issue_number, actor_login, directive, target_role, status, started_at, ended_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-            ",
-            params![
-                decision_id,
-                repo_full_name,
-                i64::try_from(issue_number).expect("issue number fits i64"),
-                "main",
-                directive,
-                "codex-orch",
-                status.as_db_str(),
-                Utc::now().to_rfc3339(),
-                Utc::now().to_rfc3339(),
-            ],
-        )
-        .expect("insert dispatch");
-        conn.last_insert_rowid()
-    }
-
-    #[test]
-    fn queued_impl_decisions_allows_parallel_repo_dispatches() {
-        let db_path = temp_db_path("queued-impl-parallel-repo");
-        super::init_db(&db_path).expect("db init");
-
-        let busy_repo = "main/busy-repo";
-        let free_repo = "main/free-repo";
-
-        let busy_decision_inflight = seed_impl_decision(&db_path, busy_repo, 1);
-        let busy_decision_queued = seed_impl_decision(&db_path, busy_repo, 2);
-        let free_decision_queued = seed_impl_decision(&db_path, free_repo, 1);
-
-        let _busy_dispatch = insert_dispatch_row_for_repo(
+        let first = super::claim_trigger_dispatch_dedupe(
             &db_path,
-            busy_decision_inflight,
-            busy_repo,
-            1,
-            DispatchState::Running,
-            DIRECTIVE_IMPL,
-        );
-
-        let queued = super::queued_impl_decisions(&db_path, 10).expect("query queued decisions");
-        let queued_ids = queued
-            .iter()
-            .map(|item| item.decision_id)
-            .collect::<Vec<_>>();
-        assert!(queued_ids.contains(&busy_decision_queued));
-        assert!(queued_ids.contains(&free_decision_queued));
+            event_id,
+            "legacy.assignee.reply",
+            "dedupe-key-1",
+            "main/orchd-debug",
+            Some(26),
+        )
+        .expect("first dedupe claim");
+        let second = super::claim_trigger_dispatch_dedupe(
+            &db_path,
+            event_id,
+            "legacy.assignee.reply",
+            "dedupe-key-1",
+            "main/orchd-debug",
+            Some(26),
+        )
+        .expect("second dedupe claim");
+        assert!(first);
+        assert!(!second);
 
         let _ = fs::remove_file(db_path);
     }
 
     #[test]
-    fn summarize_issue_delta_dedupes_repeated_rows() {
-        let rows = vec![
-            super::IssueEventDeltaRow {
-                event_type: EVENT_ISSUES.to_string(),
-                actor_login: Some("codex-orch".to_string()),
-                event_text: Some("same body text".to_string()),
-                received_at: "2026-01-01T00:00:00Z".to_string(),
-                source_created_at: Some("2026-01-01T00:00:00Z".to_string()),
-            },
-            super::IssueEventDeltaRow {
-                event_type: EVENT_ISSUES.to_string(),
-                actor_login: Some("codex-orch".to_string()),
-                event_text: Some("same body text".to_string()),
-                received_at: "2026-01-01T00:00:01Z".to_string(),
-                source_created_at: Some("2026-01-01T00:00:01Z".to_string()),
-            },
-            super::IssueEventDeltaRow {
-                event_type: EVENT_ISSUE_COMMENT.to_string(),
-                actor_login: Some("main".to_string()),
-                event_text: Some("please do x".to_string()),
-                received_at: "2026-01-01T00:00:02Z".to_string(),
-                source_created_at: Some("2026-01-01T00:00:02Z".to_string()),
-            },
-        ];
+    fn issue_trigger_guardrail_stats_track_triggered_decisions_only() {
+        let db_path = temp_db_path("trigger-guardrail-stats");
+        super::init_db(&db_path).expect("db init");
+        let conn = super::open_db(&db_path).expect("open db");
 
-        let summary = super::summarize_issue_delta(&rows);
-        assert!(summary.contains("New comments (verbatim):"));
-        assert!(summary.contains("Other issue activity (context, may be truncated):"));
-        assert_eq!(summary.matches("codex-orch issues").count(), 1);
-        assert_eq!(summary.matches("main issue_comment:").count(), 1);
-        assert!(summary.contains("omitted 1 older or duplicate context event"));
-    }
+        let insert_decision = |delivery: &str, reason: &str, directive: &str, role: &str| {
+            let now = Utc::now().to_rfc3339();
+            conn.execute(
+                r"
+                INSERT INTO events (delivery_id, event_type, repo_full_name, issue_number, action, actor_login, raw_json, received_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                ",
+                params![
+                    delivery,
+                    EVENT_ISSUE_COMMENT,
+                    "main/orchd-debug",
+                    41_i64,
+                    "created",
+                    "main",
+                    "{}",
+                    now
+                ],
+            )
+            .expect("insert event");
+            let event_id = conn.last_insert_rowid();
+            conn.execute(
+                r"
+                INSERT INTO decisions
+                (event_id, repo_full_name, issue_number, actor_login, directive, target_role, decision, reason_code, would_dispatch, created_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                ",
+                params![
+                    event_id,
+                    "main/orchd-debug",
+                    41_i64,
+                    "main",
+                    directive,
+                    role,
+                    DECISION_ACCEPTED,
+                    reason,
+                    1_i64,
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+            .expect("insert decision");
+        };
 
-    #[test]
-    fn summarize_issue_delta_keeps_full_comment_text() {
-        let long_comment = "x".repeat(300);
-        let rows = vec![super::IssueEventDeltaRow {
-            event_type: EVENT_ISSUE_COMMENT.to_string(),
-            actor_login: Some("main".to_string()),
-            event_text: Some(long_comment.clone()),
-            received_at: "2026-01-01T00:00:00Z".to_string(),
-            source_created_at: Some("2026-01-01T00:00:00Z".to_string()),
-        }];
+        insert_decision("trigger-a", "assignee_reply", "reply", "codex-orch");
+        insert_decision(
+            "trigger-b",
+            "registered_trigger:closed_debrief",
+            "poke",
+            "codex-orch",
+        );
+        insert_decision("explicit-c", "explicit_directive", "poke", "codex-orch");
 
-        let summary = super::summarize_issue_delta(&rows);
-        assert!(summary.contains("New comments (verbatim):"));
-        assert!(summary.contains(&format!("| {long_comment}")));
-    }
+        let stats = super::issue_trigger_guardrail_stats(
+            &db_path,
+            "main/orchd-debug",
+            41,
+            "1970-01-01T00:00:00+00:00",
+        )
+        .expect("guardrail stats");
 
-    #[test]
-    fn summarize_issue_delta_truncates_context_section_only() {
-        let mut rows = Vec::new();
-        for idx in 0..30 {
-            rows.push(super::IssueEventDeltaRow {
-                event_type: EVENT_ISSUES.to_string(),
-                actor_login: Some("codex-orch".to_string()),
-                event_text: Some(format!("context row {idx}")),
-                received_at: format!("2026-01-01T00:00:{idx:02}Z"),
-                source_created_at: Some(format!("2026-01-01T00:00:{idx:02}Z")),
-            });
-        }
+        assert_eq!(stats.total, 2);
+        assert_eq!(stats.recent, 2);
+        assert_eq!(stats.last_directive.as_deref(), Some("poke"));
+        assert_eq!(stats.last_target_role.as_deref(), Some("codex-orch"));
 
-        let summary = super::summarize_issue_delta(&rows);
-        assert!(summary.contains("Other issue activity (context, may be truncated):"));
-        assert!(summary.contains("omitted"));
+        let _ = fs::remove_file(db_path);
     }
 }

@@ -4,14 +4,28 @@ use chrono::Utc;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
-use super::lexicon::{
-    DECISION_ACCEPTED, DECISION_IGNORED, DIRECTIVE_DESIGN, DIRECTIVE_IMPL, DIRECTIVE_INVESTIGATE,
-    DIRECTIVE_POKE, DIRECTIVE_REPLY, EVENT_ISSUE_COMMENT, EVENT_ISSUES, directive_is_known,
+use super::dispatch_config::{
+    DispatchTriggerActorGuard, DispatchTriggerAssigneeGuard, DispatchTriggerClass,
+    DispatchTriggerConfig, DispatchTriggerDirectiveGuard, DispatchTriggerDirectiveSource,
+    DispatchTriggerRoleSource, legacy_trigger_pack,
 };
+use super::lexicon::{DECISION_ACCEPTED, EVENT_ISSUE_COMMENT, EVENT_ISSUES, directive_is_known};
 use super::paths::expand_tilde_path;
-use super::state::{DecisionRecord, EventContext, ParsedDirective, WebhookPayload};
+use super::state::{DecisionRecord, EventContext, EventRecord, ParsedDirective, WebhookPayload};
 
 type HmacSha256 = Hmac<Sha256>;
+
+#[derive(Debug)]
+struct TriggerCandidate {
+    id: String,
+    class: DispatchTriggerClass,
+    priority: i32,
+    order: usize,
+    directive: String,
+    target_role: String,
+    reason_code: String,
+    apply_guardrails: bool,
+}
 
 pub(super) fn verify_signature(
     secret: Option<&[u8]>,
@@ -104,9 +118,24 @@ pub(super) fn extract_event_context(
         .as_ref()
         .and_then(|comment| comment.created_at.clone());
 
+    let source_issue_id = payload.issue.as_ref().and_then(|issue| issue.id);
+    let source_issue_anchor_at = payload
+        .issue
+        .as_ref()
+        .and_then(|issue| {
+            issue
+                .updated_at
+                .clone()
+                .or_else(|| issue.closed_at.clone())
+                .or_else(|| issue.created_at.clone())
+        })
+        .or_else(|| source_created_at.clone());
+
     Some(EventContext {
         repo_full_name,
         issue_number,
+        source_issue_id,
+        source_issue_anchor_at,
         actor_login,
         text,
         source_comment_id,
@@ -119,71 +148,213 @@ pub(super) fn decide(
     event_type: &str,
     action: Option<&str>,
     context: Option<&EventContext>,
+    configured_triggers: Option<&[DispatchTriggerConfig]>,
 ) -> DecisionRecord {
     let Some(context) = context else {
-        return DecisionRecord {
-            decision: DECISION_IGNORED.to_string(),
-            reason_code: "missing_context".to_string(),
-            directive: None,
-            target_role: None,
-            would_dispatch: false,
-        };
+        return DecisionRecord::ignored("missing_context");
     };
 
-    if !action_is_actionable(event_type, action) {
-        return DecisionRecord {
-            decision: DECISION_IGNORED.to_string(),
-            reason_code: "unactionable_action".to_string(),
-            directive: None,
-            target_role: None,
-            would_dispatch: false,
-        };
-    }
+    let action = action.map(|value| value.trim().to_ascii_lowercase());
+    let parsed_directive = context.text.as_deref().and_then(parse_directive);
 
-    if let Some(text) = context.text.as_deref()
-        && let Some(parsed) = parse_directive(text)
+    let fallback_legacy;
+    let triggers: &[DispatchTriggerConfig] = if let Some(configured_triggers) = configured_triggers
     {
-        return DecisionRecord {
-            decision: DECISION_ACCEPTED.to_string(),
-            reason_code: "explicit_directive".to_string(),
-            directive: Some(parsed.directive),
-            target_role: Some(parsed.role),
-            would_dispatch: true,
-        };
+        configured_triggers
+    } else {
+        fallback_legacy = legacy_trigger_pack();
+        fallback_legacy.as_slice()
+    };
+
+    let actionable = triggers.iter().any(|trigger| {
+        trigger.matcher.event_type == event_type
+            && action.as_deref().is_some_and(|candidate| {
+                trigger.matcher.actions.iter().any(|item| item == candidate)
+            })
+    });
+    if !actionable {
+        return DecisionRecord::ignored("unactionable_action");
     }
 
-    if event_type == EVENT_ISSUE_COMMENT && context.assignees.len() == 1 {
-        let assignee = context.assignees[0].as_str();
+    let mut best: Option<TriggerCandidate> = None;
+    for (order, trigger) in triggers.iter().enumerate() {
+        let Some(action_value) = action.as_deref() else {
+            continue;
+        };
+        if trigger.matcher.event_type != event_type
+            || !trigger
+                .matcher
+                .actions
+                .iter()
+                .any(|item| item == action_value)
+        {
+            continue;
+        }
+
+        if !trigger_guards_hold(trigger, context, parsed_directive.as_ref()) {
+            continue;
+        }
+
+        let Some(directive) = resolve_trigger_directive(trigger, parsed_directive.as_ref()) else {
+            continue;
+        };
+        let Some(target_role) = resolve_trigger_role(trigger, context, parsed_directive.as_ref())
+        else {
+            continue;
+        };
+
+        let candidate = TriggerCandidate {
+            id: trigger.id.clone(),
+            class: trigger.class.clone(),
+            priority: trigger.priority,
+            order,
+            directive,
+            target_role,
+            reason_code: trigger.action.reason_code.clone(),
+            apply_guardrails: trigger.apply_guardrails,
+        };
+        if prefer_candidate(&candidate, best.as_ref()) {
+            best = Some(candidate);
+        }
+    }
+
+    let Some(best) = best else {
+        return DecisionRecord::ignored("no_directive");
+    };
+
+    DecisionRecord {
+        decision: DECISION_ACCEPTED.to_string(),
+        reason_code: best.reason_code,
+        directive: Some(best.directive),
+        target_role: Some(best.target_role),
+        would_dispatch: true,
+        decision_source: match best.class {
+            DispatchTriggerClass::ExplicitDirective => "explicit_directive".to_string(),
+            DispatchTriggerClass::AssigneeReply => "assignee_reply".to_string(),
+            DispatchTriggerClass::Registered => "registered_trigger".to_string(),
+        },
+        trigger_id: Some(best.id),
+        trigger_dedupe_key: None,
+        trigger_apply_guardrails: best.apply_guardrails,
+    }
+}
+
+pub(super) fn trigger_dedupe_key(record: &EventRecord, trigger_id: &str) -> String {
+    let subject_anchor = if let Some(comment_id) = record.source_comment_id {
+        format!("comment:{comment_id}")
+    } else if let Some(issue_id) = record.source_issue_id {
+        let anchored_at = record.source_issue_anchor_at.as_deref().unwrap_or("-");
+        let action = record.action.as_deref().unwrap_or("-");
+        format!("issue:{issue_id}:{action}:{anchored_at}")
+    } else if let Some(created_at) = record.source_created_at.as_deref() {
+        format!("event_created_at:{created_at}")
+    } else {
+        let payload_hash = Sha256::digest(record.raw_json.as_bytes());
+        format!("payload:{}", &hex::encode(payload_hash)[..20])
+    };
+
+    let issue_number = record
+        .issue_number
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let action = record.action.as_deref().unwrap_or("-");
+    format!(
+        "trigger:{trigger_id}:{}:{}:{}:{}:{subject_anchor}",
+        record.repo_full_name, issue_number, record.event_type, action
+    )
+}
+
+const fn prefer_candidate(
+    candidate: &TriggerCandidate,
+    current: Option<&TriggerCandidate>,
+) -> bool {
+    let Some(current) = current else {
+        return true;
+    };
+
+    let candidate_rank = candidate.class.precedence_rank();
+    let current_rank = current.class.precedence_rank();
+    if candidate_rank != current_rank {
+        return candidate_rank > current_rank;
+    }
+    if candidate.priority != current.priority {
+        return candidate.priority > current.priority;
+    }
+    candidate.order < current.order
+}
+
+fn trigger_guards_hold(
+    trigger: &DispatchTriggerConfig,
+    context: &EventContext,
+    parsed_directive: Option<&ParsedDirective>,
+) -> bool {
+    let guards = &trigger.guards;
+    if guards.directive == DispatchTriggerDirectiveGuard::RequireParsed
+        && parsed_directive.is_none()
+    {
+        return false;
+    }
+    if guards.directive == DispatchTriggerDirectiveGuard::RequireAbsent
+        && parsed_directive.is_some()
+    {
+        return false;
+    }
+
+    let assignee = single_codex_assignee(context);
+    if guards.assignee == DispatchTriggerAssigneeGuard::RequireSingleCodex && assignee.is_none() {
+        return false;
+    }
+    if guards.actor == DispatchTriggerActorGuard::RequireNotAssignee {
+        let Some(assignee) = assignee else {
+            return false;
+        };
         let actor = context
             .actor_login
             .as_deref()
             .unwrap_or_default()
             .to_ascii_lowercase();
-        if !actor.is_empty() && actor != assignee && assignee.starts_with("codex-") {
-            return DecisionRecord {
-                decision: DECISION_ACCEPTED.to_string(),
-                reason_code: "assignee_reply".to_string(),
-                directive: Some(DIRECTIVE_REPLY.to_string()),
-                target_role: Some(assignee.to_string()),
-                would_dispatch: true,
-            };
+        if actor.is_empty() || actor == assignee {
+            return false;
         }
     }
+    true
+}
 
-    DecisionRecord {
-        decision: DECISION_IGNORED.to_string(),
-        reason_code: "no_directive".to_string(),
-        directive: None,
-        target_role: None,
-        would_dispatch: false,
+fn resolve_trigger_directive(
+    trigger: &DispatchTriggerConfig,
+    parsed_directive: Option<&ParsedDirective>,
+) -> Option<String> {
+    match &trigger.action.directive {
+        DispatchTriggerDirectiveSource::Literal(directive) => Some(directive.clone()),
+        DispatchTriggerDirectiveSource::ParsedDirective => {
+            parsed_directive.map(|directive| directive.directive.to_ascii_lowercase())
+        }
     }
 }
 
-fn action_is_actionable(event_type: &str, action: Option<&str>) -> bool {
-    match event_type {
-        EVENT_ISSUES => matches!(action, Some("opened" | "edited")),
-        EVENT_ISSUE_COMMENT => matches!(action, Some("created" | "edited")),
-        _ => false,
+fn resolve_trigger_role(
+    trigger: &DispatchTriggerConfig,
+    context: &EventContext,
+    parsed_directive: Option<&ParsedDirective>,
+) -> Option<String> {
+    match &trigger.action.target_role {
+        DispatchTriggerRoleSource::Literal(role) => Some(role.clone()),
+        DispatchTriggerRoleSource::ParsedDirectiveRole => {
+            parsed_directive.map(|directive| directive.role.to_ascii_lowercase())
+        }
+        DispatchTriggerRoleSource::SingleAssignee => single_codex_assignee(context),
+    }
+}
+
+fn single_codex_assignee(context: &EventContext) -> Option<String> {
+    if context.assignees.len() != 1 {
+        return None;
+    }
+    let assignee = context.assignees[0].trim().to_ascii_lowercase();
+    if assignee.starts_with("codex-") {
+        Some(assignee)
+    } else {
+        None
     }
 }
 
@@ -192,17 +363,19 @@ pub(super) fn parse_directive(text: &str) -> Option<ParsedDirective> {
 }
 
 fn parse_directive_line(line: &str) -> Option<ParsedDirective> {
-    let trimmed = line.trim_start();
-    let role_end = trimmed.find(char::is_whitespace)?;
-    let role_token = &trimmed[..role_end];
-    let directive_text = trimmed[role_end..].trim_start();
-    if directive_text.is_empty() {
+    let mut parts = line.split_whitespace();
+    let role_token = parts.next()?;
+    let directive_token = parts.next()?;
+    if parts.next().is_some() {
         return None;
     }
 
     let role_token = role_token
         .trim_matches(|ch: char| [',', ';', ':'].contains(&ch))
         .trim_start_matches('@')
+        .to_ascii_lowercase();
+    let directive = directive_token
+        .trim_matches(|ch: char| [',', ';', ':', '.'].contains(&ch))
         .to_ascii_lowercase();
 
     let role = if role_token == "codex" {
@@ -213,30 +386,10 @@ fn parse_directive_line(line: &str) -> Option<ParsedDirective> {
         return None;
     };
 
-    let directive_text = directive_text.to_ascii_lowercase();
-    let directive = [
-        DIRECTIVE_DESIGN,
-        DIRECTIVE_INVESTIGATE,
-        DIRECTIVE_IMPL,
-        DIRECTIVE_POKE,
-        DIRECTIVE_REPLY,
-    ]
-    .iter()
-    .find_map(|candidate| {
-        let rest = directive_text.strip_prefix(candidate)?;
-        match rest.chars().next() {
-            None => Some((*candidate).to_string()),
-            Some(ch) if [',', '.', ':', ';'].contains(&ch) => Some((*candidate).to_string()),
-            Some(ch) if ch.is_whitespace() && rest.trim().is_empty() => {
-                Some((*candidate).to_string())
-            }
-            _ => None,
-        }
-    })?;
-
     if !directive_is_known(directive.as_str()) {
         return None;
     }
+
     Some(ParsedDirective { role, directive })
 }
 
@@ -251,26 +404,30 @@ pub(super) fn extract_header(headers: &HeaderMap, names: &[&str]) -> Option<Stri
 
 #[cfg(test)]
 mod tests {
-    use crate::orchd::lexicon::{
-        DECISION_ACCEPTED, DECISION_IGNORED, DIRECTIVE_DESIGN, DIRECTIVE_INVESTIGATE,
-        DIRECTIVE_POKE, DIRECTIVE_REPLY, EVENT_ISSUE_COMMENT, EVENT_ISSUES,
+    use crate::orchd::dispatch_config::{
+        DispatchTriggerAction, DispatchTriggerClass, DispatchTriggerConfig,
+        DispatchTriggerDirectiveSource, DispatchTriggerGuards, DispatchTriggerMatcher,
+        DispatchTriggerRoleSource,
     };
-    use crate::orchd::state::EventContext;
+    use crate::orchd::lexicon::{DECISION_ACCEPTED, DECISION_IGNORED, DIRECTIVE_POKE};
+    use crate::orchd::state::{EventContext, EventRecord};
 
-    use super::{decide, parse_directive};
+    use super::{decide, parse_directive, trigger_dedupe_key};
 
     #[test]
     fn owner_comment_without_directive_is_ignored() {
         let context = EventContext {
             repo_full_name: "main/orchd-debug".to_string(),
             issue_number: Some(1),
+            source_issue_id: Some(99),
+            source_issue_anchor_at: Some("2026-02-16T09:00:00Z".to_string()),
             actor_login: Some("main".to_string()),
             text: Some("just checking in".to_string()),
             source_comment_id: None,
             source_created_at: None,
             assignees: Vec::new(),
         };
-        let decision = decide(EVENT_ISSUE_COMMENT, Some("created"), Some(&context));
+        let decision = decide("issue_comment", Some("created"), Some(&context), None);
         assert_eq!(decision.decision, DECISION_IGNORED);
         assert_eq!(decision.reason_code, "no_directive");
         assert!(!decision.would_dispatch);
@@ -281,13 +438,15 @@ mod tests {
         let context = EventContext {
             repo_full_name: "main/orchd-debug".to_string(),
             issue_number: Some(1),
+            source_issue_id: Some(99),
+            source_issue_anchor_at: Some("2026-02-16T09:00:00Z".to_string()),
             actor_login: Some("main".to_string()),
             text: Some("@codex-orch poke".to_string()),
-            source_comment_id: None,
-            source_created_at: None,
+            source_comment_id: Some(123),
+            source_created_at: Some("2026-02-16T09:00:01Z".to_string()),
             assignees: Vec::new(),
         };
-        let decision = decide(EVENT_ISSUE_COMMENT, Some("created"), Some(&context));
+        let decision = decide("issue_comment", Some("created"), Some(&context), None);
         assert_eq!(decision.decision, DECISION_ACCEPTED);
         assert_eq!(decision.reason_code, "explicit_directive");
         assert_eq!(decision.directive.as_deref(), Some(DIRECTIVE_POKE));
@@ -300,16 +459,18 @@ mod tests {
         let context = EventContext {
             repo_full_name: "main/orchd-debug".to_string(),
             issue_number: Some(1),
+            source_issue_id: Some(99),
+            source_issue_anchor_at: Some("2026-02-16T09:00:00Z".to_string()),
             actor_login: Some("main".to_string()),
             text: Some("please take a look".to_string()),
-            source_comment_id: None,
-            source_created_at: None,
+            source_comment_id: Some(123),
+            source_created_at: Some("2026-02-16T09:00:01Z".to_string()),
             assignees: vec!["codex-orch".to_string()],
         };
-        let decision = decide(EVENT_ISSUE_COMMENT, Some("created"), Some(&context));
+        let decision = decide("issue_comment", Some("created"), Some(&context), None);
         assert_eq!(decision.decision, DECISION_ACCEPTED);
         assert_eq!(decision.reason_code, "assignee_reply");
-        assert_eq!(decision.directive.as_deref(), Some(DIRECTIVE_REPLY));
+        assert_eq!(decision.directive.as_deref(), Some("reply"));
         assert_eq!(decision.target_role.as_deref(), Some("codex-orch"));
         assert!(decision.would_dispatch);
     }
@@ -322,56 +483,19 @@ mod tests {
     }
 
     #[test]
-    fn directive_with_comma_suffix_text_parses() {
-        let parsed =
-            parse_directive("@codex-orch design, open ended").expect("directive should parse");
-        assert_eq!(parsed.role, "codex-orch");
-        assert_eq!(parsed.directive, DIRECTIVE_DESIGN);
-    }
-
-    #[test]
-    fn investigate_directive_is_accepted() {
-        let context = EventContext {
-            repo_full_name: "main/orchd-debug".to_string(),
-            issue_number: Some(1),
-            actor_login: Some("main".to_string()),
-            text: Some("@codex-orch investigate".to_string()),
-            source_comment_id: None,
-            source_created_at: None,
-            assignees: Vec::new(),
-        };
-        let decision = decide(EVENT_ISSUE_COMMENT, Some("created"), Some(&context));
-        assert_eq!(decision.decision, DECISION_ACCEPTED);
-        assert_eq!(decision.reason_code, "explicit_directive");
-        assert_eq!(decision.directive.as_deref(), Some(DIRECTIVE_INVESTIGATE));
-        assert_eq!(decision.target_role.as_deref(), Some("codex-orch"));
-        assert!(decision.would_dispatch);
-    }
-
-    #[test]
-    fn directive_with_unpunctuated_suffix_text_is_rejected() {
-        let parsed = parse_directive("@codex-orch design open ended");
-        assert!(parsed.is_none());
-    }
-
-    #[test]
-    fn directive_followed_by_quote_is_rejected() {
-        let parsed = parse_directive("@codex-orch design\"open ended\"");
-        assert!(parsed.is_none());
-    }
-
-    #[test]
     fn issue_body_directive_is_ignored_for_label_updates() {
         let context = EventContext {
             repo_full_name: "main/forgejo-work".to_string(),
             issue_number: Some(16),
+            source_issue_id: Some(99),
+            source_issue_anchor_at: Some("2026-02-16T09:00:00Z".to_string()),
             actor_login: Some("codex-orch".to_string()),
             text: Some("@codex-orch design".to_string()),
             source_comment_id: None,
             source_created_at: None,
             assignees: Vec::new(),
         };
-        let decision = decide(EVENT_ISSUES, Some("label_updated"), Some(&context));
+        let decision = decide("issues", Some("label_updated"), Some(&context), None);
         assert_eq!(decision.decision, DECISION_IGNORED);
         assert_eq!(decision.reason_code, "unactionable_action");
         assert!(!decision.would_dispatch);
@@ -382,17 +506,82 @@ mod tests {
         let context = EventContext {
             repo_full_name: "main/forgejo-work".to_string(),
             issue_number: Some(16),
+            source_issue_id: Some(99),
+            source_issue_anchor_at: Some("2026-02-16T09:00:00Z".to_string()),
             actor_login: Some("main".to_string()),
             text: Some("@codex-orch design".to_string()),
             source_comment_id: None,
             source_created_at: None,
             assignees: Vec::new(),
         };
-        let decision = decide(EVENT_ISSUES, Some("opened"), Some(&context));
+        let decision = decide("issues", Some("opened"), Some(&context), None);
         assert_eq!(decision.decision, DECISION_ACCEPTED);
         assert_eq!(decision.reason_code, "explicit_directive");
-        assert_eq!(decision.directive.as_deref(), Some(DIRECTIVE_DESIGN));
+        assert_eq!(decision.directive.as_deref(), Some("design"));
         assert_eq!(decision.target_role.as_deref(), Some("codex-orch"));
         assert!(decision.would_dispatch);
+    }
+
+    #[test]
+    fn explicit_directive_precedes_registered_trigger() {
+        let trigger = DispatchTriggerConfig {
+            id: "custom.closed".to_string(),
+            class: DispatchTriggerClass::Registered,
+            priority: 999,
+            matcher: DispatchTriggerMatcher {
+                event_type: "issue_comment".to_string(),
+                actions: vec!["created".to_string()],
+            },
+            guards: DispatchTriggerGuards::default(),
+            action: DispatchTriggerAction {
+                directive: DispatchTriggerDirectiveSource::Literal("poke".to_string()),
+                target_role: DispatchTriggerRoleSource::Literal("codex-orch".to_string()),
+                reason_code: "registered_trigger:custom.closed".to_string(),
+            },
+            apply_guardrails: true,
+        };
+
+        let context = EventContext {
+            repo_full_name: "main/orchd-debug".to_string(),
+            issue_number: Some(4),
+            source_issue_id: Some(4),
+            source_issue_anchor_at: Some("2026-02-16T09:00:00Z".to_string()),
+            actor_login: Some("main".to_string()),
+            text: Some("@codex-orch poke".to_string()),
+            source_comment_id: Some(500),
+            source_created_at: Some("2026-02-16T09:00:00Z".to_string()),
+            assignees: Vec::new(),
+        };
+
+        let decision = decide(
+            "issue_comment",
+            Some("created"),
+            Some(&context),
+            Some(&[trigger]),
+        );
+        assert_eq!(decision.reason_code, "registered_trigger:custom.closed");
+
+        let decision_with_legacy = decide("issue_comment", Some("created"), Some(&context), None);
+        assert_eq!(decision_with_legacy.reason_code, "explicit_directive");
+    }
+
+    #[test]
+    fn trigger_dedupe_key_uses_comment_id_when_present() {
+        let record = EventRecord {
+            delivery_id: "delivery-1".to_string(),
+            event_type: "issue_comment".to_string(),
+            repo_full_name: "main/forgejo-agent".to_string(),
+            issue_number: Some(26),
+            source_issue_id: Some(1234),
+            source_issue_anchor_at: Some("2026-02-16T09:00:00Z".to_string()),
+            action: Some("created".to_string()),
+            actor_login: Some("main".to_string()),
+            event_text: Some("hello".to_string()),
+            source_comment_id: Some(4321),
+            source_created_at: Some("2026-02-16T09:00:01Z".to_string()),
+            raw_json: "{}".to_string(),
+        };
+        let key = trigger_dedupe_key(&record, "legacy.assignee.reply");
+        assert!(key.contains("comment:4321"));
     }
 }

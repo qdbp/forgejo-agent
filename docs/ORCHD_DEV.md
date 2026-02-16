@@ -12,17 +12,21 @@ Current implementation supports two dispatch modes:
 - Issue comments are meat-only. `orchd` must never post metadata into issue comments.
 - `orchd` projects orchestration state out-of-band via labels (`orchd/state/*`) and (for worktree directives) via work-plane transitions (`state/*`).
 - Agents should use `forgejoctl` as the control plane API surface.
-- `orchd` must authenticate as the `orchd` machine user. No orchestrator path should impersonate `main`.
 
 Core behavior:
 
 - accepts webhook events at `POST /webhook`
-- parses directives (`@codex-orch design`, `@codex-orch investigate`, `@codex-orch impl`, `@codex-orch reply`, `@codex poke`)
+- compiles trigger rules from `orchd-dispatch.toml` into typed matchers/guards/actions
 - persists `events`, `decisions`, and `dispatches` in sqlite
 - ensures per-repo Forgejo webhooks exist (best-effort) for repos owned by `FORGEJO_DEFAULT_OWNER`
 - ensures per-repo policy labels exist (best-effort) and maintains per-role local checkouts under the orchd state dir
 - emits heartbeat + reconcile logs periodically
-- dispatches `reply` implicitly on new issue comments when the issue has exactly one assignee and it is a `codex-*` user (unless an explicit directive is present)
+- evaluates trigger precedence as:
+  - explicit directive triggers
+  - implicit assignee-reply trigger
+  - registered config triggers
+- enforces logical trigger dedupe keys so replayed deliveries do not re-dispatch the same logical event
+- enforces anti-spiral guardrails on trigger-fired dispatches (`depth`, `rate`, `cooldown`, `self-loop`)
 - supports postmortem session re-entry via `orchd issue resume <repo> <issue_number>`
 
 Dispatch behavior is configured in `config/orchd-dispatch.toml`:
@@ -30,19 +34,62 @@ Dispatch behavior is configured in `config/orchd-dispatch.toml`:
 - actor allowlist (`allowed_actors`)
 - directive -> role mapping
 - role -> codex binary / token file / Forgejo login mapping
-- repo -> principal workspace binding (`[[repo_bindings]]`) for `impl` writeback
+- trigger guardrails (`trigger_guardrails.*`)
+- registered trigger list (`[[triggers]]`) with matcher + guards + action
+- optional legacy trigger pack toggle (`legacy_triggers`, defaults true)
 - prompt envelopes (`prompt_envelopes.fresh_envelope`, `prompt_envelopes.followup_envelope`)
-- desktop notifications (`notifications.*`)
 - control-plane command path (`forgejoctl_bin`)
 
-For `impl` dispatches, `repo_bindings` is mandatory. `orchd` fails planning if
-no principal workspace is bound for the target repo.
+## Trigger Spec
 
-Desktop notifications are emitted directly from `orchd` via `notify-send`:
+`orchd` has a single trigger engine. Legacy behavior (explicit directives + assignee reply)
+is represented as built-in trigger rules by default (`legacy_triggers = true`), and custom
+automation is added via `[[triggers]]`.
 
-- lifecycle notifications for configured phases (`completed|failed|blocked` by default)
-- codex reply notifications when the watcher login opened the issue or is tagged (`@watch_login`)
-- stable per-issue replacement IDs and pastel color hints for a uniform feed
+Custom trigger shape:
+
+- `id`: unique identifier used for reason codes and dedupe
+- `event`: webhook event family (`issues` or `issue_comment`)
+- `actions`: accepted actions for that event family
+- `priority`: tie-break within the same precedence tier
+- `apply_guardrails`: enable anti-spiral guardrails for this rule
+- `guards`: optional predicate block:
+  - `directive = any|require_parsed|require_absent`
+  - `assignee = any|require_single_codex`
+  - `actor = any|require_not_assignee`
+- `action`: dispatch action (`directive`/`directive_from`, `target_role`/`target_role_from`)
+
+Precedence is deterministic and fixed:
+
+1. explicit directive triggers
+2. implicit assignee-reply trigger
+3. registered config triggers
+
+Within a tier, higher `priority` wins; ties break by file order.
+
+### End-to-End Example (`issues.closed -> dispatch`)
+
+```toml
+[trigger_guardrails]
+max_depth_per_issue = 6
+max_dispatches_per_window = 12
+window_sec = 3600
+cooldown_sec = 60
+deny_immediate_self_loop = true
+
+[[triggers]]
+id = "closed_issue_poke"
+event = "issues"
+actions = ["closed"]
+
+[triggers.action]
+directive = "poke"
+target_role = "codex-orch"
+```
+
+With the above rule, closing an issue causes `orchd` to emit a normal dispatch intent
+through the existing directive/role pipeline. Retried/replayed deliveries for the same
+logical close event are suppressed by logical trigger dedupe.
 
 ## Run
 
@@ -50,7 +97,6 @@ Desktop notifications are emitted directly from `orchd` via `notify-send`:
 
 ```bash
 cargo run --bin orchd -- \
-  --token-file ~/.config/forgejo-agent/creds/orchd.token \
   --listen 127.0.0.1:7878 \
   --db-path ~/.local/state/orchd-dev/orchd.sqlite \
   --reconcile-repo main/orchd-debug \
@@ -65,7 +111,6 @@ cargo run --bin orchd -- \
 
 ```bash
 cargo run --bin orchd -- \
-  --token-file ~/.config/forgejo-agent/creds/orchd.token \
   --listen 127.0.0.1:7878 \
   --db-path ~/.local/state/orchd-dev/orchd.sqlite \
   --reconcile-repo main/orchd-debug \
@@ -80,7 +125,6 @@ cargo run --bin orchd -- \
 
 ```bash
 cargo run --bin orchd -- \
-  --token-file ~/.config/forgejo-agent/creds/orchd.token \
   --listen 127.0.0.1:7878 \
   --db-path ~/.local/state/orchd-dev/orchd.sqlite \
   --reconcile-repo main/orchd-debug \
@@ -146,6 +190,13 @@ sqlite3 ~/.local/state/orchd-dev/orchd.sqlite \
   "SELECT repo_full_name,issue_number,role_name,last_event_id,updated_at FROM issue_role_cursors ORDER BY updated_at DESC LIMIT 20;"
 ```
 
+Inspect trigger dedupe claims:
+
+```bash
+sqlite3 ~/.local/state/orchd-dev/orchd.sqlite \
+  "SELECT id,trigger_id,dedupe_key,repo_full_name,issue_number,event_id,created_at FROM trigger_dispatch_dedupes ORDER BY id DESC LIMIT 20;"
+```
+
 ## Webhook Secret (Optional)
 
 If `--webhook-secret-file` is set, `orchd` verifies HMAC SHA-256 signatures from:
@@ -183,7 +234,6 @@ Expected in `exec` mode:
 - sqlite `dispatches` row with `status=running` then terminal status
 - completion status is projected to `orchd/state/completed` on success or `orchd/state/failed` otherwise
 - for `impl` directive runs, orchd applies work-plane transitions (`state/review` on success, `state/blocked` on non-success) via `forgejoctl issue transition --force`
-- for non-worktree directives (`design`, `investigate`, `reply`, `poke`), orchd does not auto-transition `state/*` workflow labels
 - generated run artifacts include `prompt.md` and `prompt_mode.txt` (`fresh` or `followup`)
 - follow-up prompts include an issue delta block derived from events newer than the role cursor
 - stale in-flight rows are healed on startup and before launch attempts (status set to `failed_runtime`, reason `stale_dispatch_autohealed`) when the backend handle is no longer live

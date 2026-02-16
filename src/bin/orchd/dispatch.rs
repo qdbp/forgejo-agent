@@ -662,7 +662,8 @@ async fn plan_dispatch(
     .map_err(|err| DispatchError::Db(err.to_string()))?
     {
         db::DispatchReservation::Started(dispatch_id) => dispatch_id,
-        db::DispatchReservation::InFlightIssue(dispatch_id) => {
+        db::DispatchReservation::InFlightIssue(dispatch_id)
+        | db::DispatchReservation::InFlightRepo(dispatch_id) => {
             let _ = fs::remove_file(&lock_path);
             return Err(DispatchError::IssueDispatchInFlight {
                 repo_full_name: intent.repo_full_name.clone(),

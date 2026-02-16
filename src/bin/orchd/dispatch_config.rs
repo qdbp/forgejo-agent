@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -8,6 +8,7 @@ use serde::Deserialize;
 use forgejo_agent::orchd_dispatch_core::DispatchNotificationPhase;
 use forgejo_agent::types::RepoRef;
 
+use super::lexicon::{DIRECTIVE_REPLY, EVENT_ISSUE_COMMENT, EVENT_ISSUES, directive_is_known};
 use super::paths::expand_tilde_path;
 
 #[derive(Clone, Debug)]
@@ -19,6 +20,8 @@ pub(super) struct DispatchConfig {
     pub(super) control_plane: Option<DispatchControlPlaneConfig>,
     pub(super) directives: HashMap<String, DispatchDirectiveConfig>,
     pub(super) repo_bindings: HashMap<String, DispatchRepoBindingConfig>,
+    pub(super) triggers: Vec<DispatchTriggerConfig>,
+    pub(super) trigger_guardrails: DispatchTriggerGuardrailsConfig,
     pub(super) forgejoctl_bin: PathBuf,
 }
 
@@ -78,6 +81,102 @@ pub(super) struct DispatchRepoBindingConfig {
     pub(super) git_base: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum DispatchTriggerClass {
+    ExplicitDirective,
+    AssigneeReply,
+    Registered,
+}
+
+impl DispatchTriggerClass {
+    pub(super) const fn precedence_rank(&self) -> u8 {
+        match self {
+            Self::ExplicitDirective => 3,
+            Self::AssigneeReply => 2,
+            Self::Registered => 1,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct DispatchTriggerConfig {
+    pub(super) id: String,
+    pub(super) class: DispatchTriggerClass,
+    pub(super) priority: i32,
+    pub(super) matcher: DispatchTriggerMatcher,
+    pub(super) guards: DispatchTriggerGuards,
+    pub(super) action: DispatchTriggerAction,
+    pub(super) apply_guardrails: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct DispatchTriggerMatcher {
+    pub(super) event_type: String,
+    pub(super) actions: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct DispatchTriggerGuards {
+    pub(super) directive: DispatchTriggerDirectiveGuard,
+    pub(super) assignee: DispatchTriggerAssigneeGuard,
+    pub(super) actor: DispatchTriggerActorGuard,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum DispatchTriggerDirectiveGuard {
+    #[default]
+    Any,
+    RequireParsed,
+    RequireAbsent,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum DispatchTriggerAssigneeGuard {
+    #[default]
+    Any,
+    RequireSingleCodex,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum DispatchTriggerActorGuard {
+    #[default]
+    Any,
+    RequireNotAssignee,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct DispatchTriggerAction {
+    pub(super) directive: DispatchTriggerDirectiveSource,
+    pub(super) target_role: DispatchTriggerRoleSource,
+    pub(super) reason_code: String,
+}
+
+#[derive(Clone, Debug)]
+pub(super) enum DispatchTriggerDirectiveSource {
+    Literal(String),
+    ParsedDirective,
+}
+
+#[derive(Clone, Debug)]
+pub(super) enum DispatchTriggerRoleSource {
+    Literal(String),
+    ParsedDirectiveRole,
+    SingleAssignee,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct DispatchTriggerGuardrailsConfig {
+    pub(super) max_depth_per_issue: u32,
+    pub(super) max_dispatches_per_window: u32,
+    pub(super) window_sec: u64,
+    pub(super) cooldown_sec: u64,
+    pub(super) deny_immediate_self_loop: bool,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DispatchConfigFile {
@@ -94,6 +193,12 @@ struct DispatchConfigFile {
     directives: HashMap<String, DispatchDirectiveConfigFile>,
     #[serde(default)]
     repo_bindings: Vec<DispatchRepoBindingConfigFile>,
+    #[serde(default = "default_legacy_triggers")]
+    legacy_triggers: bool,
+    #[serde(default)]
+    trigger_guardrails: DispatchTriggerGuardrailsConfigFile,
+    #[serde(default)]
+    triggers: Vec<DispatchTriggerConfigFile>,
     #[serde(default = "default_forgejoctl_bin")]
     forgejoctl_bin: String,
 }
@@ -194,6 +299,46 @@ struct DispatchRepoBindingConfigFile {
     git_base: String,
 }
 
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct DispatchTriggerGuardrailsConfigFile {
+    #[serde(default = "default_trigger_depth")]
+    max_depth_per_issue: u32,
+    #[serde(default = "default_trigger_window_limit")]
+    max_dispatches_per_window: u32,
+    #[serde(default = "default_trigger_window_sec")]
+    window_sec: u64,
+    #[serde(default = "default_trigger_cooldown_sec")]
+    cooldown_sec: u64,
+    #[serde(default = "default_trigger_deny_self_loop")]
+    deny_immediate_self_loop: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DispatchTriggerConfigFile {
+    id: String,
+    event: String,
+    actions: Vec<String>,
+    #[serde(default)]
+    priority: i32,
+    #[serde(default)]
+    guards: DispatchTriggerGuards,
+    action: DispatchTriggerActionConfigFile,
+    #[serde(default = "default_true")]
+    apply_guardrails: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DispatchTriggerActionConfigFile {
+    directive: Option<String>,
+    directive_from: Option<String>,
+    target_role: Option<String>,
+    target_role_from: Option<String>,
+    reason_code: Option<String>,
+}
+
 fn default_codex_bin() -> String {
     "/home/main/forgejo-agent/bin/codex-role".to_string()
 }
@@ -234,10 +379,6 @@ fn default_git_base() -> String {
     "main".to_string()
 }
 
-const fn default_timeout_sec() -> u64 {
-    3600
-}
-
 const fn default_notify_poll_sec() -> u64 {
     10
 }
@@ -260,6 +401,103 @@ fn default_watch_login() -> String {
 
 fn default_notify_send_bin() -> String {
     "/usr/bin/notify-send".to_string()
+}
+
+const fn default_timeout_sec() -> u64 {
+    3600
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+const fn default_legacy_triggers() -> bool {
+    true
+}
+
+const fn default_trigger_depth() -> u32 {
+    6
+}
+
+const fn default_trigger_window_limit() -> u32 {
+    12
+}
+
+const fn default_trigger_window_sec() -> u64 {
+    3600
+}
+
+const fn default_trigger_cooldown_sec() -> u64 {
+    60
+}
+
+const fn default_trigger_deny_self_loop() -> bool {
+    true
+}
+
+pub(super) fn legacy_trigger_pack() -> Vec<DispatchTriggerConfig> {
+    vec![
+        DispatchTriggerConfig {
+            id: "legacy.explicit.issue_comment".to_string(),
+            class: DispatchTriggerClass::ExplicitDirective,
+            priority: 0,
+            matcher: DispatchTriggerMatcher {
+                event_type: EVENT_ISSUE_COMMENT.to_string(),
+                actions: vec!["created".to_string(), "edited".to_string()],
+            },
+            guards: DispatchTriggerGuards {
+                directive: DispatchTriggerDirectiveGuard::RequireParsed,
+                assignee: DispatchTriggerAssigneeGuard::Any,
+                actor: DispatchTriggerActorGuard::Any,
+            },
+            action: DispatchTriggerAction {
+                directive: DispatchTriggerDirectiveSource::ParsedDirective,
+                target_role: DispatchTriggerRoleSource::ParsedDirectiveRole,
+                reason_code: "explicit_directive".to_string(),
+            },
+            apply_guardrails: false,
+        },
+        DispatchTriggerConfig {
+            id: "legacy.explicit.issues".to_string(),
+            class: DispatchTriggerClass::ExplicitDirective,
+            priority: 0,
+            matcher: DispatchTriggerMatcher {
+                event_type: EVENT_ISSUES.to_string(),
+                actions: vec!["opened".to_string(), "edited".to_string()],
+            },
+            guards: DispatchTriggerGuards {
+                directive: DispatchTriggerDirectiveGuard::RequireParsed,
+                assignee: DispatchTriggerAssigneeGuard::Any,
+                actor: DispatchTriggerActorGuard::Any,
+            },
+            action: DispatchTriggerAction {
+                directive: DispatchTriggerDirectiveSource::ParsedDirective,
+                target_role: DispatchTriggerRoleSource::ParsedDirectiveRole,
+                reason_code: "explicit_directive".to_string(),
+            },
+            apply_guardrails: false,
+        },
+        DispatchTriggerConfig {
+            id: "legacy.assignee.reply".to_string(),
+            class: DispatchTriggerClass::AssigneeReply,
+            priority: 0,
+            matcher: DispatchTriggerMatcher {
+                event_type: EVENT_ISSUE_COMMENT.to_string(),
+                actions: vec!["created".to_string(), "edited".to_string()],
+            },
+            guards: DispatchTriggerGuards {
+                directive: DispatchTriggerDirectiveGuard::RequireAbsent,
+                assignee: DispatchTriggerAssigneeGuard::RequireSingleCodex,
+                actor: DispatchTriggerActorGuard::RequireNotAssignee,
+            },
+            action: DispatchTriggerAction {
+                directive: DispatchTriggerDirectiveSource::Literal(DIRECTIVE_REPLY.to_string()),
+                target_role: DispatchTriggerRoleSource::SingleAssignee,
+                reason_code: "assignee_reply".to_string(),
+            },
+            apply_guardrails: true,
+        },
+    ]
 }
 
 pub(super) fn load_dispatch_config(path: &Path) -> Result<DispatchConfig> {
@@ -289,6 +527,7 @@ pub(super) fn load_dispatch_config(path: &Path) -> Result<DispatchConfig> {
 
     let mut roles = HashMap::new();
     for (role_name, role) in raw.roles {
+        let role_name = role_name.to_ascii_lowercase();
         let forgejo_login = role.forgejo_login.unwrap_or_else(|| role_name.clone());
         let codex_role_arg = role.codex_role_arg.unwrap_or_else(|| {
             role_name
@@ -310,9 +549,9 @@ pub(super) fn load_dispatch_config(path: &Path) -> Result<DispatchConfig> {
     let mut directives = HashMap::new();
     for (directive_name, directive) in raw.directives {
         directives.insert(
-            directive_name,
+            directive_name.to_ascii_lowercase(),
             DispatchDirectiveConfig {
-                role: directive.role,
+                role: directive.role.to_ascii_lowercase(),
                 prompt_file: resolve_config_path(&base_dir, &directive.prompt_file)?,
                 timeout_sec: directive.timeout_sec.max(30),
             },
@@ -353,20 +592,6 @@ pub(super) fn load_dispatch_config(path: &Path) -> Result<DispatchConfig> {
             ));
         }
     }
-    for template_file in [
-        &prompt_envelopes.turn_context_file,
-        &prompt_envelopes.issue_fresh_file,
-        &prompt_envelopes.issue_followup_file,
-    ] {
-        if !template_file.is_file() {
-            return Err(anyhow!(
-                "dispatch config {} missing prompt template {}",
-                path.display(),
-                template_file.display()
-            ));
-        }
-    }
-
     let mut repo_bindings = HashMap::new();
     for binding in raw.repo_bindings {
         let repo = RepoRef::parse(&binding.repo)
@@ -405,6 +630,32 @@ pub(super) fn load_dispatch_config(path: &Path) -> Result<DispatchConfig> {
     let mut notification_phases = raw.notifications.phases;
     notification_phases.sort_unstable();
     notification_phases.dedup();
+
+    let mut triggers = Vec::new();
+    if raw.legacy_triggers {
+        triggers.extend(legacy_trigger_pack());
+    }
+
+    for trigger in raw.triggers {
+        triggers.push(compile_registered_trigger(
+            path,
+            trigger,
+            &directives,
+            &roles,
+        )?);
+    }
+
+    let mut seen_ids = HashSet::new();
+    for trigger in &triggers {
+        if !seen_ids.insert(trigger.id.clone()) {
+            return Err(anyhow!(
+                "dispatch config {} has duplicate trigger id '{}'",
+                path.display(),
+                trigger.id
+            ));
+        }
+    }
+
     Ok(DispatchConfig {
         allowed_actors: raw
             .allowed_actors
@@ -424,7 +675,225 @@ pub(super) fn load_dispatch_config(path: &Path) -> Result<DispatchConfig> {
         control_plane,
         directives,
         repo_bindings,
+        triggers,
+        trigger_guardrails: DispatchTriggerGuardrailsConfig {
+            max_depth_per_issue: raw.trigger_guardrails.max_depth_per_issue.max(1),
+            max_dispatches_per_window: raw.trigger_guardrails.max_dispatches_per_window.max(1),
+            window_sec: raw.trigger_guardrails.window_sec.max(1),
+            cooldown_sec: raw.trigger_guardrails.cooldown_sec,
+            deny_immediate_self_loop: raw.trigger_guardrails.deny_immediate_self_loop,
+        },
         forgejoctl_bin: resolve_config_path(&base_dir, &raw.forgejoctl_bin)?,
+    })
+}
+
+fn compile_registered_trigger(
+    config_path: &Path,
+    trigger: DispatchTriggerConfigFile,
+    directives: &HashMap<String, DispatchDirectiveConfig>,
+    roles: &HashMap<String, DispatchRoleConfig>,
+) -> Result<DispatchTriggerConfig> {
+    let trigger_id = trigger.id.trim().to_string();
+    if trigger_id.is_empty() {
+        return Err(anyhow!(
+            "dispatch config {} contains trigger with empty id",
+            config_path.display()
+        ));
+    }
+
+    let event_type = trigger.event.trim().to_ascii_lowercase();
+    if !matches!(event_type.as_str(), EVENT_ISSUES | EVENT_ISSUE_COMMENT) {
+        return Err(anyhow!(
+            "dispatch config {} trigger '{}' has unsupported event '{}'",
+            config_path.display(),
+            trigger_id,
+            trigger.event
+        ));
+    }
+
+    if trigger.actions.is_empty() {
+        return Err(anyhow!(
+            "dispatch config {} trigger '{}' has empty actions",
+            config_path.display(),
+            trigger_id
+        ));
+    }
+    let actions = trigger
+        .actions
+        .into_iter()
+        .map(|action| action.trim().to_ascii_lowercase())
+        .map(|action| {
+            if action.is_empty() {
+                Err(anyhow!(
+                    "dispatch config {} trigger '{}' includes blank action",
+                    config_path.display(),
+                    trigger_id
+                ))
+            } else {
+                Ok(action)
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let guards = trigger.guards;
+    if guards.actor == DispatchTriggerActorGuard::RequireNotAssignee
+        && guards.assignee == DispatchTriggerAssigneeGuard::Any
+    {
+        return Err(anyhow!(
+            "dispatch config {} trigger '{}' sets actor=require_not_assignee without assignee=require_single_codex",
+            config_path.display(),
+            trigger_id
+        ));
+    }
+
+    let action =
+        compile_trigger_action(config_path, &trigger_id, trigger.action, directives, roles)?;
+
+    Ok(DispatchTriggerConfig {
+        id: trigger_id,
+        class: DispatchTriggerClass::Registered,
+        priority: trigger.priority,
+        matcher: DispatchTriggerMatcher {
+            event_type,
+            actions,
+        },
+        guards,
+        action,
+        apply_guardrails: trigger.apply_guardrails,
+    })
+}
+
+fn compile_trigger_action(
+    config_path: &Path,
+    trigger_id: &str,
+    action: DispatchTriggerActionConfigFile,
+    directives: &HashMap<String, DispatchDirectiveConfig>,
+    roles: &HashMap<String, DispatchRoleConfig>,
+) -> Result<DispatchTriggerAction> {
+    let directive = match (action.directive, action.directive_from) {
+        (Some(directive), None) => {
+            let directive = directive.trim().to_ascii_lowercase();
+            if directive.is_empty() {
+                return Err(anyhow!(
+                    "dispatch config {} trigger '{}' has empty action.directive",
+                    config_path.display(),
+                    trigger_id
+                ));
+            }
+            if !directive_is_known(&directive) {
+                return Err(anyhow!(
+                    "dispatch config {} trigger '{}' references unknown directive '{}'",
+                    config_path.display(),
+                    trigger_id,
+                    directive
+                ));
+            }
+            if !directives.contains_key(&directive) {
+                return Err(anyhow!(
+                    "dispatch config {} trigger '{}' references unconfigured directive '{}'",
+                    config_path.display(),
+                    trigger_id,
+                    directive
+                ));
+            }
+            DispatchTriggerDirectiveSource::Literal(directive)
+        }
+        (None, Some(source)) => {
+            if source.trim().eq_ignore_ascii_case("parsed") {
+                DispatchTriggerDirectiveSource::ParsedDirective
+            } else {
+                return Err(anyhow!(
+                    "dispatch config {} trigger '{}' has unsupported action.directive_from '{}'; expected 'parsed'",
+                    config_path.display(),
+                    trigger_id,
+                    source
+                ));
+            }
+        }
+        (Some(_), Some(_)) => {
+            return Err(anyhow!(
+                "dispatch config {} trigger '{}' action must set exactly one of directive or directive_from",
+                config_path.display(),
+                trigger_id
+            ));
+        }
+        (None, None) => {
+            return Err(anyhow!(
+                "dispatch config {} trigger '{}' action is missing directive source",
+                config_path.display(),
+                trigger_id
+            ));
+        }
+    };
+
+    let target_role = match (action.target_role, action.target_role_from) {
+        (Some(role), None) => {
+            let role = role.trim().to_ascii_lowercase();
+            if role.is_empty() {
+                return Err(anyhow!(
+                    "dispatch config {} trigger '{}' has empty action.target_role",
+                    config_path.display(),
+                    trigger_id
+                ));
+            }
+            if !roles.contains_key(&role) {
+                return Err(anyhow!(
+                    "dispatch config {} trigger '{}' references unknown role '{}'",
+                    config_path.display(),
+                    trigger_id,
+                    role
+                ));
+            }
+            DispatchTriggerRoleSource::Literal(role)
+        }
+        (None, Some(source)) if source.trim().eq_ignore_ascii_case("parsed") => {
+            DispatchTriggerRoleSource::ParsedDirectiveRole
+        }
+        (None, Some(source)) if source.trim().eq_ignore_ascii_case("assignee") => {
+            DispatchTriggerRoleSource::SingleAssignee
+        }
+        (None, Some(source)) => {
+            return Err(anyhow!(
+                "dispatch config {} trigger '{}' has unsupported action.target_role_from '{}'; expected 'parsed' or 'assignee'",
+                config_path.display(),
+                trigger_id,
+                source
+            ));
+        }
+        (Some(_), Some(_)) => {
+            return Err(anyhow!(
+                "dispatch config {} trigger '{}' action must set exactly one of target_role or target_role_from",
+                config_path.display(),
+                trigger_id
+            ));
+        }
+        (None, None) => {
+            return Err(anyhow!(
+                "dispatch config {} trigger '{}' action is missing target role source",
+                config_path.display(),
+                trigger_id
+            ));
+        }
+    };
+
+    let reason_code = action
+        .reason_code
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("registered_trigger:{trigger_id}"));
+    if !reason_code.starts_with("registered_trigger:") {
+        return Err(anyhow!(
+            "dispatch config {} trigger '{}' reason_code '{}' must start with 'registered_trigger:'",
+            config_path.display(),
+            trigger_id,
+            reason_code
+        ));
+    }
+
+    Ok(DispatchTriggerAction {
+        directive,
+        target_role,
+        reason_code,
     })
 }
 
@@ -440,130 +909,12 @@ fn resolve_config_path(base_dir: &Path, raw: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     use anyhow::Result;
     use tempfile::tempdir;
 
     use super::{DispatchPromptEnvelopeConfig, load_dispatch_config};
-
-    fn temp_config_path(label: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock drift")
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "forgejo-agent-dispatch-config-{label}-{}-{nanos}.toml",
-            std::process::id()
-        ))
-    }
-
-    fn write_config(path: &PathBuf, repo_bindings_block: &str) {
-        let config_dir = path.parent().expect("config path has parent");
-        let prompts_dir = config_dir.join("prompts");
-        let roles_dir = prompts_dir.join("roles");
-        fs::create_dir_all(&roles_dir).expect("create roles dir");
-        fs::write(prompts_dir.join("orchd-preamble.md"), "# preamble\n").expect("write preamble");
-        fs::write(prompts_dir.join("orchd-envelope-fresh.md"), "# fresh\n")
-            .expect("write fresh envelope");
-        fs::write(
-            prompts_dir.join("orchd-envelope-followup.md"),
-            "# followup\n",
-        )
-        .expect("write followup envelope");
-        fs::write(
-            prompts_dir.join("orchd-turn-context.md"),
-            "# turn context\n",
-        )
-        .expect("write turn context template");
-        fs::write(prompts_dir.join("orchd-issue-fresh.md"), "# issue fresh\n")
-            .expect("write issue fresh template");
-        fs::write(
-            prompts_dir.join("orchd-issue-followup.md"),
-            "# issue followup\n",
-        )
-        .expect("write issue followup template");
-        fs::write(prompts_dir.join("orchd-impl.md"), "# impl\n").expect("write impl prompt");
-        fs::write(roles_dir.join("codex-orch.md"), "# role card\n").expect("write role card");
-
-        let body = format!(
-            r#"
-version = 1
-allowed_actors = ["main"]
-
-[prompt_envelopes]
-preamble_file = "prompts/orchd-preamble.md"
-fresh_envelope = "prompts/orchd-envelope-fresh.md"
-followup_envelope = "prompts/orchd-envelope-followup.md"
-turn_context_file = "prompts/orchd-turn-context.md"
-issue_fresh_file = "prompts/orchd-issue-fresh.md"
-issue_followup_file = "prompts/orchd-issue-followup.md"
-
-[roles.codex-orch]
-codex_bin = "/tmp/fake-codex"
-codex_role_arg = "orch"
-token_file = "/tmp/fake-token"
-
-[directives.impl]
-role = "codex-orch"
-prompt_file = "prompts/orchd-impl.md"
-timeout_sec = 60
-{repo_bindings_block}
-"#
-        );
-        fs::write(path, body).expect("write config");
-    }
-
-    #[test]
-    fn load_dispatch_config_parses_repo_bindings() {
-        let path = temp_config_path("repo-bindings");
-        write_config(
-            &path,
-            r#"
-[[repo_bindings]]
-repo = "main/forgejo-agent"
-local_path = "/home/main/forgejo-agent"
-git_remote = "origin"
-git_base = "main"
-"#,
-        );
-        let cfg = super::load_dispatch_config(&path).expect("load config");
-        let binding = cfg
-            .repo_bindings
-            .get("main/forgejo-agent")
-            .expect("repo binding present");
-        assert_eq!(
-            binding.local_path,
-            PathBuf::from("/home/main/forgejo-agent")
-        );
-        assert_eq!(binding.git_remote, "origin");
-        assert_eq!(binding.git_base, "main");
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn load_dispatch_config_rejects_duplicate_repo_binding() {
-        let path = temp_config_path("duplicate-repo-bindings");
-        write_config(
-            &path,
-            r#"
-[[repo_bindings]]
-repo = "main/forgejo-agent"
-local_path = "/home/main/forgejo-agent"
-
-[[repo_bindings]]
-repo = "main/forgejo-agent"
-local_path = "/home/main/forgejo-agent"
-"#,
-        );
-        let err = super::load_dispatch_config(&path).expect_err("duplicate should fail");
-        assert!(
-            err.to_string()
-                .contains("duplicate repo binding for main/forgejo-agent"),
-            "unexpected error: {err:#}"
-        );
-        let _ = fs::remove_file(path);
-    }
 
     #[test]
     fn role_card_file_for_uses_roles_subdir_next_to_preamble() {
@@ -587,15 +938,6 @@ local_path = "/home/main/forgejo-agent"
         let config_path = root.join("dispatch.toml");
         let prompts_dir = root.join("prompts");
         fs::create_dir_all(&prompts_dir)?;
-        fs::write(
-            prompts_dir.join("orchd-turn-context.md"),
-            "# turn context\n",
-        )?;
-        fs::write(prompts_dir.join("orchd-issue-fresh.md"), "# issue fresh\n")?;
-        fs::write(
-            prompts_dir.join("orchd-issue-followup.md"),
-            "# issue followup\n",
-        )?;
 
         let config_toml = format!(
             r#"version = 1
@@ -606,9 +948,6 @@ forgejoctl_bin = "/home/main/.local/bin/forgejoctl"
 preamble_file = "{preamble}"
 fresh_envelope = "{fresh}"
 followup_envelope = "{followup}"
-turn_context_file = "{turn_context}"
-issue_fresh_file = "{issue_fresh}"
-issue_followup_file = "{issue_followup}"
 
 [roles.codex-orch]
 token_file = "{token}"
@@ -620,9 +959,6 @@ prompt_file = "{design_prompt}"
             preamble = prompts_dir.join("orchd-preamble.md").display(),
             fresh = prompts_dir.join("orchd-envelope-fresh.md").display(),
             followup = prompts_dir.join("orchd-envelope-followup.md").display(),
-            turn_context = prompts_dir.join("orchd-turn-context.md").display(),
-            issue_fresh = prompts_dir.join("orchd-issue-fresh.md").display(),
-            issue_followup = prompts_dir.join("orchd-issue-followup.md").display(),
             token = root.join("token.txt").display(),
             design_prompt = prompts_dir.join("orchd-design.md").display(),
         );
@@ -643,15 +979,6 @@ prompt_file = "{design_prompt}"
         let roles_dir = prompts_dir.join("roles");
         fs::create_dir_all(&roles_dir)?;
         fs::write(roles_dir.join("codex-orch.md"), "# codex-orch role card\n")?;
-        fs::write(
-            prompts_dir.join("orchd-turn-context.md"),
-            "# turn context\n",
-        )?;
-        fs::write(prompts_dir.join("orchd-issue-fresh.md"), "# issue fresh\n")?;
-        fs::write(
-            prompts_dir.join("orchd-issue-followup.md"),
-            "# issue followup\n",
-        )?;
 
         let config_toml = format!(
             r#"version = 1
@@ -662,9 +989,6 @@ forgejoctl_bin = "/home/main/.local/bin/forgejoctl"
 preamble_file = "{preamble}"
 fresh_envelope = "{fresh}"
 followup_envelope = "{followup}"
-turn_context_file = "{turn_context}"
-issue_fresh_file = "{issue_fresh}"
-issue_followup_file = "{issue_followup}"
 
 [roles.codex-orch]
 token_file = "{token}"
@@ -672,20 +996,75 @@ token_file = "{token}"
 [directives.design]
 role = "codex-orch"
 prompt_file = "{design_prompt}"
+
+[directives.reply]
+role = "codex-orch"
+prompt_file = "{reply_prompt}"
 "#,
             preamble = prompts_dir.join("orchd-preamble.md").display(),
             fresh = prompts_dir.join("orchd-envelope-fresh.md").display(),
             followup = prompts_dir.join("orchd-envelope-followup.md").display(),
-            turn_context = prompts_dir.join("orchd-turn-context.md").display(),
-            issue_fresh = prompts_dir.join("orchd-issue-fresh.md").display(),
-            issue_followup = prompts_dir.join("orchd-issue-followup.md").display(),
             token = root.join("token.txt").display(),
             design_prompt = prompts_dir.join("orchd-design.md").display(),
+            reply_prompt = prompts_dir.join("orchd-poke.md").display(),
         );
         fs::write(&config_path, config_toml)?;
 
         let config = load_dispatch_config(&config_path)?;
         assert!(config.roles.contains_key("codex-orch"));
+        assert!(!config.triggers.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn load_dispatch_config_rejects_trigger_with_unknown_directive() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path();
+        let config_path = root.join("dispatch.toml");
+        let prompts_dir = root.join("prompts");
+        let roles_dir = prompts_dir.join("roles");
+        fs::create_dir_all(&roles_dir)?;
+        fs::write(roles_dir.join("codex-orch.md"), "# role\n")?;
+
+        let config_toml = format!(
+            r#"version = 1
+allowed_actors = ["main"]
+legacy_triggers = false
+
+[prompt_envelopes]
+preamble_file = "{preamble}"
+fresh_envelope = "{fresh}"
+followup_envelope = "{followup}"
+
+[roles.codex-orch]
+token_file = "{token}"
+
+[directives.poke]
+role = "codex-orch"
+prompt_file = "{poke_prompt}"
+
+[[triggers]]
+id = "bad"
+event = "issues"
+actions = ["closed"]
+
+[triggers.action]
+directive = "debrief"
+target_role = "codex-orch"
+"#,
+            preamble = prompts_dir.join("orchd-preamble.md").display(),
+            fresh = prompts_dir.join("orchd-envelope-fresh.md").display(),
+            followup = prompts_dir.join("orchd-envelope-followup.md").display(),
+            token = root.join("token.txt").display(),
+            poke_prompt = prompts_dir.join("orchd-poke.md").display(),
+        );
+        fs::write(&config_path, config_toml)?;
+
+        let err = load_dispatch_config(&config_path).expect_err("config should fail");
+        assert!(
+            err.to_string()
+                .contains("trigger 'bad' references unknown directive 'debrief'")
+        );
         Ok(())
     }
 }
