@@ -55,6 +55,9 @@ mod run_script;
 // Operator-facing issue subcommands (postmortem session resume). Read when extending orchd obs/issue CLI surface.
 mod issue;
 
+// Role inventory/check/add subcommands for dispatch identity hygiene. Read when onboarding roles or debugging role drift.
+mod role;
+
 // Logging + tracing initialization. Read when debugging orchd logs or adding new observability.
 mod telemetry;
 

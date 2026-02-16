@@ -40,11 +40,20 @@ pub(super) enum OrchdCommand {
     FinalizeDispatch(Box<FinalizeDispatchArgs>),
     #[command(subcommand)]
     Issue(IssueCommand),
+    #[command(subcommand)]
+    Role(RoleCommand),
 }
 
 #[derive(Subcommand, Debug)]
 pub(super) enum IssueCommand {
     Resume(IssueResumeArgs),
+}
+
+#[derive(Subcommand, Debug)]
+pub(super) enum RoleCommand {
+    List(RoleListArgs),
+    Check(RoleCheckArgs),
+    Add(Box<RoleAddArgs>),
 }
 
 #[derive(Args, Debug)]
@@ -53,6 +62,53 @@ pub(super) struct IssueResumeArgs {
     pub(super) issue_number: u64,
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub(super) codex_resume_args: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub(super) struct RoleListArgs {
+    #[arg(long)]
+    pub(super) json: bool,
+}
+
+#[derive(Args, Debug)]
+pub(super) struct RoleCheckArgs {
+    #[arg(long)]
+    pub(super) role: Option<String>,
+    #[arg(long)]
+    pub(super) json: bool,
+}
+
+#[derive(Args, Debug)]
+#[allow(clippy::struct_excessive_bools)]
+pub(super) struct RoleAddArgs {
+    #[arg(long)]
+    pub(super) role: String,
+    #[arg(long)]
+    pub(super) rank: String,
+    #[arg(long = "forgejo-login")]
+    pub(super) forgejo_login: String,
+    #[arg(long = "codex-role-arg")]
+    pub(super) codex_role_arg: Option<String>,
+    #[arg(long = "token-file")]
+    pub(super) token_file: Option<PathBuf>,
+    #[arg(long = "codex-bin")]
+    pub(super) codex_bin: Option<PathBuf>,
+    #[arg(long = "can-dispatch")]
+    pub(super) can_dispatch: bool,
+    #[arg(long = "create-user")]
+    pub(super) create_user: bool,
+    #[arg(long = "rotate-token")]
+    pub(super) rotate_token: bool,
+    #[arg(long = "admin-token-file")]
+    pub(super) admin_token_file: Option<PathBuf>,
+    #[arg(long = "scream-repo", default_value = "main/forgejo-work")]
+    pub(super) scream_repo: RepoRef,
+    #[arg(long = "scream-permission", default_value = "write")]
+    pub(super) scream_permission: String,
+    #[arg(long)]
+    pub(super) dry_run: bool,
+    #[arg(long)]
+    pub(super) json: bool,
 }
 
 #[derive(Args, Debug)]

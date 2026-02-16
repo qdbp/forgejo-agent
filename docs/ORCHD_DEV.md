@@ -28,6 +28,10 @@ Core behavior:
 - enforces logical trigger dedupe keys so replayed deliveries do not re-dispatch the same logical event
 - enforces anti-spiral guardrails on trigger-fired dispatches (`depth`, `rate`, `cooldown`, `self-loop`)
 - supports postmortem session re-entry via `orchd issue resume <repo> <issue_number>`
+- provides role hygiene subcommands:
+  - `orchd role list`
+  - `orchd role check [--role <name>]`
+  - `orchd role add ...`
 
 Dispatch behavior is configured in `config/orchd-dispatch.toml`:
 
@@ -147,6 +151,35 @@ Behavior is intentionally strict:
 - errors if any non-terminal dispatch exists for that issue
 - errors if no `codex_session_id` exists in dispatch history
 - never falls back to spawning a fresh Codex session
+
+## Role Hygiene
+
+List configured roles:
+
+```bash
+cargo run --bin orchd -- role list
+```
+
+Check role integrity (role cards, token/login mapping, Forgejo user posture):
+
+```bash
+cargo run --bin orchd -- role check
+cargo run --bin orchd -- role check --role codex-dev --json
+```
+
+Add a role atomically (with rollback on local failure):
+
+```bash
+cargo run --bin orchd -- role add \
+  --role codex-dev \
+  --rank OF-2 \
+  --forgejo-login codex-dev \
+  --admin-token-file ~/.config/forgejo-agent/creds/codex-orch.token \
+  --create-user
+```
+
+Role add template source:
+- `templates/role-card-template.md`
 
 ## Health
 

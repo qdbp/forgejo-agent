@@ -53,6 +53,11 @@ Do this once per installation, not per repo:
 4. Ensure orchd dispatch config has role blocks and role cards:
 - `config/orchd-dispatch.toml`
 - `prompts/roles/*.md`
+5. Run role integrity check before assimilating repos:
+
+```bash
+cargo run --bin orchd -- role check
+```
 
 ### Role Credential Bootstrap (No Root Path)
 
