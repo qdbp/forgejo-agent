@@ -26,12 +26,12 @@ pub(super) enum DispatchReservation {
 #[derive(Debug)]
 pub(super) struct InflightDispatch {
     pub(super) id: i64,
+    pub(super) repo_full_name: String,
+    pub(super) issue_number: u64,
     pub(super) status: DispatchState,
     pub(super) started_at: String,
     pub(super) backend_kind: Option<DispatchBackendKind>,
     pub(super) backend_ref: Option<String>,
-    pub(super) tmux_session: Option<String>,
-    pub(super) tmux_window: Option<String>,
     pub(super) lock_path: Option<String>,
 }
 
@@ -111,8 +111,6 @@ pub(super) fn init_db(db_path: &Path) -> Result<()> {
             backend_ref TEXT,
             reason_code TEXT,
             error_text TEXT,
-            tmux_session TEXT,
-            tmux_window TEXT,
             run_dir TEXT,
             lock_path TEXT,
             codex_session_id TEXT,
@@ -622,8 +620,8 @@ pub(super) fn reserve_dispatch_starting(
     tx.execute(
         r"
         INSERT INTO dispatches
-        (decision_id, repo_full_name, issue_number, actor_login, directive, target_role, status, started_at, tmux_session)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)
+        (decision_id, repo_full_name, issue_number, actor_login, directive, target_role, status, started_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
         ",
         params![
             insert.decision_id,
@@ -663,35 +661,20 @@ pub(super) fn update_dispatch_running(
     else {
         return Err(anyhow!("dispatch {dispatch_id} not found"));
     };
-    let (tmux_session, tmux_window): (Option<String>, Option<String>) = match run_handle
-        .backend_kind
-    {
-        DispatchBackendKind::Tmux => {
-            let (session, window) = run_handle.backend_ref.split_once(':').ok_or_else(|| {
-                anyhow!("invalid tmux run handle ref '{}'", run_handle.backend_ref)
-            })?;
-            (Some(session.to_string()), Some(window.to_string()))
-        }
-        DispatchBackendKind::Local => (None, None),
-    };
     let rows = tx.execute(
         r"
         UPDATE dispatches
         SET status = ?2,
-            tmux_session = ?3,
-            tmux_window = ?4,
-            backend_kind = ?5,
-            backend_ref = ?6,
-            run_dir = ?7,
-            lock_path = ?8
+            backend_kind = ?3,
+            backend_ref = ?4,
+            run_dir = ?5,
+            lock_path = ?6
         WHERE id = ?1
-          AND status = ?9
+          AND status = ?7
         ",
         params![
             dispatch_id,
             plan.next_state.as_db_str(),
-            tmux_session.as_deref(),
-            tmux_window.as_deref(),
             run_handle.backend_kind.as_db_str(),
             run_handle.backend_ref.as_str(),
             run_dir.to_string_lossy(),
@@ -851,7 +834,7 @@ pub(super) fn latest_issue_inflight_dispatch(
     let dispatch = conn
         .query_row(
             r"
-            SELECT id, status, started_at, backend_kind, backend_ref, tmux_session, tmux_window, lock_path
+            SELECT id, repo_full_name, issue_number, status, started_at, backend_kind, backend_ref, lock_path
             FROM dispatches
             WHERE repo_full_name = ?1
               AND issue_number = ?2
@@ -866,10 +849,10 @@ pub(super) fn latest_issue_inflight_dispatch(
                 running_status
             ],
             |row| {
-                let status: String = row.get(1)?;
+                let status: String = row.get(3)?;
                 let status = DispatchState::parse_db(&status).ok_or_else(|| {
                     rusqlite::Error::FromSqlConversionFailure(
-                        1,
+                        3,
                         rusqlite::types::Type::Text,
                         Box::new(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
@@ -877,24 +860,89 @@ pub(super) fn latest_issue_inflight_dispatch(
                         )),
                     )
                 })?;
-                let backend_kind_raw: Option<String> = row.get(3)?;
+                let backend_kind_raw: Option<String> = row.get(5)?;
                 let backend_kind = backend_kind_raw
                     .as_deref()
                     .and_then(DispatchBackendKind::parse_db);
+                let issue_number_raw: i64 = row.get(2)?;
+                let issue_number = u64::try_from(issue_number_raw).map_err(|_| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Integer,
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("invalid issue number in db: {issue_number_raw}"),
+                        )),
+                    )
+                })?;
                 Ok(InflightDispatch {
                     id: row.get(0)?,
+                    repo_full_name: row.get(1)?,
+                    issue_number,
                     status,
-                    started_at: row.get(2)?,
+                    started_at: row.get(4)?,
                     backend_kind,
-                    backend_ref: row.get(4)?,
-                    tmux_session: row.get(5)?,
-                    tmux_window: row.get(6)?,
+                    backend_ref: row.get(6)?,
                     lock_path: row.get(7)?,
                 })
             },
         )
         .optional()?;
     Ok(dispatch)
+}
+
+pub(super) fn list_inflight_dispatches(db_path: &Path) -> Result<Vec<InflightDispatch>> {
+    let conn = open_db(db_path)?;
+    let starting_status = DispatchState::Starting.as_db_str();
+    let running_status = DispatchState::Running.as_db_str();
+    let mut stmt = conn.prepare(
+        r"
+        SELECT id, repo_full_name, issue_number, status, started_at, backend_kind, backend_ref, lock_path
+        FROM dispatches
+        WHERE status IN (?1, ?2)
+        ORDER BY id ASC
+        ",
+    )?;
+    let rows = stmt.query_map(params![starting_status, running_status], |row| {
+        let status: String = row.get(3)?;
+        let status = DispatchState::parse_db(&status).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                3,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("invalid dispatch status in db: {status}"),
+                )),
+            )
+        })?;
+        let backend_kind_raw: Option<String> = row.get(5)?;
+        let backend_kind = backend_kind_raw
+            .as_deref()
+            .and_then(DispatchBackendKind::parse_db);
+        let issue_number_raw: i64 = row.get(2)?;
+        let issue_number = u64::try_from(issue_number_raw).map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                2,
+                rusqlite::types::Type::Integer,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("invalid issue number in db: {issue_number_raw}"),
+                )),
+            )
+        })?;
+        Ok(InflightDispatch {
+            id: row.get(0)?,
+            repo_full_name: row.get(1)?,
+            issue_number,
+            status,
+            started_at: row.get(4)?,
+            backend_kind,
+            backend_ref: row.get(6)?,
+            lock_path: row.get(7)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
 }
 
 pub(super) fn latest_repo_inflight_impl_dispatch_id(

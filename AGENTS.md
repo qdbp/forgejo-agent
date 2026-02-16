@@ -40,3 +40,7 @@ When CLI surface changes (commands/flags/state names):
 ## Delivery Policy
 
 - For major features/refactors, finish by committing and pushing to `origin` in the same execution loop unless explicitly told not to.
+
+## Worktree Policy
+
+- For parallel feature work, create a dedicated git worktree under `.worktrees/` and do not develop on the primary checkout.

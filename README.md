@@ -108,8 +108,7 @@ EOF
 Current mode supports both:
 
 - `dry-run`: parse directives and post intent comments only
-- `tmux-tui` (default): tmux-backed dispatch. Currently implemented via `codex exec` for stability; produces a `codex_session_id` you can later open with `codex resume <id>` if you want an interactive TUI.
-- `tmux-exec`: explicit non-interactive dispatch (same underlying `codex exec` path)
+- `exec` (default): explicit non-interactive dispatch (`codex exec`)
 
 Core behavior:
 
@@ -125,7 +124,7 @@ Role launch wrapper:
 
 - `orchd` dispatches Codex through the repo-managed wrapper `bin/codex-role` (configured in `config/orchd-dispatch.toml`), not by clobbering `/usr/bin/codex`.
 
-Run (`tmux-tui`, default):
+Run (`exec`, default + restart-resilient backend):
 
 ```bash
 cargo run --bin orchd -- \
@@ -134,10 +133,12 @@ cargo run --bin orchd -- \
   --reconcile-repo main/orchd-debug \
   --heartbeat-sec 15 \
   --reconcile-sec 45 \
+  --dispatch-mode exec \
+  --dispatch-backend systemd \
   --dispatch-config /home/main/forgejo-agent/config/orchd-dispatch.toml
 ```
 
-Run (`tmux-exec`):
+Run (`exec` + local backend, convenient for tests):
 
 ```bash
 cargo run --bin orchd -- \
@@ -146,7 +147,8 @@ cargo run --bin orchd -- \
   --reconcile-repo main/orchd-debug \
   --heartbeat-sec 15 \
   --reconcile-sec 45 \
-  --dispatch-mode tmux-exec \
+  --dispatch-mode exec \
+  --dispatch-backend local \
   --dispatch-config /home/main/forgejo-agent/config/orchd-dispatch.toml
 ```
 
@@ -258,7 +260,6 @@ python3 /home/main/forgejo-agent/scripts/check.py
 - `docs/ORCHD_DEV.md`
 - `docs/ORCHD_PROMPT_STATE_PLAN.md`
 - `docs/ORCHD_REFACTOR_PLAN.md`
-- `docs/TMUX_OBSERVABILITY.md`
 - `docs/MCP_SETUP.md`
 - `docs/SECURITY.md`
 - `docs/skill-sync/checklist.md`

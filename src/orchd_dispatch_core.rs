@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DispatchBackendKind {
-    Tmux,
+    Systemd,
     Local,
 }
 
@@ -12,7 +12,7 @@ impl DispatchBackendKind {
     #[must_use]
     pub const fn as_db_str(self) -> &'static str {
         match self {
-            Self::Tmux => "tmux",
+            Self::Systemd => "systemd",
             Self::Local => "local",
         }
     }
@@ -20,7 +20,7 @@ impl DispatchBackendKind {
     #[must_use]
     pub fn parse_db(value: &str) -> Option<Self> {
         match value {
-            "tmux" => Some(Self::Tmux),
+            "systemd" => Some(Self::Systemd),
             "local" => Some(Self::Local),
             _ => None,
         }

@@ -25,9 +25,9 @@ pub(super) struct Cli {
     pub(super) reconcile_sec: u64,
     #[arg(long)]
     pub(super) reconcile_repo: Option<RepoRef>,
-    #[arg(long, value_enum, default_value_t = DispatchMode::TmuxTui)]
+    #[arg(long, value_enum, default_value_t = DispatchMode::Exec)]
     pub(super) dispatch_mode: DispatchMode,
-    #[arg(long, value_enum, default_value_t = DispatchBackend::Tmux)]
+    #[arg(long, value_enum, default_value_t = DispatchBackend::Systemd)]
     pub(super) dispatch_backend: DispatchBackend,
     #[arg(long, default_value = "config/orchd-dispatch.toml")]
     pub(super) dispatch_config: String,
@@ -64,8 +64,6 @@ pub(super) struct FinalizeDispatchArgs {
     pub(super) directive: String,
     #[arg(long = "role-name")]
     pub(super) role_name: String,
-    #[arg(long = "tmux-locator")]
-    pub(super) tmux_locator: String,
     #[arg(long = "run-dir")]
     pub(super) run_dir: PathBuf,
     #[arg(long = "log-file")]
@@ -91,30 +89,28 @@ pub(super) struct FinalizeDispatchArgs {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub(super) enum DispatchMode {
     DryRun,
-    TmuxExec,
-    TmuxTui,
+    Exec,
 }
 
 impl DispatchMode {
     pub(super) const fn as_str(self) -> &'static str {
         match self {
             Self::DryRun => "dry-run",
-            Self::TmuxExec => "tmux-exec",
-            Self::TmuxTui => "tmux-tui",
+            Self::Exec => "exec",
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub(super) enum DispatchBackend {
-    Tmux,
+    Systemd,
     Local,
 }
 
 impl DispatchBackend {
     pub(super) const fn as_str(self) -> &'static str {
         match self {
-            Self::Tmux => "tmux",
+            Self::Systemd => "systemd",
             Self::Local => "local",
         }
     }

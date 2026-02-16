@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/home/main/.local/bin/orchd --listen 127.0.0.1:7878 --db-path /home/main/.local/state/orchd-dev/orchd.sqlite --reconcile-repo main/forgejo-work --heartbeat-sec 15 --reconcile-sec 45 --dispatch-mode tmux-tui --dispatch-config /home/main/forgejo-agent/config/orchd-dispatch.toml
+ExecStart=/home/main/.local/bin/orchd --listen 127.0.0.1:7878 --db-path /home/main/.local/state/orchd-dev/orchd.sqlite --reconcile-repo main/forgejo-work --heartbeat-sec 15 --reconcile-sec 45 --dispatch-mode exec --dispatch-backend systemd --dispatch-config /home/main/forgejo-agent/config/orchd-dispatch.toml
 Restart=always
 RestartSec=3
 WorkingDirectory=/home/main/forgejo-agent

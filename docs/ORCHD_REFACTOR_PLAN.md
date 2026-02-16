@@ -1,5 +1,7 @@
 # orchd Core Refactor Plan (SQLite-First Telemetry)
 
+> Historical note: this plan predates tmux removal. Current runtime path is `exec` with `systemd`/`local` backends.
+
 ## 1. Goals
 
 - Refactor orchd into a typed, backend-agnostic orchestration core.

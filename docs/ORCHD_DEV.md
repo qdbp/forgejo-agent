@@ -5,8 +5,7 @@
 Current implementation supports two dispatch modes:
 
 - `dry-run`: parse directives, persist decisions. No metadata comments are posted to issues.
-- `tmux-tui` (default): tmux-backed dispatch. Currently implemented via `codex exec` for stability; produces a `codex_session_id` you can later open with `codex resume <id>` if you want an interactive TUI.
-- `tmux-exec`: create a dispatch record and run Codex non-interactively (`codex exec`).
+- `exec` (default): create a dispatch record and run Codex non-interactively (`codex exec`).
 
 ## Design Dogma
 
@@ -30,11 +29,11 @@ Dispatch behavior is configured in `config/orchd-dispatch.toml`:
 - directive -> role mapping
 - role -> codex binary / token file / Forgejo login mapping
 - prompt envelopes (`prompt_envelopes.fresh_envelope`, `prompt_envelopes.followup_envelope`)
-- tmux session naming and remain-on-exit policy
+- control-plane command path (`forgejoctl_bin`)
 
 ## Run
 
-`tmux-tui` mode (default):
+`exec` mode (default, restart-resilient via transient user units):
 
 ```bash
 cargo run --bin orchd -- \
@@ -43,10 +42,12 @@ cargo run --bin orchd -- \
   --reconcile-repo main/orchd-debug \
   --heartbeat-sec 15 \
   --reconcile-sec 45 \
+  --dispatch-mode exec \
+  --dispatch-backend systemd \
   --dispatch-config /home/main/forgejo-agent/config/orchd-dispatch.toml
 ```
 
-`tmux-exec` mode:
+`exec` mode with local backend (test/dev):
 
 ```bash
 cargo run --bin orchd -- \
@@ -55,7 +56,8 @@ cargo run --bin orchd -- \
   --reconcile-repo main/orchd-debug \
   --heartbeat-sec 15 \
   --reconcile-sec 45 \
-  --dispatch-mode tmux-exec \
+  --dispatch-mode exec \
+  --dispatch-backend local \
   --dispatch-config /home/main/forgejo-agent/config/orchd-dispatch.toml
 ```
 
@@ -96,7 +98,7 @@ Inspect recent dispatches:
 
 ```bash
 sqlite3 ~/.local/state/orchd-dev/orchd.sqlite \
-  "SELECT id,repo_full_name,issue_number,actor_login,directive,target_role,status,reason_code,tmux_session,tmux_window,codex_session_id,exit_code,started_at,ended_at FROM dispatches ORDER BY id DESC LIMIT 20;"
+  "SELECT id,repo_full_name,issue_number,actor_login,directive,target_role,status,backend_kind,backend_ref,codex_session_id,exit_code,started_at,ended_at FROM dispatches ORDER BY id DESC LIMIT 20;"
 ```
 
 Inspect dispatch transition events:
@@ -112,18 +114,6 @@ Inspect role cursors used for follow-up deltas:
 sqlite3 ~/.local/state/orchd-dev/orchd.sqlite \
   "SELECT repo_full_name,issue_number,role_name,last_event_id,updated_at FROM issue_role_cursors ORDER BY updated_at DESC LIMIT 20;"
 ```
-
-Inspect issue-scoped tmux windows:
-
-```bash
-tmux list-sessions
-tmux list-windows -t codex-orch
-tmux attach -t codex-orch
-```
-
-For a human-operator guide (attach/rejoin/inspect lifecycle), see:
-
-- `docs/TMUX_OBSERVABILITY.md`
 
 ## Webhook Secret (Optional)
 
@@ -155,15 +145,14 @@ curl -fsS -X POST http://127.0.0.1:7878/webhook \
   --data "$body" | jq .
 ```
 
-Expected in `tmux-tui` mode:
+Expected in `exec` mode:
 
 - response: `decision=accepted`, `reason_code=explicit_directive`
 - issue runtime labels: `orchd/state/queued` then `orchd/state/running`
 - sqlite `dispatches` row with `status=running` then terminal status
-- tmux window `r<repo_slug>-i<issue_number>` created (or respawned) under the configured session
 - completion status is projected to `orchd/state/completed` on success or `orchd/state/failed` otherwise
 - for `impl` directive runs, orchd applies work-plane transitions (`state/review` on success, `state/blocked` on non-success) via `forgejoctl issue transition --force`
 - generated run artifacts include `prompt.md` and `prompt_mode.txt` (`fresh` or `followup`)
 - follow-up prompts include an issue delta block derived from events newer than the role cursor
-- stale in-flight rows are lazily healed on the next launch attempt (status set to `failed_runtime`, reason `stale_dispatch_autohealed`) when tmux no longer has a live pane for that issue
+- stale in-flight rows are healed on startup and before launch attempts (status set to `failed_runtime`, reason `stale_dispatch_autohealed`) when the backend handle is no longer live
 - repo lockfiles under `locks/` are metadata only; dispatch gating is driven by sqlite `dispatches` state

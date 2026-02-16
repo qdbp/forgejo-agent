@@ -914,10 +914,6 @@ fn write_orchd_dispatch_toml(path: &Path, inputs: OrchdDispatchTomlInputs<'_>) -
         inputs.forgejoctl.display()
     )?;
 
-    writeln!(&mut out, "[tmux]")?;
-    writeln!(&mut out, "session = \"itest\"")?;
-    writeln!(&mut out, "remain_on_exit = false\n")?;
-
     writeln!(&mut out, "[prompt_envelopes]")?;
     writeln!(&mut out, "preamble_file = \"{}\"", preamble.display())?;
     writeln!(&mut out, "fresh_envelope = \"{}\"", fresh_env.display())?;
@@ -1063,7 +1059,7 @@ impl OrchdTestProcess {
             .arg("--reconcile-sec")
             .arg("1")
             .arg("--dispatch-mode")
-            .arg("tmux-exec")
+            .arg("exec")
             .arg("--dispatch-backend")
             .arg("local")
             .arg("--dispatch-config")

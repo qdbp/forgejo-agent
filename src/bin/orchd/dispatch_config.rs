@@ -10,7 +10,6 @@ use super::paths::expand_tilde_path;
 #[derive(Clone, Debug)]
 pub(super) struct DispatchConfig {
     pub(super) allowed_actors: Vec<String>,
-    pub(super) tmux: DispatchTmuxConfig,
     pub(super) prompt_envelopes: DispatchPromptEnvelopeConfig,
     pub(super) roles: HashMap<String, DispatchRoleConfig>,
     pub(super) directives: HashMap<String, DispatchDirectiveConfig>,
@@ -18,17 +17,10 @@ pub(super) struct DispatchConfig {
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct DispatchTmuxConfig {
-    pub(super) session: String,
-    pub(super) remain_on_exit: bool,
-}
-
-#[derive(Clone, Debug)]
 pub(super) struct DispatchPromptEnvelopeConfig {
     pub(super) preamble_file: PathBuf,
     pub(super) fresh_envelope: PathBuf,
     pub(super) followup_envelope: PathBuf,
-    pub(super) tmux_tui_bootstrap: PathBuf,
 }
 
 #[derive(Clone, Debug)]
@@ -52,21 +44,12 @@ struct DispatchConfigFile {
     version: u32,
     #[serde(default)]
     allowed_actors: Vec<String>,
-    tmux: DispatchTmuxConfigFile,
     #[serde(default)]
     prompt_envelopes: DispatchPromptEnvelopeConfigFile,
     roles: HashMap<String, DispatchRoleConfigFile>,
     directives: HashMap<String, DispatchDirectiveConfigFile>,
     #[serde(default = "default_forgejoctl_bin")]
     forgejoctl_bin: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DispatchTmuxConfigFile {
-    session: String,
-    #[serde(default = "default_tmux_remain_on_exit")]
-    remain_on_exit: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -78,8 +61,6 @@ struct DispatchPromptEnvelopeConfigFile {
     fresh_envelope: String,
     #[serde(default = "default_followup_envelope")]
     followup_envelope: String,
-    #[serde(default = "default_tmux_tui_bootstrap_file")]
-    tmux_tui_bootstrap: String,
 }
 
 impl Default for DispatchPromptEnvelopeConfigFile {
@@ -88,7 +69,6 @@ impl Default for DispatchPromptEnvelopeConfigFile {
             preamble_file: default_preamble_file(),
             fresh_envelope: default_fresh_envelope(),
             followup_envelope: default_followup_envelope(),
-            tmux_tui_bootstrap: default_tmux_tui_bootstrap_file(),
         }
     }
 }
@@ -112,10 +92,6 @@ struct DispatchDirectiveConfigFile {
     timeout_sec: u64,
 }
 
-const fn default_tmux_remain_on_exit() -> bool {
-    true
-}
-
 fn default_codex_bin() -> String {
     "/home/main/forgejo-agent/bin/codex-role".to_string()
 }
@@ -134,10 +110,6 @@ fn default_fresh_envelope() -> String {
 
 fn default_followup_envelope() -> String {
     "../prompts/orchd-envelope-followup.md".to_string()
-}
-
-fn default_tmux_tui_bootstrap_file() -> String {
-    "../prompts/orchd-tui-bootstrap.md".to_string()
 }
 
 const fn default_timeout_sec() -> u64 {
@@ -207,20 +179,12 @@ pub(super) fn load_dispatch_config(path: &Path) -> Result<DispatchConfig> {
             .into_iter()
             .map(|actor| actor.to_ascii_lowercase())
             .collect(),
-        tmux: DispatchTmuxConfig {
-            session: raw.tmux.session,
-            remain_on_exit: raw.tmux.remain_on_exit,
-        },
         prompt_envelopes: DispatchPromptEnvelopeConfig {
             preamble_file: resolve_config_path(&base_dir, &raw.prompt_envelopes.preamble_file)?,
             fresh_envelope: resolve_config_path(&base_dir, &raw.prompt_envelopes.fresh_envelope)?,
             followup_envelope: resolve_config_path(
                 &base_dir,
                 &raw.prompt_envelopes.followup_envelope,
-            )?,
-            tmux_tui_bootstrap: resolve_config_path(
-                &base_dir,
-                &raw.prompt_envelopes.tmux_tui_bootstrap,
             )?,
         },
         roles,

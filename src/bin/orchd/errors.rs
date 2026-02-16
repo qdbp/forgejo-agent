@@ -29,8 +29,8 @@ pub(super) enum DispatchError {
     PromptTemplate(String),
     #[error("io failure: {0}")]
     Io(String),
-    #[error("tmux failure: {0}")]
-    Tmux(String),
+    #[error("launch failure: {0}")]
+    Launch(String),
     #[error("issue fetch failure: {0}")]
     IssueFetch(String),
     #[error("db failure: {0}")]
@@ -49,7 +49,7 @@ impl DispatchError {
             Self::InvalidIssueRef(_) => "invalid_issue_ref",
             Self::PromptTemplate(_) => "prompt_template_error",
             Self::Io(_) => "io_failure",
-            Self::Tmux(_) => "tmux_failure",
+            Self::Launch(_) => "launch_failure",
             Self::IssueFetch(_) => "issue_fetch_failure",
             Self::Db(_) => "db_failure",
         }
@@ -67,7 +67,7 @@ pub(super) const fn runtime_state_for_dispatch_error(error: &DispatchError) -> O
         DispatchError::PromptTemplate(_)
         | DispatchError::ConfigNotLoaded
         | DispatchError::Io(_)
-        | DispatchError::Tmux(_)
+        | DispatchError::Launch(_)
         | DispatchError::IssueFetch(_)
         | DispatchError::Db(_) => OrchdRuntimeState::Failed,
     }

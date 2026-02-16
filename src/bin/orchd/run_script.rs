@@ -1,12 +1,7 @@
 use std::borrow::Cow;
 use std::path::Path;
-use std::process::{Command, Stdio};
 
-use anyhow::Result;
-
-use super::errors::DispatchError;
-
-pub(super) struct TmuxRunScriptInputs<'a> {
+pub(super) struct DispatchRunScriptInputs<'a> {
     pub(super) dispatch_id: i64,
     pub(super) db_path: &'a Path,
     pub(super) lock_path: &'a Path,
@@ -34,7 +29,6 @@ pub(super) struct TmuxRunScriptInputs<'a> {
     pub(super) issue_session_id: Option<&'a str>,
     pub(super) directive_name: &'a str,
     pub(super) role_name: &'a str,
-    pub(super) tmux_locator: &'a str,
     pub(super) timeout_sec: u64,
 }
 
@@ -42,146 +36,7 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
-fn tmux_repo_slug(repo_full_name: &str) -> String {
-    let mut slug = String::with_capacity(repo_full_name.len());
-    let mut last_dash = false;
-    for ch in repo_full_name.chars() {
-        if ch.is_ascii_alphanumeric() {
-            slug.push(ch.to_ascii_lowercase());
-            last_dash = false;
-        } else if !last_dash {
-            slug.push('-');
-            last_dash = true;
-        }
-    }
-    let trimmed = slug.trim_matches('-');
-    let normalized = if trimmed.is_empty() { "repo" } else { trimmed };
-    normalized.chars().take(24).collect()
-}
-
-pub(super) fn issue_tmux_window_name(repo_full_name: &str, issue_number: u64) -> String {
-    let repo_slug = tmux_repo_slug(repo_full_name);
-    format!("r{repo_slug}-i{issue_number}")
-}
-
-fn tmux_has_session(session: &str) -> Result<bool, DispatchError> {
-    let status = Command::new("tmux")
-        .args(["has-session", "-t", session])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|err| DispatchError::Tmux(format!("failed checking tmux session: {err}")))?;
-    Ok(status.success())
-}
-
-fn tmux_set_remain_on_exit(session: &str, enabled: bool) -> Result<(), DispatchError> {
-    let flag = if enabled { "on" } else { "off" };
-    let status = Command::new("tmux")
-        .args(["set-option", "-t", session, "remain-on-exit", flag])
-        .status()
-        .map_err(|err| DispatchError::Tmux(format!("failed setting remain-on-exit: {err}")))?;
-    if !status.success() {
-        return Err(DispatchError::Tmux(format!(
-            "tmux set-option failed for session {session}"
-        )));
-    }
-    Ok(())
-}
-
-fn tmux_has_window(session: &str, window: &str) -> Result<bool, DispatchError> {
-    let output = Command::new("tmux")
-        .args(["list-windows", "-t", session, "-F", "#{window_name}"])
-        .output()
-        .map_err(|err| DispatchError::Tmux(format!("failed listing tmux windows: {err}")))?;
-    if !output.status.success() {
-        return Err(DispatchError::Tmux(format!(
-            "tmux list-windows failed for session {session}"
-        )));
-    }
-    let target = window.trim();
-    let windows = String::from_utf8_lossy(&output.stdout);
-    Ok(windows.lines().any(|name| name.trim() == target))
-}
-
-pub(super) fn tmux_window_has_live_pane(
-    session: &str,
-    window: &str,
-) -> Result<bool, DispatchError> {
-    let target = format!("{session}:{window}");
-    let output = Command::new("tmux")
-        .args(["list-panes", "-t", &target, "-F", "#{pane_dead}"])
-        .output()
-        .map_err(|err| DispatchError::Tmux(format!("failed listing tmux panes: {err}")))?;
-    if !output.status.success() {
-        return Ok(false);
-    }
-    let pane_states = String::from_utf8_lossy(&output.stdout);
-    Ok(pane_states.lines().any(|line| line.trim() == "0"))
-}
-
-pub(super) fn tmux_spawn_or_respawn_window(
-    session: &str,
-    window: &str,
-    script_path: &Path,
-    remain_on_exit: bool,
-) -> Result<(), DispatchError> {
-    let cmd = format!("bash {}", shell_quote(&script_path.to_string_lossy()));
-    if tmux_has_session(session)? {
-        if tmux_has_window(session, window)? {
-            let status = Command::new("tmux")
-                .args([
-                    "respawn-window",
-                    "-k",
-                    "-t",
-                    &format!("{session}:{window}"),
-                    &cmd,
-                ])
-                .status()
-                .map_err(|err| {
-                    DispatchError::Tmux(format!("failed respawning tmux window: {err}"))
-                })?;
-            if !status.success() {
-                return Err(DispatchError::Tmux(format!(
-                    "tmux respawn-window failed for {session}:{window}"
-                )));
-            }
-        } else {
-            let status = Command::new("tmux")
-                .args([
-                    "new-window",
-                    "-d",
-                    "-t",
-                    &format!("{session}:"),
-                    "-n",
-                    window,
-                    &cmd,
-                ])
-                .status()
-                .map_err(|err| {
-                    DispatchError::Tmux(format!("failed creating tmux window: {err}"))
-                })?;
-            if !status.success() {
-                return Err(DispatchError::Tmux(format!(
-                    "tmux new-window failed for {session}:{window}"
-                )));
-            }
-        }
-    } else {
-        let status = Command::new("tmux")
-            .args(["new-session", "-d", "-s", session, "-n", window, &cmd])
-            .status()
-            .map_err(|err| DispatchError::Tmux(format!("failed creating tmux session: {err}")))?;
-        if !status.success() {
-            return Err(DispatchError::Tmux(format!(
-                "tmux new-session failed for {session}:{window}"
-            )));
-        }
-    }
-    tmux_set_remain_on_exit(session, remain_on_exit)?;
-    Ok(())
-}
-
-pub(super) fn build_tmux_exec_run_script(inputs: &TmuxRunScriptInputs<'_>) -> String {
+pub(super) fn build_exec_run_script(inputs: &DispatchRunScriptInputs<'_>) -> String {
     let forgejo_config_file = inputs
         .forgejo_config_file
         .map_or(Cow::Borrowed(""), |path| path.to_string_lossy());
@@ -217,7 +72,6 @@ CODEX_ROLE_ARG={codex_role_arg}
 ISSUE_SESSION_ID={issue_session_id}
 DIRECTIVE={directive}
 ROLE_NAME={role_name}
-TMUX_LOCATOR={tmux_locator}
 TIMEOUT_SEC={timeout_sec}
 
 cleanup() {{
@@ -289,7 +143,6 @@ fi
 {{
   echo "orchd: dispatch completed id=$DISPATCH_ID status=$status reason=$reason_code"
   echo "directive=$DIRECTIVE role=$ROLE_NAME"
-  echo "tmux=$TMUX_LOCATOR"
   echo "codex_session_id=${{session_id:-unknown}}"
   echo "run_dir=$RUN_DIR"
   echo "log=$CODEX_LOG_FILE"
@@ -316,7 +169,6 @@ fi
   --issue-url "$ISSUE_URL" \
   --directive "$DIRECTIVE" \
   --role-name "$ROLE_NAME" \
-  --tmux-locator "$TMUX_LOCATOR" \
   --run-dir "$RUN_DIR" \
   --log-file "$CODEX_LOG_FILE" \
   --completion-file "$COMPLETION_FILE" \
@@ -355,18 +207,6 @@ fi
         issue_session_id = shell_quote(inputs.issue_session_id.unwrap_or("")),
         directive = shell_quote(inputs.directive_name),
         role_name = shell_quote(inputs.role_name),
-        tmux_locator = shell_quote(inputs.tmux_locator),
         timeout_sec = inputs.timeout_sec,
     )
-}
-
-pub(super) fn build_tmux_tui_run_script(
-    inputs: &TmuxRunScriptInputs<'_>,
-    _bootstrap_prompt_path: &Path,
-    _session_jsonl_path: &Path,
-) -> String {
-    // `codex` does not currently provide a stable, script-friendly interactive ("TUI") interface
-    // for injecting prompts and harvesting the final message. Until it does, `tmux-tui` is an
-    // alias for the non-interactive exec path while preserving operator visibility via tmux.
-    build_tmux_exec_run_script(inputs)
 }

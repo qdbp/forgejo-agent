@@ -53,9 +53,7 @@ pub(super) async fn run_server(cli: Cli) -> Result<()> {
     let dispatch_config_path = expand_tilde_path(&cli.dispatch_config)?;
     let dispatch_config = match cli.dispatch_mode {
         DispatchMode::DryRun => None,
-        DispatchMode::TmuxExec | DispatchMode::TmuxTui => {
-            Some(load_dispatch_config(&dispatch_config_path)?)
-        }
+        DispatchMode::Exec => Some(load_dispatch_config(&dispatch_config_path)?),
     };
 
     let db_path = expand_tilde_path(&cli.db_path)?;
@@ -78,6 +76,25 @@ pub(super) async fn run_server(cli: Cli) -> Result<()> {
     };
     let mode_name = state.dispatch_mode.as_str();
     let backend_name = state.dispatch_backend.as_str();
+
+    match dispatch::heal_stale_inflight_dispatches(&state.db_path) {
+        Ok(healed) => {
+            log_line(
+                "startup_stale_heal_complete",
+                json!({
+                    "healed_dispatches": healed,
+                }),
+            );
+        }
+        Err(err) => {
+            log_line(
+                "startup_stale_heal_failed",
+                json!({
+                    "error": err.to_string(),
+                }),
+            );
+        }
+    }
 
     let heartbeat_state = state.clone();
     tokio::spawn(async move {
@@ -316,7 +333,7 @@ async fn process_webhook(
             }
             match state.dispatch_mode {
                 DispatchMode::DryRun => {}
-                DispatchMode::TmuxExec | DispatchMode::TmuxTui => {
+                DispatchMode::Exec => {
                     let defer_impl = match decision.directive.as_deref() {
                         Some(DIRECTIVE_IMPL) => match db::latest_repo_inflight_impl_dispatch_id(
                             &state.db_path,

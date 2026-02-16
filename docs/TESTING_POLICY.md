@@ -16,9 +16,9 @@ paths.
 - Includes: live Forgejo process + real `forgejoctl` command round-trips.
 - Required when changing issue/repo lifecycle behavior, API wiring, label/state semantics, or integration tests.
 
-3. Tier 2 (`orchd live manual`, until harness exists)
+3. Tier 2 (`orchd live manual`, optional confidence pass)
 - Follow runbook in `docs/ORCHD_DEV.md` for webhook -> dispatch -> completion checks.
-- Required when changing `src/bin/orchd.rs`, dispatch scripts, tmux lifecycle, or webhook/reconcile logic.
+- Recommended when changing `src/bin/orchd/*`, dispatch scripts, or webhook/reconcile logic.
 
 ## Required tier matrix
 

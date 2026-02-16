@@ -22,6 +22,7 @@ Thumbs.db
 dispatch-runs/
 state/
 tmp/
+.worktrees/
 
 # Local env and credentials
 .env

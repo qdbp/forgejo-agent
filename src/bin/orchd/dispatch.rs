@@ -23,12 +23,9 @@ use super::errors::DispatchError;
 use super::forgejoctl_cmd;
 use super::lexicon;
 use super::repo;
+use super::run_script::{DispatchRunScriptInputs, build_exec_run_script};
 use super::state::{AppState, DecisionRecord, EventRecord};
 use super::telemetry::{log_line, record_phase_latency_ms};
-use super::tmux::{
-    TmuxRunScriptInputs, build_tmux_exec_run_script, build_tmux_tui_run_script,
-    issue_tmux_window_name, tmux_spawn_or_respawn_window, tmux_window_has_live_pane,
-};
 
 pub(super) const STARTING_DISPATCH_STALE_AFTER_SEC: i64 = 120;
 
@@ -52,7 +49,6 @@ struct DispatchPlan {
     dispatch_id: i64,
     lock_path: PathBuf,
     run_dir: PathBuf,
-    tmux_window: String,
 }
 
 #[derive(Debug, Clone)]
@@ -77,41 +73,70 @@ trait DispatchBackendAdapter {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct TmuxBackendAdapter;
+struct SystemdBackendAdapter;
 
-impl DispatchBackendAdapter for TmuxBackendAdapter {
+impl DispatchBackendAdapter for SystemdBackendAdapter {
     fn launch(
         &self,
-        dispatch_config: &DispatchConfig,
+        _dispatch_config: &DispatchConfig,
         plan: &DispatchPlan,
         artifacts: &DispatchRunArtifacts,
     ) -> Result<RunHandle, DispatchError> {
-        tmux_spawn_or_respawn_window(
-            &dispatch_config.tmux.session,
-            &plan.tmux_window,
-            &artifacts.script_path,
-            dispatch_config.tmux.remain_on_exit,
-        )?;
+        let unit_name = format!("orchd-dispatch-{}", plan.dispatch_id);
+        let unit_ref = format!("{unit_name}.service");
+        let status = Command::new("systemd-run")
+            .args([
+                "--user",
+                "--collect",
+                "--unit",
+                &unit_name,
+                "/usr/bin/env",
+                "bash",
+            ])
+            .arg(&artifacts.script_path)
+            .status()
+            .map_err(|err| DispatchError::Launch(format!("failed launching systemd-run: {err}")))?;
+        if !status.success() {
+            return Err(DispatchError::Launch(format!(
+                "systemd-run exited with status {status}"
+            )));
+        }
         Ok(RunHandle {
-            backend_kind: DispatchBackendKind::Tmux,
-            backend_ref: format!("{}:{}", dispatch_config.tmux.session, plan.tmux_window),
+            backend_kind: DispatchBackendKind::Systemd,
+            backend_ref: unit_ref,
         })
     }
 
     fn probe(
         &self,
         dispatch: &db::InflightDispatch,
-        repo_full_name: &str,
-        issue_number: u64,
+        _repo_full_name: &str,
+        _issue_number: u64,
     ) -> Result<bool, DispatchError> {
-        let session = dispatch.tmux_session.as_deref().ok_or_else(|| {
-            DispatchError::Tmux("missing tmux session for tmux-backed dispatch".to_string())
-        })?;
-        let window = dispatch
-            .tmux_window
-            .clone()
-            .unwrap_or_else(|| issue_tmux_window_name(repo_full_name, issue_number));
-        tmux_window_has_live_pane(session, &window)
+        let unit_ref = dispatch
+            .backend_ref
+            .as_deref()
+            .ok_or_else(|| DispatchError::Launch("missing systemd unit ref".to_string()))?;
+        let output = Command::new("systemctl")
+            .args([
+                "--user",
+                "show",
+                "--property=ActiveState",
+                "--value",
+                unit_ref,
+            ])
+            .output()
+            .map_err(|err| {
+                DispatchError::Launch(format!("failed probing systemd unit state: {err}"))
+            })?;
+        if !output.status.success() {
+            return Ok(false);
+        }
+        let active_state = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Ok(matches!(
+            active_state.as_str(),
+            "active" | "activating" | "reloading"
+        ))
     }
 }
 
@@ -312,13 +337,14 @@ fn probe_dispatch_liveness(
     repo_full_name: &str,
     issue_number: u64,
 ) -> Result<bool, DispatchError> {
-    match dispatch.backend_kind.unwrap_or(DispatchBackendKind::Tmux) {
-        DispatchBackendKind::Tmux => {
-            TmuxBackendAdapter.probe(dispatch, repo_full_name, issue_number)
+    match dispatch.backend_kind {
+        Some(DispatchBackendKind::Systemd) => {
+            SystemdBackendAdapter.probe(dispatch, repo_full_name, issue_number)
         }
-        DispatchBackendKind::Local => {
+        Some(DispatchBackendKind::Local) => {
             LocalBackendAdapter.probe(dispatch, repo_full_name, issue_number)
         }
+        None => Ok(false),
     }
 }
 
@@ -334,22 +360,14 @@ pub(super) fn is_stale_starting_dispatch(
     if age < ChronoDuration::seconds(STARTING_DISPATCH_STALE_AFTER_SEC) {
         return false;
     }
-    if dispatch.backend_kind.is_none()
-        && dispatch.tmux_session.is_none()
-        && dispatch.backend_ref.is_none()
-    {
+    if dispatch.backend_kind.is_none() {
         return true;
     }
-    if dispatch.backend_kind == Some(DispatchBackendKind::Local) && dispatch.backend_ref.is_none() {
-        return true;
-    }
-    if dispatch.backend_kind.unwrap_or(DispatchBackendKind::Tmux) == DispatchBackendKind::Tmux
-        && dispatch.tmux_session.is_none()
-    {
+    if dispatch.backend_ref.is_none() {
         return true;
     }
     match probe_dispatch_liveness(dispatch, repo_full_name, issue_number) {
-        Ok(has_live_pane) => !has_live_pane,
+        Ok(alive) => !alive,
         Err(err) => {
             log_line(
                 "dispatch_heal_probe_failed",
@@ -431,6 +449,39 @@ fn find_issue_inflight_dispatch_with_healing(
             }),
         );
     }
+}
+
+pub(super) fn heal_stale_inflight_dispatches(db_path: &Path) -> Result<usize, DispatchError> {
+    let inflight =
+        db::list_inflight_dispatches(db_path).map_err(|err| DispatchError::Db(err.to_string()))?;
+    let mut healed = 0usize;
+    for dispatch in inflight {
+        if !should_heal_dispatch_stale(&dispatch, &dispatch.repo_full_name, dispatch.issue_number) {
+            continue;
+        }
+        db::mark_dispatch_failed_runtime(
+            db_path,
+            dispatch.id,
+            "stale_dispatch_autohealed",
+            "auto-healed stale in-flight dispatch during startup sweep",
+        )
+        .map_err(|err| DispatchError::Db(err.to_string()))?;
+        if let Some(lock_path) = dispatch.lock_path.as_deref() {
+            let _ = fs::remove_file(lock_path);
+        }
+        log_line(
+            "dispatch_autohealed",
+            json!({
+                "dispatch_id": dispatch.id,
+                "repo": dispatch.repo_full_name,
+                "issue_number": dispatch.issue_number,
+                "status": dispatch.status,
+                "reason_code": "stale_dispatch_autohealed",
+            }),
+        );
+        healed += 1;
+    }
+    Ok(healed)
 }
 
 async fn plan_dispatch(
@@ -678,7 +729,6 @@ async fn plan_dispatch(
         dispatch_id,
         lock_path,
         run_dir,
-        tmux_window: issue_tmux_window_name(&record.repo_full_name, issue_number),
     })
 }
 
@@ -754,11 +804,10 @@ fn materialize_run_artifacts(
         "{}#{}",
         plan.intent.repo_full_name, plan.intent.issue_number
     );
-    let tmux_locator = format!("{}:{}", dispatch_config.tmux.session, plan.tmux_window);
     let orchd_bin = std::env::current_exe()
         .map_err(|err| DispatchError::Io(format!("failed resolving orchd executable: {err}")))?;
 
-    let script_inputs = TmuxRunScriptInputs {
+    let script_inputs = DispatchRunScriptInputs {
         dispatch_id: plan.dispatch_id,
         db_path: &state.db_path,
         lock_path: &plan.lock_path,
@@ -786,41 +835,12 @@ fn materialize_run_artifacts(
         issue_session_id: plan.issue_session_id.as_deref(),
         directive_name: &plan.intent.directive,
         role_name: &plan.intent.role,
-        tmux_locator: &tmux_locator,
         timeout_sec: plan.directive.timeout_sec,
     };
 
-    let script = match (state.dispatch_mode, state.dispatch_backend) {
-        (DispatchMode::TmuxExec, _) => build_tmux_exec_run_script(&script_inputs),
-        (DispatchMode::TmuxTui, DispatchBackend::Tmux) => {
-            let bootstrap_prompt_path = plan.run_dir.join("bootstrap_prompt.md");
-            let bootstrap_template = fs::read_to_string(
-                &dispatch_config.prompt_envelopes.tmux_tui_bootstrap,
-            )
-            .map_err(|err| {
-                DispatchError::Io(format!(
-                    "failed reading tmux-tui bootstrap prompt {}: {err}",
-                    dispatch_config
-                        .prompt_envelopes
-                        .tmux_tui_bootstrap
-                        .display()
-                ))
-            })?;
-            let prompt_path_text = prompt_path.display().to_string();
-            let bootstrap_prompt =
-                render_prompt(&bootstrap_template, &[("prompt_path", &prompt_path_text)])?;
-            fs::write(&bootstrap_prompt_path, bootstrap_prompt).map_err(|err| {
-                DispatchError::Io(format!("failed writing bootstrap prompt: {err}"))
-            })?;
-            let session_jsonl_path = plan.run_dir.join("session.jsonl.path");
-            build_tmux_tui_run_script(&script_inputs, &bootstrap_prompt_path, &session_jsonl_path)
-        }
-        (DispatchMode::TmuxTui, DispatchBackend::Local) => {
-            return Err(DispatchError::Io(
-                "dispatch backend local does not support dispatch mode tmux-tui".to_string(),
-            ));
-        }
-        (DispatchMode::DryRun, _) => return Err(DispatchError::ConfigNotLoaded),
+    let script = match state.dispatch_mode {
+        DispatchMode::Exec => build_exec_run_script(&script_inputs),
+        DispatchMode::DryRun => return Err(DispatchError::ConfigNotLoaded),
     };
 
     fs::write(&script_path, script)
@@ -835,7 +855,7 @@ fn launch_dispatch_backend(
     artifacts: &DispatchRunArtifacts,
 ) -> Result<RunHandle, DispatchError> {
     match state.dispatch_backend {
-        DispatchBackend::Tmux => TmuxBackendAdapter.launch(dispatch_config, plan, artifacts),
+        DispatchBackend::Systemd => SystemdBackendAdapter.launch(dispatch_config, plan, artifacts),
         DispatchBackend::Local => LocalBackendAdapter.launch(dispatch_config, plan, artifacts),
     }
 }
@@ -941,19 +961,15 @@ mod tests {
 
     use super::{DispatchBackendKind, DispatchState, db};
 
-    fn inflight_dispatch(
-        status: DispatchState,
-        started_at: String,
-        tmux_session: Option<&str>,
-    ) -> db::InflightDispatch {
+    fn inflight_dispatch(status: DispatchState, started_at: String) -> db::InflightDispatch {
         db::InflightDispatch {
             id: 1,
+            repo_full_name: "main/orchd-debug".to_string(),
+            issue_number: 1,
             status,
             started_at,
-            backend_kind: Some(DispatchBackendKind::Tmux),
-            backend_ref: Some("codex-orch:rmain-orchd-debug-i1".to_string()),
-            tmux_session: tmux_session.map(str::to_string),
-            tmux_window: None,
+            backend_kind: Some(DispatchBackendKind::Systemd),
+            backend_ref: Some("orchd-dispatch-1.service".to_string()),
             lock_path: None,
         }
     }
@@ -961,7 +977,7 @@ mod tests {
     #[test]
     fn starting_dispatch_is_not_stale_within_grace_period() {
         let started_at = (Utc::now() - ChronoDuration::seconds(5)).to_rfc3339();
-        let dispatch = inflight_dispatch(DispatchState::Starting, started_at, None);
+        let dispatch = inflight_dispatch(DispatchState::Starting, started_at);
         assert!(!super::is_stale_starting_dispatch(
             &dispatch,
             "main/orchd-debug",
@@ -971,11 +987,7 @@ mod tests {
 
     #[test]
     fn starting_dispatch_with_invalid_timestamp_is_stale() {
-        let dispatch = inflight_dispatch(
-            DispatchState::Starting,
-            "invalid-timestamp".to_string(),
-            None,
-        );
+        let dispatch = inflight_dispatch(DispatchState::Starting, "invalid-timestamp".to_string());
         assert!(super::is_stale_starting_dispatch(
             &dispatch,
             "main/orchd-debug",
@@ -984,11 +996,12 @@ mod tests {
     }
 
     #[test]
-    fn starting_dispatch_without_tmux_session_is_stale_after_grace_period() {
+    fn starting_dispatch_without_backend_ref_is_stale_after_grace_period() {
         let started_at = (Utc::now()
             - ChronoDuration::seconds(super::STARTING_DISPATCH_STALE_AFTER_SEC + 5))
         .to_rfc3339();
-        let dispatch = inflight_dispatch(DispatchState::Starting, started_at, None);
+        let mut dispatch = inflight_dispatch(DispatchState::Starting, started_at);
+        dispatch.backend_ref = None;
         assert!(super::is_stale_starting_dispatch(
             &dispatch,
             "main/orchd-debug",
