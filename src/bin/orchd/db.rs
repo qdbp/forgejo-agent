@@ -14,6 +14,7 @@ use forgejo_agent::orchd_dispatch_core::{
 use super::lexicon::{
     DIRECTIVE_IMPL, EVENT_ISSUE_COMMENT, EVENT_ISSUES, directive_serializes_repo,
 };
+use super::migrations;
 use super::state::{DecisionRecord, EventRecord, IssueEventDeltaRow};
 
 #[derive(Debug)]
@@ -48,137 +49,8 @@ pub(super) fn init_db(db_path: &Path) -> Result<()> {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create db directory: {}", parent.display()))?;
     }
-    let conn = open_db(db_path)?;
-    conn.execute_batch(
-        r"
-        CREATE TABLE IF NOT EXISTS events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            delivery_id TEXT NOT NULL,
-            event_type TEXT NOT NULL,
-            repo_full_name TEXT NOT NULL,
-            issue_number INTEGER,
-            action TEXT,
-            actor_login TEXT,
-            event_text TEXT,
-            source_comment_id INTEGER,
-            source_created_at TEXT,
-            raw_json TEXT NOT NULL,
-            received_at TEXT NOT NULL,
-            UNIQUE(delivery_id, event_type)
-        );
-        CREATE TABLE IF NOT EXISTS decisions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            event_id INTEGER NOT NULL,
-            repo_full_name TEXT NOT NULL,
-            issue_number INTEGER,
-            actor_login TEXT,
-            directive TEXT,
-            target_role TEXT,
-            decision TEXT NOT NULL,
-            reason_code TEXT NOT NULL,
-            would_dispatch INTEGER NOT NULL,
-            comment_posted INTEGER NOT NULL DEFAULT 0,
-            comment_error TEXT,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY(event_id) REFERENCES events(id)
-        );
-        CREATE TABLE IF NOT EXISTS heartbeats (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            recorded_at TEXT NOT NULL,
-            queue_depth INTEGER NOT NULL,
-            events_total INTEGER NOT NULL,
-            decisions_total INTEGER NOT NULL,
-            last_delivery_id TEXT
-        );
-        CREATE TABLE IF NOT EXISTS reconciles (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            recorded_at TEXT NOT NULL,
-            repo_full_name TEXT NOT NULL,
-            scanned_open INTEGER NOT NULL,
-            status TEXT NOT NULL,
-            error_text TEXT
-        );
-        CREATE TABLE IF NOT EXISTS dispatches (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            decision_id INTEGER NOT NULL,
-            repo_full_name TEXT NOT NULL,
-            issue_number INTEGER NOT NULL,
-            actor_login TEXT,
-            directive TEXT NOT NULL,
-            target_role TEXT NOT NULL,
-            status TEXT NOT NULL,
-            backend_kind TEXT,
-            backend_ref TEXT,
-            reason_code TEXT,
-            error_text TEXT,
-            run_dir TEXT,
-            lock_path TEXT,
-            codex_session_id TEXT,
-            exit_code INTEGER,
-            started_at TEXT NOT NULL,
-            ended_at TEXT,
-            FOREIGN KEY(decision_id) REFERENCES decisions(id)
-        );
-        CREATE INDEX IF NOT EXISTS idx_dispatches_repo_status
-            ON dispatches (repo_full_name, status);
-        CREATE INDEX IF NOT EXISTS idx_dispatches_repo_issue
-            ON dispatches (repo_full_name, issue_number, id DESC);
-        CREATE TABLE IF NOT EXISTS dispatch_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            dispatch_id INTEGER NOT NULL,
-            event_kind TEXT NOT NULL,
-            from_state TEXT,
-            to_state TEXT NOT NULL,
-            reason_code TEXT,
-            error_text TEXT,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY(dispatch_id) REFERENCES dispatches(id)
-        );
-        CREATE INDEX IF NOT EXISTS idx_dispatch_events_dispatch
-            ON dispatch_events (dispatch_id, id);
-        CREATE TABLE IF NOT EXISTS issue_role_cursors (
-            repo_full_name TEXT NOT NULL,
-            issue_number INTEGER NOT NULL,
-            role_name TEXT NOT NULL,
-            last_event_id INTEGER NOT NULL,
-            updated_at TEXT NOT NULL,
-            PRIMARY KEY (repo_full_name, issue_number, role_name)
-        );
-        CREATE TABLE IF NOT EXISTS repos (
-            repo_full_name TEXT PRIMARY KEY,
-            first_seen_at TEXT NOT NULL,
-            last_seen_at TEXT NOT NULL,
-            labels_ensured_at TEXT,
-            local_path TEXT,
-            last_error TEXT
-        );
-        ",
-    )?;
-    ensure_column_exists(&conn, "events", "event_text", "TEXT")?;
-    ensure_column_exists(&conn, "events", "source_comment_id", "INTEGER")?;
-    ensure_column_exists(&conn, "events", "source_created_at", "TEXT")?;
-    ensure_column_exists(&conn, "dispatches", "backend_kind", "TEXT")?;
-    ensure_column_exists(&conn, "dispatches", "backend_ref", "TEXT")?;
-    Ok(())
-}
-
-fn ensure_column_exists(
-    conn: &Connection,
-    table_name: &str,
-    column_name: &str,
-    column_type: &str,
-) -> Result<()> {
-    let pragma = format!("PRAGMA table_info({table_name})");
-    let mut stmt = conn.prepare(&pragma)?;
-    let column_names = stmt
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    if column_names.iter().any(|name| name == column_name) {
-        return Ok(());
-    }
-
-    let alter = format!("ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}");
-    conn.execute(&alter, [])?;
+    let mut conn = open_db(db_path)?;
+    migrations::apply_all(&mut conn)?;
     Ok(())
 }
 

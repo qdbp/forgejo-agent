@@ -31,6 +31,9 @@ mod webhook;
 // Canonical tokens for directives/decisions/event-types. Read when adjusting directive grammar or DB literals.
 mod lexicon;
 
+// Versioned SQLite migrations. Read when changing schema shape or adding backwards-compatible upgrades.
+mod migrations;
+
 // SQLite schema + queries + dispatch state transitions. Read when changing locking, queues, or persistence.
 mod db;
 
