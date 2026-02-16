@@ -35,10 +35,24 @@ else
   exit 1
 fi
 
+# systemd user services often lack user bin dirs in PATH; make sure our tools exist.
+new_path="${PATH:-}"
+for d in "$HOME/bin" "$HOME/.local/bin"; do
+  if [[ -d "$d" ]] && [[ ":${new_path}:" != *":${d}:"* ]]; then
+    if [[ -n "$new_path" ]]; then
+      new_path="${d}:${new_path}"
+    else
+      new_path="$d"
+    fi
+  fi
+done
+
 exec env \
+  PATH="$new_path" \
   FORGEJO_PROFILE="$role" \
   FORGEJO_TOKEN_FILE="$token_file" \
   /usr/bin/codex \
+  -c "shell_environment_policy.set.PATH=\"$new_path\"" \
   -c "shell_environment_policy.set.FORGEJO_PROFILE=\"$role\"" \
   -c "shell_environment_policy.set.FORGEJO_TOKEN_FILE=\"$token_file\"" \
   "$@"
