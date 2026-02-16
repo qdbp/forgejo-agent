@@ -52,6 +52,54 @@ Do this once per installation, not per repo:
 - `config/orchd-dispatch.toml`
 - `prompts/roles/*.md`
 
+### Role Credential Bootstrap (No Root Path)
+
+If a role exists in Forgejo but `~/.config/forgejo-agent/creds/<role>.token` is
+missing, bootstrap it in-band:
+
+```bash
+BASE_URL="${FORGEJO_BASE_URL:-http://127.0.0.1:3000}"
+ADMIN_TOKEN="$(tr -d '\r\n' < ~/.config/forgejo-agent/token)"
+ROLE_LOGIN="codex-lead"   # or codex-dev / future role
+TOKEN_NAME="${ROLE_LOGIN}-$(date +%Y%m%d-%H%M%S)"
+
+TMP_PASS="$(python3 - <<'PY'
+import secrets, string
+alphabet = string.ascii_letters + string.digits
+print(''.join(secrets.choice(alphabet) for _ in range(32)))
+PY
+)"
+
+# 1) Ensure role user is active and set a temporary password for token minting.
+curl -fsS -X PATCH \
+  -H "Authorization: token ${ADMIN_TOKEN}" \
+  -H 'Content-Type: application/json' \
+  -d "{\"active\":true,\"must_change_password\":false,\"password\":\"${TMP_PASS}\"}" \
+  "${BASE_URL}/api/v1/admin/users/${ROLE_LOGIN}" >/dev/null
+
+# 2) Mint role token (Forgejo requires explicit scopes for this endpoint).
+ROLE_TOKEN="$(
+  curl -fsS -X POST \
+    -u "${ROLE_LOGIN}:${TMP_PASS}" \
+    -H 'Content-Type: application/json' \
+    -d "{\"name\":\"${TOKEN_NAME}\",\"scopes\":[\"all\"]}" \
+    "${BASE_URL}/api/v1/users/${ROLE_LOGIN}/tokens" | jq -r '.sha1'
+)"
+
+# 3) Persist role credential for orchd dispatch.
+install -d -m 700 ~/.config/forgejo-agent/creds
+printf '%s\n' "${ROLE_TOKEN}" > ~/.config/forgejo-agent/creds/"${ROLE_LOGIN}".token
+chmod 600 ~/.config/forgejo-agent/creds/"${ROLE_LOGIN}".token
+```
+
+Sanity check:
+
+```bash
+curl -fsS \
+  -H "Authorization: token $(tr -d '\r\n' < ~/.config/forgejo-agent/creds/codex-lead.token)" \
+  "${BASE_URL}/api/v1/user" | jq -r '.login'
+```
+
 ## Per-Repo Assimilation (Single Command)
 
 Run:
