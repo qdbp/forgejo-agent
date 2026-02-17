@@ -26,6 +26,7 @@ use super::lexicon::{DIRECTIVE_IMPL, EVENT_ISSUE_COMMENT, EVENT_ISSUES};
 use super::notifier;
 use super::paths::expand_tilde_path;
 use super::projection;
+use super::role;
 use super::state::{
     AppState, ErrorEnvelope, EventRecord, HealthEnvelope, WebhookOutcome, WebhookPayload,
 };
@@ -60,6 +61,32 @@ pub(super) async fn run_server(cli: Cli) -> Result<()> {
         DispatchMode::DryRun => None,
         DispatchMode::Exec => Some(load_dispatch_config(&dispatch_config_path)?),
     };
+    if matches!(cli.dispatch_mode, DispatchMode::Exec) {
+        if cli.skip_startup_role_check {
+            log_line(
+                "startup_role_check_skipped",
+                json!({
+                    "reason": "--skip-startup-role-check",
+                }),
+            );
+        } else {
+            let startup_cfg = cfg.clone();
+            let startup_dispatch = dispatch_config
+                .clone()
+                .ok_or_else(|| anyhow!("dispatch config missing in exec mode"))?;
+            tokio::task::spawn_blocking(move || {
+                role::enforce_startup_role_check(&startup_dispatch, &startup_cfg)
+            })
+            .await
+            .context("startup role check task failed")??;
+            log_line(
+                "startup_role_check_passed",
+                json!({
+                    "roles_checked": dispatch_config.as_ref().map_or(0, |cfg| cfg.roles.len()),
+                }),
+            );
+        }
+    }
 
     let db_path = expand_tilde_path(&cli.db_path)?;
     db::init_db(&db_path)?;

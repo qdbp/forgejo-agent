@@ -148,6 +148,9 @@ cargo run --bin orchd -- role check
 cargo run --bin orchd -- role check --role codex-dev --json
 ```
 
+`exec` startup enforces role integrity by default (`orchd role check` equivalent).
+Use `--skip-startup-role-check` only as an emergency recovery override.
+
 Run (`exec`, default + restart-resilient backend):
 
 ```bash
@@ -250,6 +253,9 @@ Primary command:
   --local-path /home/main/programming/projects/repo
 ```
 
+The assimilation script runs `orchd role check` preflight by default. Bypass only
+for break-glass recovery with `--skip-role-check-preflight`.
+
 ## Live Forgejo Integration Test
 
 `tests/live_forgejo.rs` provides the first full round-trip test:
@@ -311,9 +317,7 @@ python3 /home/main/forgejo-agent/scripts/check.py
 - `docs/AGENT_WORKFLOW.md`
 - `docs/WORKER_LOOP.md`
 - `docs/ORCHD_DEV.md`
-- `docs/ORCHD_ROLEADD_PLAN.md`
 - `docs/ORCHD_PROMPT_STATE_PLAN.md` (historical draft)
-- `docs/ORCHD_REFACTOR_PLAN.md` (historical design record)
 - `docs/MCP_SETUP.md`
 - `docs/SECURITY.md`
 - `docs/skill-sync/checklist.md`

@@ -53,7 +53,7 @@ Do this once per installation, not per repo:
 4. Ensure orchd dispatch config has role blocks and role cards:
 - `config/orchd-dispatch.toml`
 - `prompts/roles/*.md`
-5. Run role integrity check before assimilating repos:
+5. Ensure role integrity check passes before assimilating repos:
 
 ```bash
 cargo run --bin orchd -- role check
@@ -129,6 +129,7 @@ Run:
 ```
 
 Default behavior:
+- runs `orchd role check` preflight against the configured dispatch config
 - ensures repo + policy labels via `forgejoctl repo ensure`
 - applies collaborator ACLs:
   - `codex-orch`: admin
@@ -151,10 +152,16 @@ Default behavior:
 --lead-login LOGIN
 --dev-login LOGIN
 --skip-acl
+--skip-role-check-preflight
 --skip-bootstrap-push
 --skip-agents-patch
 --dry-run
 ```
+
+Environment overrides:
+
+- `ORCHD_BIN` (default `~/.local/bin/orchd`)
+- `ORCHD_TOKEN_FILE` (default `~/.config/forgejo-agent/creds/orchd.token`)
 
 ## After Assimilation
 

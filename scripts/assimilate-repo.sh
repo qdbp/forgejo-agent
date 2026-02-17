@@ -10,6 +10,8 @@ need_cmd rg
 need_cmd jq
 
 FORGEJOCTL_BIN="${FORGEJOCTL_BIN:-$HOME/.local/bin/forgejoctl}"
+ORCHD_BIN="${ORCHD_BIN:-$HOME/.local/bin/orchd}"
+ORCHD_TOKEN_FILE="${ORCHD_TOKEN_FILE:-$HOME/.config/forgejo-agent/creds/orchd.token}"
 DISPATCH_CONFIG_DEFAULT="$SCRIPT_DIR/../config/orchd-dispatch.toml"
 AGENTS_SNIPPET_TEMPLATE="$SCRIPT_DIR/../templates/repo-agents-assimilation-snippet.md"
 
@@ -35,6 +37,7 @@ options:
   --lead-login LOGIN             default: codex-lead
   --dev-login LOGIN              default: codex-dev
   --skip-acl                     do not apply repo-scoped collaborator ACLs
+  --skip-role-check-preflight    skip `orchd role check` preflight gate
   --bootstrap-token-file PATH    default: ~/.config/forgejo-agent/creds/codex-orch.token
   --skip-bootstrap-push          do not push initial branch to forgejo remote
   --skip-agents-patch            do not patch repo-local AGENTS.md
@@ -55,6 +58,7 @@ orch_login="codex-orch"
 lead_login="codex-lead"
 dev_login="codex-dev"
 apply_acl=1
+skip_role_check_preflight=0
 bootstrap_token_file="$HOME/.config/forgejo-agent/creds/codex-orch.token"
 bootstrap_push=1
 patch_agents=1
@@ -73,6 +77,7 @@ while [[ $# -gt 0 ]]; do
     --lead-login) lead_login="${2-}"; shift 2 ;;
     --dev-login) dev_login="${2-}"; shift 2 ;;
     --skip-acl) apply_acl=0; shift ;;
+    --skip-role-check-preflight) skip_role_check_preflight=1; shift ;;
     --bootstrap-token-file) bootstrap_token_file="${2-}"; shift 2 ;;
     --skip-bootstrap-push) bootstrap_push=0; shift ;;
     --skip-agents-patch) patch_agents=0; shift ;;
@@ -94,6 +99,10 @@ bootstrap_token_file="$(expand_tilde "$bootstrap_token_file")"
 [[ -f "$dispatch_config" ]] || err "dispatch config not found: $dispatch_config"
 [[ -f "$AGENTS_SNIPPET_TEMPLATE" ]] || err "missing AGENTS snippet template: $AGENTS_SNIPPET_TEMPLATE"
 [[ -x "$FORGEJOCTL_BIN" ]] || err "forgejoctl binary is not executable: $FORGEJOCTL_BIN"
+if [[ "$skip_role_check_preflight" -ne 1 ]]; then
+  [[ -x "$ORCHD_BIN" ]] || err "orchd binary is not executable: $ORCHD_BIN"
+  [[ -r "$ORCHD_TOKEN_FILE" ]] || err "orchd token file is not readable: $ORCHD_TOKEN_FILE"
+fi
 
 if [[ ! -d "$local_path" ]]; then
   err "local path does not exist: $local_path"
@@ -129,6 +138,18 @@ run() {
   else
     "$@"
   fi
+}
+
+run_role_check_preflight() {
+  if [[ "$skip_role_check_preflight" -eq 1 ]]; then
+    log "skipping role-check preflight by request"
+    return
+  fi
+  log "running orchd role integrity preflight"
+  run "$ORCHD_BIN" \
+    --token-file "$ORCHD_TOKEN_FILE" \
+    --dispatch-config "$dispatch_config" \
+    role check
 }
 
 append_text() {
@@ -336,6 +357,7 @@ log "local path: $local_path"
 log "dispatch config: $dispatch_config"
 log "forgejo remote: $forgejo_remote ($forgejo_push_url)"
 
+run_role_check_preflight
 ensure_repo_labels
 apply_collaborator_acl
 ensure_local_remote

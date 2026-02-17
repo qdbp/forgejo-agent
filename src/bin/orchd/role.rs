@@ -63,12 +63,30 @@ struct ForgejoUser {
 
 #[derive(Debug, Clone, Deserialize)]
 struct ForgejoTokenResponse {
+    #[serde(default)]
+    id: Option<i64>,
+    #[serde(default)]
+    name: Option<String>,
     sha1: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct ForgejoApiErrorBody {
     message: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct MintedRoleToken {
+    token: String,
+    revoke_ref: String,
+    created_user: bool,
+}
+
+#[derive(Debug, Clone)]
+struct RemoteProvisioningReceipt {
+    login: String,
+    revoke_token_ref: String,
+    created_user: bool,
 }
 
 pub(super) fn role_list_command(cli: &Cli, args: RoleListArgs) -> Result<()> {
@@ -100,14 +118,7 @@ pub(super) fn role_check_command(cli: &Cli, args: RoleCheckArgs) -> Result<()> {
     let dispatch_config_path = resolve_dispatch_config_path(cli)?;
     let dispatch_config = load_dispatch_config(&dispatch_config_path)?;
     let cfg = AgentConfig::load(cli.config.clone(), cli.token_file.clone())?;
-    let client = ForgejoClient::new(&cfg)?;
-
-    let report = evaluate_roles(
-        &dispatch_config,
-        &cfg,
-        &client,
-        args.role.as_deref().map(normalize_name),
-    );
+    let report = run_role_check(&dispatch_config, &cfg, args.role.as_deref())?;
     if report.roles.is_empty() {
         if let Some(role_name) = args.role.as_deref() {
             bail!(
@@ -153,6 +164,28 @@ pub(super) fn role_check_command(cli: &Cli, args: RoleCheckArgs) -> Result<()> {
     } else {
         bail!("role check failed")
     }
+}
+
+pub(super) fn enforce_startup_role_check(
+    dispatch_config: &DispatchConfig,
+    cfg: &AgentConfig,
+) -> Result<()> {
+    let report = run_role_check(dispatch_config, cfg, None)?;
+    if report.roles.is_empty() {
+        bail!("startup role check found no roles in dispatch config");
+    }
+    if report.ok {
+        return Ok(());
+    }
+
+    let mut lines = vec!["startup role check failed:".to_string()];
+    for role in report.roles.iter().filter(|entry| !entry.errors.is_empty()) {
+        lines.push(format!("- {}:", role.role));
+        for error in &role.errors {
+            lines.push(format!("  - {error}"));
+        }
+    }
+    bail!("{}", lines.join("\n"));
 }
 
 pub(super) fn role_add_command(cli: &Cli, args: RoleAddArgs) -> Result<()> {
@@ -212,42 +245,6 @@ pub(super) fn role_add_command(cli: &Cli, args: RoleAddArgs) -> Result<()> {
         );
     }
 
-    let mut created_token_file = false;
-    let mut previous_token_contents = read_token_if_exists(&token_file)?;
-    let desired_token = if previous_token_contents.is_some() && !args.rotate_token {
-        read_token_file(&token_file)?
-    } else if args.dry_run {
-        "<dry-run-token>".to_string()
-    } else {
-        let admin_token = read_admin_token(args.admin_token_file.as_deref())?;
-        let minted = mint_role_token(
-            cfg.base_url.as_str(),
-            admin_token.as_str(),
-            forgejo_login.as_str(),
-            args.create_user,
-        )?;
-        write_secret_token_file(&token_file, minted.as_str())?;
-        created_token_file = previous_token_contents.is_none();
-        previous_token_contents = previous_token_contents.take();
-        minted
-    };
-
-    if !args.dry_run {
-        verify_token_maps_to_login(
-            &client,
-            &cfg,
-            desired_token.as_str(),
-            forgejo_login.as_str(),
-        )?;
-        ensure_scream_acl(
-            cfg.base_url.as_str(),
-            read_admin_token(args.admin_token_file.as_deref())?.as_str(),
-            &args.scream_repo,
-            forgejo_login.as_str(),
-            args.scream_permission.as_str(),
-        )?;
-    }
-
     let updated_config = render_role_added_config(
         &config_before,
         role.as_str(),
@@ -286,6 +283,69 @@ pub(super) fn role_add_command(cli: &Cli, args: RoleAddArgs) -> Result<()> {
         return Ok(());
     }
 
+    let admin_token = read_admin_token(args.admin_token_file.as_deref())?;
+    let mut created_token_file = false;
+    let mut previous_token_contents = read_token_if_exists(&token_file)?;
+    let mut remote_receipt = None;
+
+    let desired_token = if previous_token_contents.is_some() && !args.rotate_token {
+        read_token_file(&token_file)?
+    } else {
+        let minted = mint_role_token(
+            cfg.base_url.as_str(),
+            admin_token.as_str(),
+            forgejo_login.as_str(),
+            args.create_user,
+        )?;
+        write_secret_token_file(&token_file, minted.token.as_str())?;
+        created_token_file = previous_token_contents.is_none();
+        previous_token_contents = previous_token_contents.take();
+        remote_receipt = Some(RemoteProvisioningReceipt {
+            login: forgejo_login.clone(),
+            revoke_token_ref: minted.revoke_ref,
+            created_user: minted.created_user,
+        });
+        minted.token
+    };
+
+    let remote_ready = (|| -> Result<()> {
+        verify_token_maps_to_login(
+            &client,
+            &cfg,
+            desired_token.as_str(),
+            forgejo_login.as_str(),
+        )?;
+        ensure_scream_acl(
+            cfg.base_url.as_str(),
+            admin_token.as_str(),
+            &args.scream_repo,
+            forgejo_login.as_str(),
+            args.scream_permission.as_str(),
+        )?;
+        Ok(())
+    })();
+    if let Err(err) = remote_ready {
+        if created_token_file {
+            let _ = fs::remove_file(&token_file);
+        } else if args.rotate_token
+            && let Some(previous) = previous_token_contents.as_deref()
+        {
+            let _ = write_secret_token_file(&token_file, previous);
+        }
+
+        let compensation_notes = compensate_remote_role_add(
+            cfg.base_url.as_str(),
+            admin_token.as_str(),
+            remote_receipt.as_ref(),
+        );
+        let mut context = "role add failed before local writes".to_string();
+        if !compensation_notes.is_empty() {
+            context.push_str("; remote compensation: ");
+            context.push_str(&compensation_notes.join("; "));
+        }
+        return Err(err).context(context);
+    }
+
     let mut wrote_config = false;
     let mut wrote_role_card = false;
 
@@ -314,7 +374,7 @@ pub(super) fn role_add_command(cli: &Cli, args: RoleAddArgs) -> Result<()> {
             forgejo_login.as_str(),
         )?;
 
-        let report = evaluate_roles(&reloaded, &cfg, &client, Some(role.clone()));
+        let report = run_role_check(&reloaded, &cfg, Some(role.as_str()))?;
         if !report.ok {
             bail!("new role '{}' failed post-write role check", role);
         }
@@ -335,7 +395,17 @@ pub(super) fn role_add_command(cli: &Cli, args: RoleAddArgs) -> Result<()> {
         {
             let _ = write_secret_token_file(&token_file, previous);
         }
-        return Err(err).context("role add failed and local edits were rolled back");
+        let compensation_notes = compensate_remote_role_add(
+            cfg.base_url.as_str(),
+            admin_token.as_str(),
+            remote_receipt.as_ref(),
+        );
+        let mut context = "role add failed and local edits were rolled back".to_string();
+        if !compensation_notes.is_empty() {
+            context.push_str("; remote compensation: ");
+            context.push_str(&compensation_notes.join("; "));
+        }
+        return Err(err).context(context);
     }
 
     if args.json {
@@ -378,6 +448,20 @@ fn collect_role_summaries(config: &DispatchConfig) -> Vec<RoleSummary> {
             }
         })
         .collect()
+}
+
+fn run_role_check(
+    dispatch_config: &DispatchConfig,
+    cfg: &AgentConfig,
+    role_filter: Option<&str>,
+) -> Result<RoleCheckReport> {
+    let client = ForgejoClient::new(cfg)?;
+    Ok(evaluate_roles(
+        dispatch_config,
+        cfg,
+        &client,
+        role_filter.map(normalize_name),
+    ))
 }
 
 fn evaluate_roles(
@@ -683,14 +767,16 @@ fn mint_role_token(
     admin_token: &str,
     login: &str,
     create_user: bool,
-) -> Result<String> {
+) -> Result<MintedRoleToken> {
     let http = Client::builder()
         .user_agent("forgejo-agent/role")
         .build()
         .context("failed creating HTTP client")?;
 
     let user_exists = fetch_user_with_token(base_url, admin_token, login)?.is_some();
-    if !user_exists {
+    let user_created_in_run = if user_exists {
+        false
+    } else {
         if !create_user {
             bail!(
                 "forgejo user '{}' does not exist; rerun with --create-user to provision",
@@ -698,7 +784,8 @@ fn mint_role_token(
             );
         }
         create_forgejo_user(&http, base_url, admin_token, login)?;
-    }
+        true
+    };
 
     let temp_password = format!(
         "{}-{}",
@@ -707,7 +794,17 @@ fn mint_role_token(
     );
 
     update_forgejo_user_password(&http, base_url, admin_token, login, temp_password.as_str())?;
-    create_forgejo_user_token(&http, base_url, login, temp_password.as_str())
+    let token = create_forgejo_user_token(&http, base_url, login, temp_password.as_str())?;
+    let revoke_ref = token
+        .id
+        .map(|id| id.to_string())
+        .or(token.name)
+        .ok_or_else(|| anyhow!("minted token response missing both id and name"))?;
+    Ok(MintedRoleToken {
+        token: token.sha1,
+        revoke_ref,
+        created_user: user_created_in_run,
+    })
 }
 
 fn create_forgejo_user(
@@ -753,7 +850,7 @@ fn create_forgejo_user_token(
     base_url: &str,
     login: &str,
     password: &str,
-) -> Result<String> {
+) -> Result<ForgejoTokenResponse> {
     let url = format!(
         "{}/api/v1/users/{}/tokens",
         base_url.trim_end_matches('/'),
@@ -774,10 +871,12 @@ fn create_forgejo_user_token(
         password,
         &scoped_payload,
     ) {
-        Ok(response.sha1)
+        let mut response = response;
+        response.name.get_or_insert(token_name);
+        Ok(response)
     } else {
         let payload = json!({ "name": token_name });
-        let response = send_basic_json::<ForgejoTokenResponse>(
+        let mut response = send_basic_json::<ForgejoTokenResponse>(
             http,
             Method::POST,
             &url,
@@ -785,8 +884,97 @@ fn create_forgejo_user_token(
             password,
             &payload,
         )?;
-        Ok(response.sha1)
+        response.name.get_or_insert(token_name);
+        Ok(response)
     }
+}
+
+fn compensate_remote_role_add(
+    base_url: &str,
+    admin_token: &str,
+    receipt: Option<&RemoteProvisioningReceipt>,
+) -> Vec<String> {
+    let Some(receipt) = receipt else {
+        return Vec::new();
+    };
+
+    let http = match Client::builder().user_agent("forgejo-agent/role").build() {
+        Ok(client) => client,
+        Err(err) => {
+            return vec![format!(
+                "failed building HTTP client for compensation: {err}"
+            )];
+        }
+    };
+
+    let mut notes = Vec::new();
+    if let Err(err) = revoke_forgejo_user_token(
+        &http,
+        base_url,
+        admin_token,
+        receipt.login.as_str(),
+        receipt.revoke_token_ref.as_str(),
+    ) {
+        notes.push(format!("token revoke failed: {err}"));
+    }
+    if receipt.created_user
+        && let Err(err) =
+            set_forgejo_user_active(&http, base_url, admin_token, receipt.login.as_str(), false)
+    {
+        notes.push(format!("user deactivate failed: {err}"));
+    }
+    notes
+}
+
+fn revoke_forgejo_user_token(
+    http: &Client,
+    base_url: &str,
+    admin_token: &str,
+    login: &str,
+    token_ref: &str,
+) -> Result<()> {
+    let url = format!(
+        "{}/api/v1/users/{}/tokens/{}",
+        base_url.trim_end_matches('/'),
+        login,
+        token_ref
+    );
+    let response = http
+        .request(Method::DELETE, &url)
+        .header("Accept", "application/json")
+        .header("Authorization", format!("token {admin_token}"))
+        .send()
+        .with_context(|| format!("request failed: DELETE {url}"))?;
+
+    if response.status().is_success() || response.status().as_u16() == 404 {
+        return Ok(());
+    }
+    let status = response.status().as_u16();
+    let body_text = response.text().unwrap_or_else(|_| "<no body>".to_string());
+    let body_message = serde_json::from_str::<ForgejoApiErrorBody>(&body_text)
+        .ok()
+        .and_then(|body| body.message)
+        .unwrap_or(body_text);
+    bail!("DELETE {url} failed with {status}: {body_message}");
+}
+
+fn set_forgejo_user_active(
+    http: &Client,
+    base_url: &str,
+    admin_token: &str,
+    login: &str,
+    active: bool,
+) -> Result<()> {
+    let url = format!(
+        "{}/api/v1/admin/users/{}",
+        base_url.trim_end_matches('/'),
+        login
+    );
+    let payload = json!({
+        "active": active,
+        "must_change_password": false,
+    });
+    send_token_json(http, Method::PATCH, &url, admin_token, &payload)
 }
 
 fn ensure_scream_acl(

@@ -32,6 +32,7 @@ Core behavior:
   - `orchd role list`
   - `orchd role check [--role <name>]`
   - `orchd role add ...`
+- enforces role integrity on `exec` startup (same checks as `orchd role check`; override with `--skip-startup-role-check` only for break-glass recovery)
 
 Dispatch behavior is configured in `config/orchd-dispatch.toml`:
 
