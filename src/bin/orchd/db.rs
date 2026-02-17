@@ -207,6 +207,47 @@ pub(super) fn update_repo_local_path(
     Ok(())
 }
 
+pub(super) fn repo_is_known(db_path: &Path, repo_full_name: &str) -> Result<bool> {
+    let conn = open_db(db_path)?;
+    let repo_row: Option<()> = conn
+        .query_row(
+            "SELECT 1 FROM repos WHERE repo_full_name = ?1 LIMIT 1",
+            params![repo_full_name],
+            |_| Ok(()),
+        )
+        .optional()?;
+    if repo_row.is_some() {
+        return Ok(true);
+    }
+    let dispatch_row: Option<()> = conn
+        .query_row(
+            "SELECT 1 FROM dispatches WHERE repo_full_name = ?1 LIMIT 1",
+            params![repo_full_name],
+            |_| Ok(()),
+        )
+        .optional()?;
+    Ok(dispatch_row.is_some())
+}
+
+pub(super) fn list_known_repo_full_names(db_path: &Path, limit: usize) -> Result<Vec<String>> {
+    let conn = open_db(db_path)?;
+    let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+    let mut stmt = conn.prepare(
+        r"
+        SELECT repo_full_name FROM (
+            SELECT repo_full_name FROM repos
+            UNION
+            SELECT repo_full_name FROM dispatches
+        )
+        ORDER BY repo_full_name ASC
+        LIMIT ?1
+        ",
+    )?;
+    let rows = stmt.query_map(params![limit_i64], |row| row.get::<_, String>(0))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
 pub(super) fn insert_event(db_path: &Path, event: &EventRecord) -> Result<Option<i64>> {
     let conn = open_db(db_path)?;
     let now = Utc::now().to_rfc3339();
@@ -1634,6 +1675,53 @@ mod tests {
             .expect("query event rows")
             .collect::<rusqlite::Result<Vec<_>>>()
             .expect("collect event rows")
+    }
+
+    #[test]
+    fn repo_is_known_matches_seen_repo_row_or_dispatch_row() {
+        let db_path = temp_db_path("repo-known");
+        super::init_db(&db_path).expect("db init");
+
+        assert!(
+            !super::repo_is_known(&db_path, "main/unknown-repo").expect("repo is known check"),
+            "fresh db should treat unknown repo as unknown"
+        );
+
+        super::upsert_repo_seen(&db_path, "main/seen-repo").expect("upsert repo");
+        assert!(
+            super::repo_is_known(&db_path, "main/seen-repo").expect("repo is known check"),
+            "repo_is_known should match rows in repos table"
+        );
+
+        let decision_id = seed_decision_id(&db_path);
+        let now = Utc::now().to_rfc3339();
+        let conn = super::open_db(&db_path).expect("open db");
+        conn.execute(
+            r"
+            INSERT INTO dispatches
+            (decision_id, repo_full_name, issue_number, actor_login, directive, target_role, status, started_at, ended_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            ",
+            params![
+                decision_id,
+                "main/dispatch-only",
+                1_i64,
+                "main",
+                DIRECTIVE_REPLY,
+                "codex-orch",
+                DispatchState::Completed.as_db_str(),
+                &now,
+                &now,
+            ],
+        )
+        .expect("insert dispatch");
+
+        assert!(
+            super::repo_is_known(&db_path, "main/dispatch-only").expect("repo is known check"),
+            "repo_is_known should match rows in dispatches table"
+        );
+
+        let _ = fs::remove_file(db_path);
     }
 
     #[test]

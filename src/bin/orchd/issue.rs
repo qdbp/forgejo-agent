@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -46,6 +46,33 @@ fn normalized_role_filter(role: Option<&str>) -> Result<Option<String>> {
     .transpose()
 }
 
+fn ensure_repo_known(db_path: &Path, repo: &str, repo_full_name: &str) -> Result<()> {
+    if db::repo_is_known(db_path, repo_full_name)? {
+        return Ok(());
+    }
+
+    let prefix = format!("{ISSUE_OWNER}/");
+    let mut known = db::list_known_repo_full_names(db_path, 25)?
+        .into_iter()
+        .map(|full| {
+            full.strip_prefix(&prefix)
+                .map(ToOwned::to_owned)
+                .unwrap_or(full)
+        })
+        .collect::<Vec<_>>();
+    known.sort();
+    known.dedup();
+
+    if known.is_empty() {
+        bail!("unknown repo '{repo}' (owner {ISSUE_OWNER}); orchd db has no known repos yet");
+    }
+
+    bail!(
+        "unknown repo '{repo}' (owner {ISSUE_OWNER}); known repos: {}",
+        known.join(", ")
+    );
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct IssueSessionSummary {
     dispatch_id: i64,
@@ -69,6 +96,7 @@ pub(super) fn issue_sessions_command(db_path_raw: &str, args: IssueSessionsArgs)
     let repo = validate_repo_name(&args.repo)?;
     let repo_full_name = format!("{ISSUE_OWNER}/{repo}");
     let db_path = expand_tilde_path(db_path_raw)?;
+    ensure_repo_known(&db_path, repo, &repo_full_name)?;
     let role_filter = normalized_role_filter(args.role.as_deref())?;
     let rows = db::list_issue_resume_dispatches(
         &db_path,
@@ -126,6 +154,7 @@ pub(super) fn issue_resume_command(db_path_raw: &str, args: IssueResumeArgs) -> 
     let repo_full_name = format!("{ISSUE_OWNER}/{repo}");
     let issue_ref = format!("{repo_full_name}#{}", args.issue_number);
     let db_path = expand_tilde_path(db_path_raw)?;
+    ensure_repo_known(&db_path, repo, &repo_full_name)?;
     if let Some(active) =
         db::latest_issue_active_dispatch(&db_path, &repo_full_name, args.issue_number)?
     {
