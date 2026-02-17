@@ -254,6 +254,10 @@ fn run_codex_once(spec: &DispatchExecSpecV1, mode: CodexRunMode<'_>) -> Result<i
     }
 
     cmd.current_dir(&spec.workdir)
+        // Ensure `bin/codex-role` uses the exact token path from the dispatch spec rather than
+        // deriving it from `codex_role_arg`. This makes role naming + token naming resilient to
+        // drift and avoids "instant death" failures before Codex starts.
+        .env("CODEX_ROLE_TOKEN_FILE", &spec.token_file)
         .stdin(Stdio::piped())
         .stdout(Stdio::from(log_out))
         .stderr(Stdio::from(log_err));

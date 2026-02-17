@@ -19,7 +19,7 @@ token_file = "/home/main/.config/forgejo-agent/creds/codex-dev.token"
 
 [roles.codex-audit]
 codex_bin = "/home/main/forgejo-agent/bin/codex-role"
-codex_role_arg = "auditor"
+codex_role_arg = "audit"
 forgejo_login = "codex-audit"
 token_file = "/home/main/.config/forgejo-agent/creds/codex-audit.token"
 
