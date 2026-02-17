@@ -390,13 +390,39 @@ fn git_is_ancestor(workdir: &Path, ancestor: &str, descendant: &str) -> Result<b
     }
 }
 
-fn validate_principal_workspace(
+enum PrincipalSyncRelation {
+    InSync,
+    Behind,
+    Ahead,
+    Diverged,
+}
+
+fn classify_sync_relation(
+    principal_workdir: &Path,
+    principal_head: &str,
+    fetched_head: &str,
+) -> Result<PrincipalSyncRelation> {
+    if principal_head == fetched_head {
+        return Ok(PrincipalSyncRelation::InSync);
+    }
+    let local_is_behind = git_is_ancestor(principal_workdir, principal_head, fetched_head)?;
+    let local_is_ahead = git_is_ancestor(principal_workdir, fetched_head, principal_head)?;
+    if local_is_behind {
+        return Ok(PrincipalSyncRelation::Behind);
+    }
+    if local_is_ahead {
+        return Ok(PrincipalSyncRelation::Ahead);
+    }
+    Ok(PrincipalSyncRelation::Diverged)
+}
+
+fn reconcile_principal_workspace(
     db_path: &Path,
     token_file: &Path,
     principal_workdir: &Path,
     base_branch: &str,
     source_remote_url: &str,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     let _ = git_checked(principal_workdir, &["rev-parse", "--is-inside-work-tree"])?;
     let status = git_stdout_trim(&git_checked(
         principal_workdir,
@@ -422,6 +448,7 @@ fn validate_principal_workspace(
         ));
     }
 
+    let mut lines = Vec::new();
     git_checked_with_token(
         db_path,
         token_file,
@@ -441,36 +468,46 @@ fn validate_principal_workspace(
         principal_workdir,
         &["rev-parse", "--short", "FETCH_HEAD"],
     )?);
-
-    if principal_head == fetched_head {
-        return Ok(());
-    }
-
-    let local_is_behind = git_is_ancestor(principal_workdir, &principal_head, &fetched_head)?;
-    let local_is_ahead = git_is_ancestor(principal_workdir, &fetched_head, &principal_head)?;
     let sync_target = format!("{}:{base_branch}", source_remote_url);
-    if local_is_behind {
-        return Err(anyhow!(
-            "principal workspace {} is behind {sync_target} (local={}, remote={}); reconcile before dispatch",
+    match classify_sync_relation(principal_workdir, &principal_head, &fetched_head)? {
+        PrincipalSyncRelation::InSync => {
+            lines.push(format!(
+                "preflight_sync: principal already in sync with {sync_target} at {principal_head_short}"
+            ));
+            Ok(lines)
+        }
+        PrincipalSyncRelation::Behind => {
+            git_checked(principal_workdir, &["merge", "--ff-only", "FETCH_HEAD"])?;
+            let principal_after_short = git_stdout_trim(&git_checked(
+                principal_workdir,
+                &["rev-parse", "--short", "HEAD"],
+            )?);
+            lines.push(format!(
+                "preflight_sync: principal fast-forwarded {} -> {} from {sync_target}",
+                principal_head_short, principal_after_short
+            ));
+            Ok(lines)
+        }
+        PrincipalSyncRelation::Ahead => {
+            git_checked_with_token(
+                db_path,
+                token_file,
+                Some(principal_workdir),
+                &["push", source_remote_url, &format!("HEAD:{base_branch}")],
+            )?;
+            lines.push(format!(
+                "preflight_sync: principal pushed ahead commit {} to {sync_target} (remote was {})",
+                principal_head_short, fetched_head_short
+            ));
+            Ok(lines)
+        }
+        PrincipalSyncRelation::Diverged => Err(anyhow!(
+            "principal workspace {} diverged from {sync_target} (local={}, remote={}); reconcile before dispatch",
             principal_workdir.display(),
             principal_head_short,
             fetched_head_short
-        ));
+        )),
     }
-    if local_is_ahead {
-        return Err(anyhow!(
-            "principal workspace {} is ahead of {sync_target} (local={}, remote={}); push/rebase and reconcile before dispatch",
-            principal_workdir.display(),
-            principal_head_short,
-            fetched_head_short
-        ));
-    }
-    Err(anyhow!(
-        "principal workspace {} diverged from {sync_target} (local={}, remote={}); reconcile before dispatch",
-        principal_workdir.display(),
-        principal_head_short,
-        fetched_head_short
-    ))
 }
 
 pub(super) fn autoland_and_sync_principal(
@@ -482,17 +519,13 @@ pub(super) fn autoland_and_sync_principal(
     base_branch: &str,
 ) -> Result<Vec<String>> {
     let dispatch_head = git_stdout_trim(&git_checked(dispatch_workdir, &["rev-parse", "HEAD"])?);
-    let dispatch_head_short = git_stdout_trim(&git_checked(
-        dispatch_workdir,
-        &["rev-parse", "--short", "HEAD"],
-    )?);
     let dispatch_remote_url = git_stdout_trim(&git_checked(
         dispatch_workdir,
         &["remote", "get-url", remote],
     )?);
 
     // Preflight principal before touching remote main.
-    validate_principal_workspace(
+    let mut lines = reconcile_principal_workspace(
         db_path,
         token_file,
         principal_workdir,
@@ -506,15 +539,45 @@ pub(super) fn autoland_and_sync_principal(
         Some(dispatch_workdir),
         &["fetch", remote, base_branch],
     );
+    let dispatch_fetch_head = git_stdout_trim(&git_checked(
+        dispatch_workdir,
+        &["rev-parse", "FETCH_HEAD"],
+    )?);
+    if dispatch_fetch_head != dispatch_head {
+        let includes_latest_main =
+            git_is_ancestor(dispatch_workdir, &dispatch_fetch_head, &dispatch_head)?;
+        if !includes_latest_main {
+            let rebase_result = git_checked(dispatch_workdir, &["rebase", "FETCH_HEAD"]);
+            if let Err(err) = rebase_result {
+                let _ = git_checked(dispatch_workdir, &["rebase", "--abort"]);
+                return Err(anyhow!(
+                    "rebasing dispatch branch on latest {remote}/{base_branch} failed: {err:#}"
+                ));
+            }
+            let rebased_short = git_stdout_trim(&git_checked(
+                dispatch_workdir,
+                &["rev-parse", "--short", "HEAD"],
+            )?);
+            lines.push(format!(
+                "autoland_rebase: rebased dispatch onto latest {remote}/{base_branch}, new head {rebased_short}"
+            ));
+        }
+    }
+
+    let dispatch_head = git_stdout_trim(&git_checked(dispatch_workdir, &["rev-parse", "HEAD"])?);
+    let dispatch_head_short = git_stdout_trim(&git_checked(
+        dispatch_workdir,
+        &["rev-parse", "--short", "HEAD"],
+    )?);
     git_checked_with_token(
         db_path,
         token_file,
         Some(dispatch_workdir),
         &["push", remote, &format!("HEAD:{base_branch}")],
     )?;
-    let mut lines = vec![format!(
+    lines.push(format!(
         "autoland: pushed {dispatch_head_short} -> {remote}/{base_branch}"
-    )];
+    ));
 
     let sync_result: Result<(String, String, String)> = (|| {
         let principal_before = git_stdout_trim(&git_checked(

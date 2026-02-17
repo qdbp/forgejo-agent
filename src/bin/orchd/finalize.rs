@@ -79,6 +79,10 @@ fn is_retryable_autoland_conflict(error_text: &str) -> bool {
         "not possible to fast-forward",
         "cannot fast-forward",
         "merge --ff-only",
+        "could not apply",
+        "resolve all conflicts manually",
+        "conflict (content)",
+        "rebasing dispatch branch on latest",
     ]
     .iter()
     .any(|needle| lower.contains(needle))

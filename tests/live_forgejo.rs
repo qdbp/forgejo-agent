@@ -2180,7 +2180,7 @@ fn live_orchd_impl_dirty_principal_blocks_push() -> Result<()> {
 
 #[test]
 #[serial(live_forgejo)]
-fn live_orchd_impl_principal_ahead_blocks_push() -> Result<()> {
+fn live_orchd_impl_principal_ahead_is_autohealed() -> Result<()> {
     if !live_tests_enabled() {
         eprintln!(
             "skipping live orchd integration test; enable with {}=1",
@@ -2189,7 +2189,7 @@ fn live_orchd_impl_principal_ahead_blocks_push() -> Result<()> {
         return Ok(());
     }
 
-    let harness = LiveHarness::bootstrap("live_orchd_impl_principal_ahead_blocks_push")?;
+    let harness = LiveHarness::bootstrap("live_orchd_impl_principal_ahead_is_autohealed")?;
     let issue_number = harness.create_issue("orchd impl principal ahead", "issue body", "ready")?;
 
     let git = GitWorkspace::from_fixture(&harness.fixture, &harness.repo_name)?;
@@ -2282,40 +2282,45 @@ fn live_orchd_impl_principal_ahead_blocks_push() -> Result<()> {
     let final_issue = wait_for_issue_label(
         &harness,
         issue_number,
-        "orchd/state/failed",
+        "orchd/state/completed",
         Duration::from_secs(60),
     )?;
-    if !issue_has_label(&final_issue, "state/blocked")? {
-        bail!("expected principal-ahead preflight to transition issue to state/blocked");
+    if !issue_has_label(&final_issue, "state/review")? {
+        bail!("expected principal-ahead autoheal flow to transition issue to state/review");
     }
 
     let status_reason =
         orchd_latest_dispatch_status_reason(&db_path, &harness.repo_ref, issue_number)?
             .ok_or_else(|| anyhow!("expected latest dispatch row for issue"))?;
-    if status_reason.0 != "failed_runtime" {
+    if status_reason.0 != "completed" {
         bail!(
-            "expected failed_runtime when principal ahead preflight blocks autoland, got status={} reason={:?}",
+            "expected completed status when principal ahead autoheal succeeds, got status={} reason={:?}",
             status_reason.0,
             status_reason.1
         );
     }
-    if status_reason.1.as_deref() != Some("autoland_failed") {
-        bail!(
-            "expected autoland_failed reason code, got {:?}",
-            status_reason.1
-        );
+    if status_reason.1.as_deref() != Some("completed") {
+        bail!("expected completed reason code, got {:?}", status_reason.1);
     }
 
     let after_head = git.bare_head_main()?;
     let after_count = git.bare_commit_count_main()?;
-    if after_head != before_head {
+    if after_head == before_head {
+        bail!("expected autoland to advance remote main after principal ahead autoheal");
+    }
+    if after_count != before_count + 2 {
         bail!(
-            "expected principal-ahead preflight to block remote push; main moved from {before_head} to {after_head}"
+            "expected principal ahead commit plus dispatch commit to land ({before_count} -> {after_count})"
         );
     }
-    if after_count != before_count {
+    let principal_head = stdout_trim(&git_output_checked(
+        &harness.principal_workdir,
+        &["rev-parse", "HEAD"],
+        "git rev-parse HEAD (principal workspace after ahead autoheal)",
+    )?)?;
+    if principal_head != after_head {
         bail!(
-            "expected principal-ahead preflight to keep commit count unchanged ({before_count} -> {after_count})"
+            "expected principal workspace to sync to landed remote head (principal={principal_head} remote={after_head})"
         );
     }
 
