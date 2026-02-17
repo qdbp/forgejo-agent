@@ -87,8 +87,6 @@ pub(super) struct IssueTriggerGuardrailStats {
     pub(super) total: u64,
     pub(super) recent: u64,
     pub(super) last_created_at: Option<String>,
-    pub(super) last_directive: Option<String>,
-    pub(super) last_target_role: Option<String>,
 }
 
 pub(super) fn init_db(db_path: &Path) -> Result<()> {
@@ -403,11 +401,11 @@ pub(super) fn issue_trigger_guardrail_stats(
         |row| row.get(0),
     )?;
 
-    let latest = conn
+    let last_created_at = conn
         .query_row(
             &format!(
                 r"
-                SELECT created_at, directive, target_role
+                SELECT created_at
                 FROM decisions
                 WHERE repo_full_name = ?1
                   AND issue_number = ?2
@@ -417,24 +415,14 @@ pub(super) fn issue_trigger_guardrail_stats(
                 "
             ),
             params![repo_full_name, issue_number],
-            |row| {
-                Ok((
-                    row.get::<_, Option<String>>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                ))
-            },
+            |row| row.get::<_, String>(0),
         )
         .optional()?;
-
-    let (last_created_at, last_directive, last_target_role) = latest.unwrap_or((None, None, None));
 
     Ok(IssueTriggerGuardrailStats {
         total,
         recent,
         last_created_at,
-        last_directive,
-        last_target_role,
     })
 }
 
@@ -2094,10 +2082,13 @@ mod tests {
         super::init_db(&db_path).expect("db init");
         let conn = super::open_db(&db_path).expect("open db");
 
-        let insert_decision = |delivery: &str, reason: &str, directive: &str, role: &str| {
-            let now = Utc::now().to_rfc3339();
+        let insert_decision = |delivery: &str,
+                               reason: &str,
+                               directive: &str,
+                               role: &str,
+                               created_at: &str| {
             conn.execute(
-                r"
+                    r"
                 INSERT INTO events (delivery_id, event_type, repo_full_name, issue_number, action, actor_login, raw_json, received_at)
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                 ",
@@ -2109,13 +2100,13 @@ mod tests {
                     "created",
                     "main",
                     "{}",
-                    now
+                    created_at
                 ],
-            )
-            .expect("insert event");
+                )
+                .expect("insert event");
             let event_id = conn.last_insert_rowid();
             conn.execute(
-                r"
+                    r"
                 INSERT INTO decisions
                 (event_id, repo_full_name, issue_number, actor_login, directive, target_role, decision, reason_code, would_dispatch, created_at)
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
@@ -2130,20 +2121,37 @@ mod tests {
                     DECISION_ACCEPTED,
                     reason,
                     1_i64,
-                    Utc::now().to_rfc3339(),
+                    created_at,
                 ],
-            )
-            .expect("insert decision");
+                )
+                .expect("insert decision");
         };
 
-        insert_decision("trigger-a", "assignee_reply", "reply", "codex-orch");
+        let created_a = "2026-02-16T09:00:00Z";
+        let created_b = "2026-02-16T09:01:00Z";
+        let created_c = "2026-02-16T09:02:00Z";
+
+        insert_decision(
+            "trigger-a",
+            "assignee_reply",
+            "reply",
+            "codex-orch",
+            created_a,
+        );
         insert_decision(
             "trigger-b",
             "registered_trigger:closed_debrief",
             "reply",
             "codex-orch",
+            created_b,
         );
-        insert_decision("explicit-c", "explicit_directive", "reply", "codex-orch");
+        insert_decision(
+            "explicit-c",
+            "explicit_directive",
+            "reply",
+            "codex-orch",
+            created_c,
+        );
 
         let stats = super::issue_trigger_guardrail_stats(
             &db_path,
@@ -2155,8 +2163,7 @@ mod tests {
 
         assert_eq!(stats.total, 2);
         assert_eq!(stats.recent, 2);
-        assert_eq!(stats.last_directive.as_deref(), Some("reply"));
-        assert_eq!(stats.last_target_role.as_deref(), Some("codex-orch"));
+        assert_eq!(stats.last_created_at.as_deref(), Some(created_b));
 
         let _ = fs::remove_file(db_path);
     }

@@ -376,9 +376,6 @@ fn apply_trigger_guardrails(
     let Some(issue_number) = record.issue_number else {
         return Ok(None);
     };
-    let Some(directive) = decision.directive.as_deref() else {
-        return Ok(None);
-    };
     let Some(target_role) = decision.target_role.as_deref() else {
         return Ok(None);
     };
@@ -403,11 +400,19 @@ fn apply_trigger_guardrails(
     if guardrail_stats.recent >= u64::from(guardrails.max_dispatches_per_window) {
         return Ok(Some("guardrail_rate".to_string()));
     }
-    if guardrails.deny_immediate_self_loop
-        && guardrail_stats.last_directive.as_deref() == Some(directive)
-        && guardrail_stats.last_target_role.as_deref() == Some(target_role)
-    {
-        return Ok(Some("guardrail_self_loop".to_string()));
+    // Self-loop guardrail is meant to prevent trigger-fired dispatches that target the same
+    // principal that produced the triggering event (codex<->codex ping-pong is handled by
+    // rate/depth/cooldown, and we still want humans to be able to send repeated follow-ups).
+    if guardrails.deny_immediate_self_loop {
+        let actor = record
+            .actor_login
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        if !actor.is_empty() && actor == target_role.trim().to_ascii_lowercase() {
+            return Ok(Some("guardrail_self_loop".to_string()));
+        }
     }
     if guardrails.cooldown_sec > 0
         && let Some(last_created_at) = guardrail_stats.last_created_at.as_deref()
