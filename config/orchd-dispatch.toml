@@ -93,14 +93,3 @@ max_dispatches_per_window = 12
 window_sec = 3600
 cooldown_sec = 60
 deny_immediate_self_loop = true
-
-[[triggers]]
-id = "closed_issue_poke"
-event = "issues"
-actions = ["closed"]
-priority = 0
-apply_guardrails = true
-
-[triggers.action]
-directive = "reply"
-target_role = "codex-orch"

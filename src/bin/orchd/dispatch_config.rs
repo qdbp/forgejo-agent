@@ -187,11 +187,12 @@ impl DispatchRankAclConfig {
             .ok_or_else(|| anyhow!("target role '{target_role}' has no rank ACL policy"))?;
 
         let strict_downrank = actor_policy.rank > target_policy.rank;
-        let uprank_reply_exception =
-            directive == DIRECTIVE_REPLY && actor_policy.rank < target_policy.rank;
-        if !strict_downrank && !uprank_reply_exception {
+        let is_reply = directive == DIRECTIVE_REPLY;
+        let uprank_reply_exception = is_reply && actor_policy.rank < target_policy.rank;
+        let self_reply_exception = is_reply && actor_login == target_role;
+        if !strict_downrank && !uprank_reply_exception && !self_reply_exception {
             return Err(anyhow!(
-                "actor '{actor_login}' rank {} cannot delegate directive '{directive}' to role '{target_role}' rank {} (requires strict downrank; only uprank exception is reply)",
+                "actor '{actor_login}' rank {} cannot delegate directive '{directive}' to role '{target_role}' rank {} (requires strict downrank; reply exceptions: uprank and self-edge)",
                 actor_policy.rank,
                 target_policy.rank
             ));
@@ -2106,10 +2107,10 @@ own_directives = ["reply", "design"]
 delegation_directives = ["reply", "design"]
 own_directives = ["reply", "design"]
 
-[rank_acl.ranks."OF-2"]
-delegation_directives = ["reply"]
-own_directives = ["reply"]
-"#,
+	[rank_acl.ranks."OF-2"]
+	delegation_directives = ["reply", "impl"]
+	own_directives = ["reply", "impl"]
+	"#,
             preamble = prompts_dir.join("orchd-preamble.md").display(),
             fresh = prompts_dir.join("orchd-envelope-fresh.md").display(),
             followup = prompts_dir.join("orchd-envelope-followup.md").display(),
@@ -2146,6 +2147,18 @@ own_directives = ["reply"]
         assert!(
             acl.assert_actor_can_dispatch("codex-dev", "codex-lead", "reply")
                 .is_ok()
+        );
+
+        // self-edge: reply to self is always allowed.
+        assert!(
+            acl.assert_actor_can_dispatch("codex-orch", "codex-orch", "reply")
+                .is_ok()
+        );
+
+        // strict downrank: non-reply self delegation is rejected.
+        assert!(
+            acl.assert_actor_can_dispatch("codex-dev", "codex-dev", "impl")
+                .is_err()
         );
 
         // downrank delegation allowed: main (OF-10) to orch (OF-8).
