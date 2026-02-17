@@ -12,11 +12,16 @@ pub(super) const DIRECTIVE_DESIGN: &str = "design";
 pub(super) const DIRECTIVE_INVESTIGATE: &str = "investigate";
 pub(super) const DIRECTIVE_IMPL: &str = "impl";
 pub(super) const DIRECTIVE_REPLY: &str = "reply";
+pub(super) const DIRECTIVE_AUDIT: &str = "audit";
 
 pub(super) fn directive_is_known(directive: &str) -> bool {
     matches!(
         directive,
-        DIRECTIVE_DESIGN | DIRECTIVE_INVESTIGATE | DIRECTIVE_IMPL | DIRECTIVE_REPLY
+        DIRECTIVE_DESIGN
+            | DIRECTIVE_INVESTIGATE
+            | DIRECTIVE_IMPL
+            | DIRECTIVE_REPLY
+            | DIRECTIVE_AUDIT
     )
 }
 
@@ -31,7 +36,7 @@ pub(super) fn directive_serializes_repo(directive: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        DIRECTIVE_DESIGN, DIRECTIVE_IMPL, DIRECTIVE_INVESTIGATE, DIRECTIVE_REPLY,
+        DIRECTIVE_AUDIT, DIRECTIVE_DESIGN, DIRECTIVE_IMPL, DIRECTIVE_INVESTIGATE, DIRECTIVE_REPLY,
         directive_is_known, directive_uses_worktree,
     };
 
@@ -41,10 +46,16 @@ mod tests {
     }
 
     #[test]
+    fn audit_is_a_known_directive() {
+        assert!(directive_is_known(DIRECTIVE_AUDIT));
+    }
+
+    #[test]
     fn only_impl_uses_a_worktree() {
         assert!(directive_uses_worktree(DIRECTIVE_IMPL));
         assert!(!directive_uses_worktree(DIRECTIVE_DESIGN));
         assert!(!directive_uses_worktree(DIRECTIVE_INVESTIGATE));
         assert!(!directive_uses_worktree(DIRECTIVE_REPLY));
+        assert!(!directive_uses_worktree(DIRECTIVE_AUDIT));
     }
 }

@@ -1102,6 +1102,28 @@ pub(super) fn latest_issue_active_dispatch(
     Ok(dispatch)
 }
 
+pub(super) fn latest_issue_dispatch_id(
+    db_path: &Path,
+    repo_full_name: &str,
+    issue_number: u64,
+) -> Result<Option<i64>> {
+    let conn = open_db(db_path)?;
+    conn.query_row(
+        r"
+        SELECT id
+        FROM dispatches
+        WHERE repo_full_name = ?1
+          AND issue_number = ?2
+        ORDER BY id DESC
+        LIMIT 1
+        ",
+        params![repo_full_name, i64::try_from(issue_number)?],
+        |row| row.get::<_, i64>(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 pub(super) fn list_issue_resume_dispatches(
     db_path: &Path,
     repo_full_name: &str,

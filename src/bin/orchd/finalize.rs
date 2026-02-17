@@ -15,7 +15,8 @@ use forgejo_agent::types::OrchdRuntimeState;
 use super::cli::FinalizeDispatchArgs;
 use super::db;
 use super::forgejoctl_cmd;
-use super::lexicon::{DIRECTIVE_IMPL, directive_uses_worktree};
+use super::inquisition::{InquisitionSpec, maybe_spawn_inquisition};
+use super::lexicon::{DIRECTIVE_AUDIT, DIRECTIVE_IMPL, directive_uses_worktree};
 use super::repo;
 use super::telemetry::record_phase_latency_ms;
 use super::template;
@@ -653,6 +654,38 @@ pub(super) fn finalize_dispatch_command(args: FinalizeDispatchArgs) -> Result<()
             phase_state_start.elapsed().as_secs_f64() * 1000.0,
             "ok",
         );
+    }
+
+    if status_spec.runtime_state == OrchdRuntimeState::Failed
+        && args.role_name != "codex-audit"
+        && args.directive != DIRECTIVE_AUDIT
+    {
+        let default_owner =
+            AgentConfig::load(args.forgejo_config.clone(), Some(args.token_file.clone()))
+                .map(|cfg| cfg.default_repo.owner)
+                .unwrap_or_else(|_| args.issue_ref.repo.owner.clone());
+        let identity = super::projection::CommentIdentity {
+            forgejoctl_bin: args.forgejoctl_bin.clone(),
+            config_file: args.forgejo_config.clone(),
+            token_file: args.token_file.clone(),
+        };
+        let spec = InquisitionSpec {
+            source_issue: args.issue_ref.clone(),
+            source_issue_title: Some(args.issue_title.clone()),
+            source_issue_url: Some(args.issue_url.clone()),
+            dispatch_id: Some(args.dispatch_id),
+            directive: Some(args.directive.clone()),
+            role_name: Some(args.role_name.clone()),
+            reason_code: status_spec.reason_code,
+            exit_code: Some(args.exit_code),
+            run_dir: Some(args.run_dir.to_string_lossy().into_owned()),
+            log_file: Some(args.log_file.to_string_lossy().into_owned()),
+            completion_file: Some(args.completion_file.to_string_lossy().into_owned()),
+            error_text: None,
+        };
+        if let Err(err) = maybe_spawn_inquisition(&args.db_path, &default_owner, &identity, spec) {
+            eprintln!("finalize-dispatch: failed spawning inquisition ticket: {err}");
+        }
     }
 
     info!("finalize dispatch completed");

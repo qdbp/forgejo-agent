@@ -49,6 +49,9 @@ mod repo;
 // forgejoctl subprocess wrapper. Read when debugging control-plane side effects (labels/state/comments) from orchd.
 mod forgejoctl_cmd;
 
+// Failure inquisition automation (spawn audit tickets on harness failures). Read when changing auto-audit behavior.
+mod inquisition;
+
 // Dispatch finalization (db terminal transitions + PR landing). Read when changing completion semantics.
 mod finalize;
 

@@ -1,5 +1,5 @@
 version = 1
-allowed_actors = ["main"]
+allowed_actors = ["main", "orchd"]
 forgejoctl_bin = "/home/main/.local/bin/forgejoctl"
 
 [roles.codex-orch]
@@ -30,20 +30,24 @@ token_file = "/home/main/.config/forgejo-agent/creds/orchd.token"
 enabled = true
 
 [rank_acl.ranks."OF-10"]
-own_directives = ["design", "investigate", "impl", "reply"]
-delegation_directives = ["design", "investigate", "impl", "reply"]
+own_directives = ["design", "investigate", "impl", "reply", "audit"]
+delegation_directives = ["design", "investigate", "impl", "reply", "audit"]
 
 [rank_acl.ranks."OF-8"]
-own_directives = ["design", "investigate", "impl", "reply"]
-delegation_directives = ["design", "investigate", "impl", "reply"]
+own_directives = ["design", "investigate", "impl", "reply", "audit"]
+delegation_directives = ["design", "investigate", "impl", "reply", "audit"]
 
 [rank_acl.ranks."OF-4"]
-own_directives = ["design", "investigate", "impl", "reply"]
-delegation_directives = ["design", "investigate", "impl", "reply"]
+own_directives = ["design", "investigate", "impl", "reply", "audit"]
+delegation_directives = ["design", "investigate", "impl", "reply", "audit"]
 
 [rank_acl.ranks."OF-2"]
 own_directives = ["impl", "reply"]
 delegation_directives = ["impl", "reply"]
+
+[rank_acl.role_overrides.codex-audit]
+own_directives = ["audit", "reply"]
+delegation_directives = ["reply"]
 
 [[repo_bindings]]
 repo = "main/forgejo-agent"
@@ -86,6 +90,11 @@ timeout_sec = 7200
 role = "codex-orch"
 prompt_file = "../prompts/orders/orchd-reply.md"
 timeout_sec = 1200
+
+[directives.audit]
+role = "codex-audit"
+prompt_file = "../prompts/orders/orchd-audit.md"
+timeout_sec = 3600
 
 [trigger_guardrails]
 max_depth_per_issue = 6

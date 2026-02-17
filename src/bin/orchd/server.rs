@@ -15,13 +15,14 @@ use serde_json::json;
 
 use forgejo_agent::api::ForgejoClient;
 use forgejo_agent::config::AgentConfig;
-use forgejo_agent::types::{OrchdRuntimeState, RepoRef};
+use forgejo_agent::types::{IssueRef, OrchdRuntimeState, RepoRef};
 
 use super::cli::{Cli, DispatchMode};
 use super::db;
 use super::dispatch;
 use super::dispatch_config::{DispatchTriggerGuardrailsConfig, load_dispatch_config};
 use super::errors::runtime_state_for_dispatch_error;
+use super::inquisition::{InquisitionSpec, maybe_spawn_inquisition};
 use super::lexicon::{DIRECTIVE_IMPL, EVENT_ISSUE_COMMENT, EVENT_ISSUES};
 use super::notifier;
 use super::paths::expand_tilde_path;
@@ -607,11 +608,12 @@ async fn process_webhook(
                                 }
                             }
                             Err(err) => {
+                                let runtime_state = runtime_state_for_dispatch_error(&err);
                                 let projection = projection::project_issue_runtime_state(
                                     state.clone(),
                                     &record.repo_full_name,
                                     issue_number,
-                                    runtime_state_for_dispatch_error(&err),
+                                    runtime_state,
                                     Some(err.reason_code()),
                                     dispatch_identity.clone(),
                                 )
@@ -626,6 +628,89 @@ async fn process_webhook(
                                         }
                                     }
                                 }
+
+                                if runtime_state == OrchdRuntimeState::Failed
+                                    && decision.target_role.as_deref() != Some("codex-audit")
+                                    && decision.directive.as_deref() != Some("audit")
+                                    && let Some(identity) = dispatch_identity.clone()
+                                {
+                                    let db_path = state.db_path.clone();
+                                    let default_owner = state.cfg.default_repo.owner.clone();
+                                    let repo_full_name = record.repo_full_name.clone();
+                                    let repo_full_name_for_log = repo_full_name.clone();
+                                    let directive = decision.directive.clone();
+                                    let role_name = decision.target_role.clone();
+                                    let reason_code = err.reason_code().to_string();
+                                    let reason_code_for_log = reason_code.clone();
+                                    let error_text = err.to_string();
+                                    let spawn_outcome = tokio::task::spawn_blocking(move || {
+                                        let repo = RepoRef::parse(&repo_full_name)
+                                            .context("invalid repo_full_name")?;
+                                        let source_issue = IssueRef {
+                                            repo,
+                                            number: issue_number,
+                                        };
+                                        let dispatch_id = db::latest_issue_dispatch_id(
+                                            &db_path,
+                                            &repo_full_name,
+                                            issue_number,
+                                        )
+                                        .ok()
+                                        .flatten();
+                                        let run_dir = dispatch_id.and_then(|dispatch_id| {
+                                            db_path.parent().map(|parent| {
+                                                parent
+                                                    .join("dispatch-runs")
+                                                    .join(format!("dispatch-{dispatch_id}"))
+                                                    .to_string_lossy()
+                                                    .into_owned()
+                                            })
+                                        });
+                                        let spec = InquisitionSpec {
+                                            source_issue,
+                                            source_issue_title: None,
+                                            source_issue_url: None,
+                                            dispatch_id,
+                                            directive,
+                                            role_name,
+                                            reason_code,
+                                            exit_code: None,
+                                            run_dir,
+                                            log_file: None,
+                                            completion_file: None,
+                                            error_text: Some(error_text),
+                                        };
+                                        maybe_spawn_inquisition(
+                                            &db_path,
+                                            &default_owner,
+                                            &identity,
+                                            spec,
+                                        )
+                                    })
+                                    .await;
+                                    match spawn_outcome {
+                                        Ok(Ok(())) => {}
+                                        Ok(Err(err)) => log_line(
+                                            "inquisition_spawn_failed",
+                                            json!({
+                                                "repo": repo_full_name_for_log,
+                                                "issue_number": issue_number,
+                                                "reason_code": reason_code_for_log,
+                                                "error": err.to_string(),
+                                            }),
+                                        ),
+                                        Err(err) => log_line(
+                                            "inquisition_spawn_join_failed",
+                                            json!({
+                                                "repo": repo_full_name_for_log,
+                                                "issue_number": issue_number,
+                                                "reason_code": reason_code_for_log,
+                                                "error": err.to_string(),
+                                            }),
+                                        ),
+                                    }
+                                }
+
                                 if status_error.is_none() {
                                     status_error =
                                         Some(format!("dispatch {}: {}", err.reason_code(), err));

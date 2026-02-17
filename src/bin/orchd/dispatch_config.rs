@@ -10,8 +10,8 @@ use forgejo_agent::orchd_dispatch_core::DispatchNotificationPhase;
 use forgejo_agent::types::RepoRef;
 
 use super::lexicon::{
-    DIRECTIVE_DESIGN, DIRECTIVE_IMPL, DIRECTIVE_INVESTIGATE, DIRECTIVE_REPLY, EVENT_ISSUE_COMMENT,
-    EVENT_ISSUES, directive_is_known,
+    DIRECTIVE_AUDIT, DIRECTIVE_DESIGN, DIRECTIVE_IMPL, DIRECTIVE_INVESTIGATE, DIRECTIVE_REPLY,
+    EVENT_ISSUE_COMMENT, EVENT_ISSUES, directive_is_known,
 };
 use super::paths::expand_tilde_path;
 
@@ -685,6 +685,7 @@ fn default_rank_directives() -> BTreeMap<DispatchRank, DispatchRankAclRankPolicy
         DIRECTIVE_INVESTIGATE,
         DIRECTIVE_IMPL,
         DIRECTIVE_REPLY,
+        DIRECTIVE_AUDIT,
     ];
     let all_directives = all_directives
         .into_iter()
