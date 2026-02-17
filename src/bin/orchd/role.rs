@@ -1190,9 +1190,10 @@ allowed_actors = ["main"]
 [rank_acl]
 enabled = true
 
-[rank_acl.ranks."OF-10"]
-directives = ["poke"]
-"#;
+	[rank_acl.ranks."OF-10"]
+	own_directives = ["reply"]
+	delegation_directives = ["reply"]
+	"#;
         assert!(assert_rank_defined(dispatch_config, "OF-10").is_ok());
         assert!(assert_rank_defined(dispatch_config, "OF-8").is_err());
     }

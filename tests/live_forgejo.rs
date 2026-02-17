@@ -977,7 +977,6 @@ impl LiveHarness {
 
 #[derive(Debug, Clone, Copy)]
 enum OrchdTestDirective {
-    Poke,
     Reply,
     Impl,
 }
@@ -985,7 +984,6 @@ enum OrchdTestDirective {
 impl OrchdTestDirective {
     const fn as_str(self) -> &'static str {
         match self {
-            Self::Poke => "poke",
             Self::Reply => "reply",
             Self::Impl => "impl",
         }
@@ -993,7 +991,7 @@ impl OrchdTestDirective {
 
     const fn prompt_file(self) -> &'static str {
         match self {
-            Self::Poke | Self::Reply => "orders/orchd-poke.md",
+            Self::Reply => "orders/orchd-reply.md",
             Self::Impl => "orders/orchd-impl.md",
         }
     }
@@ -1038,7 +1036,7 @@ fn ensure_test_prompt_bundle(config_path: &Path, actor: &str) -> Result<PathBuf>
         "orchd-issue-followup.md",
         "orders/orchd-impl.md",
         "orders/orchd-design.md",
-        "orders/orchd-poke.md",
+        "orders/orchd-reply.md",
         "orders/orchd-investigate.md",
     ];
     for file in prompt_files {
@@ -1588,7 +1586,7 @@ fn live_orchd_local_backend_smoke() -> Result<()> {
             codex_bin: &fake_codex,
             token_file: &harness.token_path,
             forgejoctl: &forgejoctl,
-            directives: &[OrchdTestDirective::Poke],
+            directives: &[OrchdTestDirective::Reply],
             timeout_sec: 10,
         },
     )?;

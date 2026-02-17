@@ -68,7 +68,7 @@ Start a line with one of these shorthands in an issue body/comment:
 - `@codex-orch design` (or `codex-orch design`)
 - `@codex-orch investigate` (or `codex-orch investigate`)
 - `@codex-orch impl` (or `codex-orch impl`)
-- `@codex-orch poke` (or `codex-orch poke`)
+- `@codex-orch reply` (or `codex-orch reply`; `poke` is accepted as an alias)
 - `@codex-lead design` (or `codex-lead design`)
 - `@codex-dev impl` (or `codex-dev impl`)
 
@@ -80,7 +80,7 @@ Current semantics:
 - `design`: produce high-level design/spec response and drive state toward `spec`.
 - `investigate`: run bounded feasibility/current-state/options discovery in read-only mode; include evidence and concrete next-step guidance without auto-advancing workflow state.
 - `impl`: execute implementation loop and autoland to `main` on success (multiple impl turns may run in parallel; conflicts are handled via follow-up rebase turns).
-- `poke`: conversational “status/next action” response (read-only).
+- `reply`: conversational “status/next action” response (read-only); `poke` is an alias.
 
 Role note:
 - Roles are templates, not singular "people"; one role can be materialized in many parallel issue contexts.

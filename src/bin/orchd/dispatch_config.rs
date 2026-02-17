@@ -10,8 +10,8 @@ use forgejo_agent::orchd_dispatch_core::DispatchNotificationPhase;
 use forgejo_agent::types::RepoRef;
 
 use super::lexicon::{
-    DIRECTIVE_DESIGN, DIRECTIVE_IMPL, DIRECTIVE_INVESTIGATE, DIRECTIVE_POKE, DIRECTIVE_REPLY,
-    EVENT_ISSUE_COMMENT, EVENT_ISSUES, directive_is_known,
+    DIRECTIVE_DESIGN, DIRECTIVE_IMPL, DIRECTIVE_INVESTIGATE, DIRECTIVE_REPLY, EVENT_ISSUE_COMMENT,
+    EVENT_ISSUES, directive_is_known,
 };
 use super::paths::expand_tilde_path;
 
@@ -535,23 +535,15 @@ impl Default for DispatchRankAclConfigFile {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DispatchRankAclRankConfigFile {
-    #[serde(default)]
-    directives: Vec<String>,
-    #[serde(default)]
-    own_directives: Vec<String>,
-    #[serde(default)]
-    delegation_directives: Vec<String>,
+    own_directives: Option<Vec<String>>,
+    delegation_directives: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DispatchRankAclRoleOverrideConfigFile {
-    #[serde(default)]
-    directives: Vec<String>,
-    #[serde(default)]
-    own_directives: Vec<String>,
-    #[serde(default)]
-    delegation_directives: Vec<String>,
+    own_directives: Option<Vec<String>>,
+    delegation_directives: Option<Vec<String>>,
 }
 
 fn default_codex_bin() -> String {
@@ -668,7 +660,6 @@ fn default_rank_directives() -> BTreeMap<DispatchRank, DispatchRankAclRankPolicy
         DIRECTIVE_INVESTIGATE,
         DIRECTIVE_IMPL,
         DIRECTIVE_REPLY,
-        DIRECTIVE_POKE,
     ];
     let all_directives = all_directives
         .into_iter()
@@ -689,7 +680,7 @@ fn default_rank_directives() -> BTreeMap<DispatchRank, DispatchRankAclRankPolicy
     policies.insert(
         DispatchRank(2),
         acl_policy_with_shared_directives(
-            [DIRECTIVE_IMPL, DIRECTIVE_REPLY, DIRECTIVE_POKE]
+            [DIRECTIVE_IMPL, DIRECTIVE_REPLY]
                 .into_iter()
                 .map(ToOwned::to_owned)
                 .collect(),
@@ -730,49 +721,32 @@ fn parse_acl_directive_set(
 fn compile_acl_directive_surfaces(
     config_path: &Path,
     source_prefix: &str,
-    legacy_directives: Vec<String>,
-    own_directives: Vec<String>,
-    delegation_directives: Vec<String>,
+    own_directives: Option<Vec<String>>,
+    delegation_directives: Option<Vec<String>>,
 ) -> Result<DispatchRankAclRankPolicy> {
-    let has_own = !own_directives.is_empty();
-    let has_delegation = !delegation_directives.is_empty();
-    if (has_own || has_delegation) && !legacy_directives.is_empty() {
-        return Err(anyhow!(
-            "dispatch config {} {} mixes legacy 'directives' with 'own_directives'/'delegation_directives'",
+    let own_directives = own_directives.ok_or_else(|| {
+        anyhow!(
+            "dispatch config {} {} is missing required key 'own_directives'",
             config_path.display(),
             source_prefix
-        ));
-    }
-
-    if !has_own && !has_delegation {
-        let directives = parse_acl_directive_set(
-            config_path,
-            &format!("{source_prefix}.directives"),
-            legacy_directives,
-        )?;
-        return Ok(acl_policy_with_shared_directives(directives));
-    }
-
-    let own_seed = if has_own {
-        own_directives.clone()
-    } else {
-        delegation_directives.clone()
-    };
-    let delegation_seed = if has_delegation {
-        delegation_directives
-    } else {
-        own_directives
-    };
-
+        )
+    })?;
+    let delegation_directives = delegation_directives.ok_or_else(|| {
+        anyhow!(
+            "dispatch config {} {} is missing required key 'delegation_directives'",
+            config_path.display(),
+            source_prefix
+        )
+    })?;
     let own = parse_acl_directive_set(
         config_path,
         &format!("{source_prefix}.own_directives"),
-        own_seed,
+        own_directives,
     )?;
     let delegation = parse_acl_directive_set(
         config_path,
         &format!("{source_prefix}.delegation_directives"),
-        delegation_seed,
+        delegation_directives,
     )?;
     Ok(DispatchRankAclRankPolicy {
         own_directives: own,
@@ -851,7 +825,6 @@ fn compile_rank_acl_config(
         let policy = compile_acl_directive_surfaces(
             config_path,
             &source,
-            rank_policy.directives,
             rank_policy.own_directives,
             rank_policy.delegation_directives,
         )?;
@@ -878,7 +851,6 @@ fn compile_rank_acl_config(
         let policy = compile_acl_directive_surfaces(
             config_path,
             &source,
-            role_policy.directives,
             role_policy.own_directives,
             role_policy.delegation_directives,
         )?;
@@ -1651,7 +1623,7 @@ prompt_file = "{reply_prompt}"
             followup = prompts_dir.join("orchd-envelope-followup.md").display(),
             token = root.join("token.txt").display(),
             design_prompt = prompts_dir.join("orders").join("orchd-design.md").display(),
-            reply_prompt = prompts_dir.join("orders").join("orchd-poke.md").display(),
+            reply_prompt = prompts_dir.join("orders").join("orchd-reply.md").display(),
         );
         fs::write(&config_path, config_toml)?;
 
@@ -1691,9 +1663,9 @@ followup_envelope = "{followup}"
 [roles.codex-orch]
 token_file = "{token}"
 
-[directives.poke]
+[directives.reply]
 role = "codex-orch"
-prompt_file = "{poke_prompt}"
+prompt_file = "{reply_prompt}"
 
 [[triggers]]
 id = "bad"
@@ -1708,7 +1680,7 @@ target_role = "codex-orch"
             fresh = prompts_dir.join("orchd-envelope-fresh.md").display(),
             followup = prompts_dir.join("orchd-envelope-followup.md").display(),
             token = root.join("token.txt").display(),
-            poke_prompt = prompts_dir.join("orders").join("orchd-poke.md").display(),
+            reply_prompt = prompts_dir.join("orders").join("orchd-reply.md").display(),
         );
         fs::write(&config_path, config_toml)?;
 
@@ -1755,15 +1727,15 @@ token_file = "{shared_token}"
 [roles.codex-b]
 token_file = "{shared_token}"
 
-[directives.poke]
+[directives.reply]
 role = "codex-a"
-prompt_file = "{poke_prompt}"
+prompt_file = "{reply_prompt}"
 "#,
             preamble = prompts_dir.join("orchd-preamble.md").display(),
             fresh = prompts_dir.join("orchd-envelope-fresh.md").display(),
             followup = prompts_dir.join("orchd-envelope-followup.md").display(),
             shared_token = shared_token.display(),
-            poke_prompt = prompts_dir.join("orders").join("orchd-poke.md").display(),
+            reply_prompt = prompts_dir.join("orders").join("orchd-reply.md").display(),
         );
         fs::write(&config_path, config_toml)?;
 
@@ -1802,15 +1774,15 @@ followup_envelope = "{followup}"
 [roles.codex-orch]
 token_file = "{owner_token}"
 
-[directives.poke]
+[directives.reply]
 role = "codex-orch"
-prompt_file = "{poke_prompt}"
+prompt_file = "{reply_prompt}"
 "#,
             preamble = prompts_dir.join("orchd-preamble.md").display(),
             fresh = prompts_dir.join("orchd-envelope-fresh.md").display(),
             followup = prompts_dir.join("orchd-envelope-followup.md").display(),
             owner_token = owner_token.display(),
-            poke_prompt = prompts_dir.join("orders").join("orchd-poke.md").display(),
+            reply_prompt = prompts_dir.join("orders").join("orchd-reply.md").display(),
         );
         fs::write(&config_path, config_toml)?;
 
@@ -1855,16 +1827,16 @@ token_file = "{token_alpha}"
 forgejo_login = "shared-login"
 token_file = "{token_beta}"
 
-[directives.poke]
+[directives.reply]
 role = "codex-alpha"
-prompt_file = "{poke_prompt}"
+prompt_file = "{reply_prompt}"
 "#,
             preamble = prompts_dir.join("orchd-preamble.md").display(),
             fresh = prompts_dir.join("orchd-envelope-fresh.md").display(),
             followup = prompts_dir.join("orchd-envelope-followup.md").display(),
             token_alpha = root.join("alpha.token").display(),
             token_beta = root.join("beta.token").display(),
-            poke_prompt = prompts_dir.join("orders").join("orchd-poke.md").display(),
+            reply_prompt = prompts_dir.join("orders").join("orchd-reply.md").display(),
         );
         fs::write(&config_path, config_toml)?;
 
@@ -1901,15 +1873,15 @@ followup_envelope = "{followup}"
 forgejo_login = "main"
 token_file = "{token}"
 
-[directives.poke]
+[directives.reply]
 role = "codex-orch"
-prompt_file = "{poke_prompt}"
+prompt_file = "{reply_prompt}"
 "#,
             preamble = prompts_dir.join("orchd-preamble.md").display(),
             fresh = prompts_dir.join("orchd-envelope-fresh.md").display(),
             followup = prompts_dir.join("orchd-envelope-followup.md").display(),
             token = root.join("orch.token").display(),
-            poke_prompt = prompts_dir.join("orders").join("orchd-poke.md").display(),
+            reply_prompt = prompts_dir.join("orders").join("orchd-reply.md").display(),
         );
         fs::write(&config_path, config_toml)?;
 
@@ -1951,16 +1923,16 @@ token_file = "{role_token}"
 [control_plane]
 token_file = "{owner_token}"
 
-[directives.poke]
+[directives.reply]
 role = "codex-orch"
-prompt_file = "{poke_prompt}"
+prompt_file = "{reply_prompt}"
 "#,
             preamble = prompts_dir.join("orchd-preamble.md").display(),
             fresh = prompts_dir.join("orchd-envelope-fresh.md").display(),
             followup = prompts_dir.join("orchd-envelope-followup.md").display(),
             role_token = root.join("orch.token").display(),
             owner_token = owner_token.display(),
-            poke_prompt = prompts_dir.join("orders").join("orchd-poke.md").display(),
+            reply_prompt = prompts_dir.join("orders").join("orchd-reply.md").display(),
         );
         fs::write(&config_path, config_toml)?;
 
@@ -1997,21 +1969,23 @@ followup_envelope = "{followup}"
 [roles.codex-orch]
 token_file = "{token}"
 
-[rank_acl.ranks."OF-8"]
-directives = ["reply"]
-
-[rank_acl.role_overrides.codex-orch]
-directives = ["reply", "impl"]
-
-[directives.reply]
-role = "codex-orch"
-prompt_file = "{reply_prompt}"
+	[rank_acl.ranks."OF-8"]
+	own_directives = ["reply"]
+	delegation_directives = ["reply"]
+	
+	[rank_acl.role_overrides.codex-orch]
+	own_directives = ["reply", "impl"]
+	delegation_directives = ["reply", "impl"]
+	
+	[directives.reply]
+	role = "codex-orch"
+	prompt_file = "{reply_prompt}"
 "#,
             preamble = prompts_dir.join("orchd-preamble.md").display(),
             fresh = prompts_dir.join("orchd-envelope-fresh.md").display(),
             followup = prompts_dir.join("orchd-envelope-followup.md").display(),
             token = root.join("token.txt").display(),
-            reply_prompt = prompts_dir.join("orders").join("orchd-poke.md").display(),
+            reply_prompt = prompts_dir.join("orders").join("orchd-reply.md").display(),
         );
         fs::write(&config_path, config_toml)?;
 
@@ -2063,7 +2037,7 @@ prompt_file = "{reply_prompt}"
             prompts_dir.join("orchd-envelope-followup.md"),
             "{{dispatch_md}}\n",
         )?;
-        fs::write(orders_dir.join("orchd-poke.md"), "poke\n")?;
+        fs::write(orders_dir.join("orchd-reply.md"), "reply\n")?;
         fs::write(root.join("orch.token"), "orch\n")?;
         fs::write(root.join("lead.token"), "lead\n")?;
         fs::write(root.join("dev.token"), "dev\n")?;
@@ -2092,9 +2066,9 @@ token_file = "{dev_token}"
 [roles.codex-auditor]
 token_file = "{auditor_token}"
 
-[directives.reply]
-role = "codex-orch"
-prompt_file = "{poke_prompt}"
+	[directives.reply]
+	role = "codex-orch"
+	prompt_file = "{reply_prompt}"
 
 [rank_acl.ranks."OF-10"]
 delegation_directives = ["reply", "design"]
@@ -2119,7 +2093,7 @@ own_directives = ["reply"]
             lead_token = root.join("lead.token").display(),
             dev_token = root.join("dev.token").display(),
             auditor_token = root.join("auditor.token").display(),
-            poke_prompt = orders_dir.join("orchd-poke.md").display(),
+            reply_prompt = orders_dir.join("orchd-reply.md").display(),
         );
         fs::write(&config_path, config_toml)?;
 

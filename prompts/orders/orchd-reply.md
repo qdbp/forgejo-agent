@@ -1,4 +1,4 @@
-## Your Orders: poke/reply
+## Your Orders: reply (aka poke)
 
 - Read-only conversational mode.
 - Provide a quick status/next-action response.

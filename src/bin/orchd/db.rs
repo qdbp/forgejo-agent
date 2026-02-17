@@ -1511,7 +1511,7 @@ mod tests {
     use rusqlite::params;
 
     use crate::orchd::lexicon::{
-        DECISION_ACCEPTED, DIRECTIVE_IMPL, DIRECTIVE_POKE, EVENT_ISSUE_COMMENT,
+        DECISION_ACCEPTED, DIRECTIVE_IMPL, DIRECTIVE_REPLY, EVENT_ISSUE_COMMENT,
     };
 
     fn temp_db_path(label: &str) -> PathBuf {
@@ -1567,7 +1567,7 @@ mod tests {
                 "main/orchd-debug",
                 i64::try_from(issue_number).expect("issue number fits i64"),
                 "main",
-                DIRECTIVE_POKE,
+                DIRECTIVE_REPLY,
                 target_role,
                 status.as_db_str(),
                 codex_session_id,
@@ -1611,7 +1611,7 @@ mod tests {
                 "main/orchd-debug",
                 7_i64,
                 "main",
-                DIRECTIVE_POKE,
+                DIRECTIVE_REPLY,
                 "codex-orch",
                 DECISION_ACCEPTED,
                 "explicit_directive",
@@ -1643,7 +1643,7 @@ mod tests {
         let first_decision_id = seed_decision_id(&db_path);
         let second_decision_id = seed_decision_id(&db_path);
 
-        let first = reserve_sample_dispatch(&db_path, first_decision_id, 7, DIRECTIVE_POKE);
+        let first = reserve_sample_dispatch(&db_path, first_decision_id, 7, DIRECTIVE_REPLY);
         let first_id = match first {
             super::DispatchReservation::Started(id) => id,
             super::DispatchReservation::InFlightIssue(_)
@@ -1656,7 +1656,7 @@ mod tests {
             vec!["mark_starting".to_string()]
         );
 
-        let second = reserve_sample_dispatch(&db_path, second_decision_id, 7, DIRECTIVE_POKE);
+        let second = reserve_sample_dispatch(&db_path, second_decision_id, 7, DIRECTIVE_REPLY);
         match second {
             super::DispatchReservation::InFlightIssue(id) => assert_eq!(id, first_id),
             super::DispatchReservation::Started(_) => {
@@ -1705,7 +1705,7 @@ mod tests {
         let db_path = temp_db_path("dispatch-autoheal");
         super::init_db(&db_path).expect("db init");
         let decision_id = seed_decision_id(&db_path);
-        let started_id = match reserve_sample_dispatch(&db_path, decision_id, 9, DIRECTIVE_POKE) {
+        let started_id = match reserve_sample_dispatch(&db_path, decision_id, 9, DIRECTIVE_REPLY) {
             super::DispatchReservation::Started(id) => id,
             super::DispatchReservation::InFlightIssue(_)
             | super::DispatchReservation::InFlightRepo(_) => {
@@ -2016,10 +2016,10 @@ mod tests {
         insert_decision(
             "trigger-b",
             "registered_trigger:closed_debrief",
-            "poke",
+            "reply",
             "codex-orch",
         );
-        insert_decision("explicit-c", "explicit_directive", "poke", "codex-orch");
+        insert_decision("explicit-c", "explicit_directive", "reply", "codex-orch");
 
         let stats = super::issue_trigger_guardrail_stats(
             &db_path,
@@ -2031,7 +2031,7 @@ mod tests {
 
         assert_eq!(stats.total, 2);
         assert_eq!(stats.recent, 2);
-        assert_eq!(stats.last_directive.as_deref(), Some("poke"));
+        assert_eq!(stats.last_directive.as_deref(), Some("reply"));
         assert_eq!(stats.last_target_role.as_deref(), Some("codex-orch"));
 
         let _ = fs::remove_file(db_path);

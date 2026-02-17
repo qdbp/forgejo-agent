@@ -9,7 +9,7 @@ struct Migration {
     apply: fn(&mut Connection) -> Result<()>,
 }
 
-const LATEST_SCHEMA_VERSION: i64 = 6;
+const LATEST_SCHEMA_VERSION: i64 = 7;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -41,6 +41,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 6,
         name: "ensure_trigger_dispatch_dedupe_table",
         apply: migration_0006_ensure_trigger_dispatch_dedupe_table,
+    },
+    Migration {
+        version: 7,
+        name: "canonicalize_poke_directive_to_reply",
+        apply: migration_0007_canonicalize_poke_directive_to_reply,
     },
 ];
 
@@ -411,7 +416,6 @@ fn foreign_keys_enabled(conn: &Connection) -> Result<bool> {
     Ok(enabled != 0)
 }
 
-#[cfg(test)]
 fn table_exists(conn: &Connection, table_name: &str) -> Result<bool> {
     let exists = conn
         .query_row(
@@ -422,6 +426,24 @@ fn table_exists(conn: &Connection, table_name: &str) -> Result<bool> {
         .optional()?
         .unwrap_or(0);
     Ok(exists != 0)
+}
+
+fn migration_0007_canonicalize_poke_directive_to_reply(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if table_exists(&tx, "decisions")? {
+        tx.execute(
+            "UPDATE decisions SET directive = 'reply' WHERE directive = 'poke'",
+            [],
+        )?;
+    }
+    if table_exists(&tx, "dispatches")? {
+        tx.execute(
+            "UPDATE dispatches SET directive = 'reply' WHERE directive = 'poke'",
+            [],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -517,11 +539,11 @@ mod tests {
         assert!(!table_has_column(&conn, "dispatches", "tmux_window").expect("pragma"));
         assert!(table_has_column(&conn, "trigger_dispatch_dedupes", "dedupe_key").expect("pragma"));
 
-        let (kind, backend_ref): (Option<String>, Option<String>) = conn
+        let (kind, backend_ref, directive): (Option<String>, Option<String>, String) = conn
             .query_row(
-                "SELECT backend_kind, backend_ref FROM dispatches WHERE id = 1",
+                "SELECT backend_kind, backend_ref, directive FROM dispatches WHERE id = 1",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .expect("query migrated dispatch");
         assert_eq!(kind.as_deref(), Some("tmux"));
@@ -529,6 +551,7 @@ mod tests {
             backend_ref.as_deref(),
             Some("codex-orch:rmain-forgejo-work-i1")
         );
+        assert_eq!(directive.as_str(), "reply");
         assert_eq!(
             current_schema_version(&conn).expect("schema version query"),
             LATEST_SCHEMA_VERSION

@@ -386,6 +386,13 @@ fn parse_directive_line(line: &str) -> Option<ParsedDirective> {
         return None;
     };
 
+    // `poke` is a user-facing alias for the canonical `reply` directive.
+    let directive = if directive == "poke" {
+        "reply".to_string()
+    } else {
+        directive
+    };
+
     if !directive_is_known(directive.as_str()) {
         return None;
     }
@@ -409,7 +416,7 @@ mod tests {
         DispatchTriggerDirectiveSource, DispatchTriggerGuards, DispatchTriggerMatcher,
         DispatchTriggerRoleSource,
     };
-    use crate::orchd::lexicon::{DECISION_ACCEPTED, DECISION_IGNORED, DIRECTIVE_POKE};
+    use crate::orchd::lexicon::{DECISION_ACCEPTED, DECISION_IGNORED, DIRECTIVE_REPLY};
     use crate::orchd::state::{EventContext, EventRecord};
 
     use super::{decide, parse_directive, trigger_dedupe_key};
@@ -449,7 +456,7 @@ mod tests {
         let decision = decide("issue_comment", Some("created"), Some(&context), None);
         assert_eq!(decision.decision, DECISION_ACCEPTED);
         assert_eq!(decision.reason_code, "explicit_directive");
-        assert_eq!(decision.directive.as_deref(), Some(DIRECTIVE_POKE));
+        assert_eq!(decision.directive.as_deref(), Some(DIRECTIVE_REPLY));
         assert_eq!(decision.target_role.as_deref(), Some("codex-orch"));
         assert!(decision.would_dispatch);
     }
@@ -476,10 +483,10 @@ mod tests {
     }
 
     #[test]
-    fn codex_alias_maps_to_orch_role() {
+    fn poke_alias_maps_to_reply_and_codex_alias_maps_to_orch_role() {
         let parsed = parse_directive("@codex poke").expect("directive should parse");
         assert_eq!(parsed.role, "codex-orch");
-        assert_eq!(parsed.directive, DIRECTIVE_POKE);
+        assert_eq!(parsed.directive, DIRECTIVE_REPLY);
     }
 
     #[test]
@@ -534,7 +541,7 @@ mod tests {
             },
             guards: DispatchTriggerGuards::default(),
             action: DispatchTriggerAction {
-                directive: DispatchTriggerDirectiveSource::Literal("poke".to_string()),
+                directive: DispatchTriggerDirectiveSource::Literal("reply".to_string()),
                 target_role: DispatchTriggerRoleSource::Literal("codex-orch".to_string()),
                 reason_code: "registered_trigger:custom.closed".to_string(),
             },

@@ -10,7 +10,7 @@ Define a practical implementation path for:
 
 1. moving orchestration runtime status from noisy comments into Forgejo labels
 2. splitting dispatch prompts into fresh-context vs follow-up-context forms
-3. enforcing directive-specific interaction contracts (`design`, `impl`, `poke`) without strict parsing of model freeform output
+3. enforcing directive-specific interaction contracts (`design`, `impl`, `reply`) without strict parsing of model freeform output
 
 This plan is optimized for rapid MVP iteration, not final architecture.
 
@@ -19,7 +19,7 @@ This plan is optimized for rapid MVP iteration, not final architecture.
 - Hierarchy: `main` -> `codex-orch` -> implementation agents (future).
 - `main` is the current human decision authority.
 - `codex-orch` is the orchestration/triage layer.
-- `poke` is conversational and read-only; intent is inferred from issue context.
+- `reply` is conversational and read-only; intent is inferred from issue context (`poke` is accepted as an alias).
 
 ## Comment Dogma (Applies To All Directives)
 
@@ -60,7 +60,7 @@ Stop conditions:
 - self-detected churn/confusion/tarpit behavior
 - temptation to change locked semantics instead of solving root cause
 
-### `poke`
+### `reply`
 
 - Read-only conversational mode.
 - Infer likely intent from issue context and recent thread activity.
@@ -107,7 +107,7 @@ Fresh envelope must include:
 1. org/authority snapshot
 2. Forgejo workflow sketch + doc pointers
 3. bug-reporting guidance (`forgejo-agent` feedback encouraged)
-4. directive contract (`design`/`impl`/`poke`)
+4. directive contract (`design`/`impl`/`reply`)
 5. task payload
 
 Follow-up envelope must include:
@@ -134,7 +134,7 @@ Scope:
 Acceptance:
 
 - follow-up prompts include only new thread content since prior dispatch
-- no full-issue replay on each poke
+- no full-issue replay on each reply
 - recovery behavior defined for missing/stale cursor
 
 ### C4: Completion + Block Protocol (Control-Plane First)
@@ -198,4 +198,4 @@ Acceptance:
 - Exact mapping from current `state/*` workflow to blocked/unblocked transitions during `impl`.
 - Whether `orchd/control/retry` is label-triggered or comment-triggered.
 - Long-term authority model for delegated reviewer/owner agents.
-- Auto-poke trigger policy and required webhook metadata (assignee context, role mapping).
+- Auto-reply trigger policy and required webhook metadata (assignee context, role mapping).

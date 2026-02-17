@@ -209,10 +209,9 @@ impl DispatchBackendAdapter for LocalBackendAdapter {
 
 fn codex_sandbox_for_directive(directive: &str) -> &'static str {
     match directive {
-        lexicon::DIRECTIVE_DESIGN
-        | lexicon::DIRECTIVE_INVESTIGATE
-        | lexicon::DIRECTIVE_REPLY
-        | lexicon::DIRECTIVE_POKE => "read-only",
+        lexicon::DIRECTIVE_DESIGN | lexicon::DIRECTIVE_INVESTIGATE | lexicon::DIRECTIVE_REPLY => {
+            "read-only"
+        }
         _ => "workspace-write",
     }
 }

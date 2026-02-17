@@ -88,7 +88,7 @@ event = "issues"
 actions = ["closed"]
 
 [triggers.action]
-directive = "poke"
+directive = "reply"
 target_role = "codex-orch"
 ```
 
