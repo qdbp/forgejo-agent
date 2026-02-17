@@ -363,19 +363,78 @@ pub(super) fn parse_directive(text: &str) -> Option<ParsedDirective> {
 }
 
 fn parse_directive_line(line: &str) -> Option<ParsedDirective> {
+    // Commands must start at the beginning of a line (no leading whitespace). We support two
+    // syntaxes:
+    // 1) `@codex-<role> <directive>` optionally followed by `,.;:` and then additional text.
+    //    If additional text is present, the directive token must be suffixed with one of `,.;:`
+    //    to avoid accidental parsing of normal prose.
+    // 2) `cc @codex-<role>` as an alias for `reply` (optionally followed by more text).
+    const TRAILER_PUNCT: &[char] = &[',', '.', ';', ':'];
+
+    if line.is_empty() {
+        return None;
+    }
+
+    // `cc @codex-orch ...` -> `@codex-orch reply ...`
+    if line.len() >= 3
+        && line.as_bytes()[0..2].eq_ignore_ascii_case(b"cc")
+        && line.as_bytes()[2].is_ascii_whitespace()
+    {
+        let mut parts = line.split_whitespace();
+        let cc_token = parts.next()?;
+        if !cc_token.eq_ignore_ascii_case("cc") {
+            return None;
+        }
+        let role_token = parts.next()?;
+        if role_token.contains(['\'', '"']) {
+            return None;
+        }
+
+        let role_token = role_token
+            .trim_end_matches(|ch: char| TRAILER_PUNCT.contains(&ch))
+            .trim_start_matches('@')
+            .to_ascii_lowercase();
+        let role = if role_token == "codex" {
+            "codex-orch".to_string()
+        } else if role_token.starts_with("codex-") {
+            role_token
+        } else {
+            return None;
+        };
+
+        return Some(ParsedDirective {
+            role,
+            directive: "reply".to_string(),
+        });
+    }
+
+    if !line.starts_with('@') {
+        return None;
+    }
+
     let mut parts = line.split_whitespace();
     let role_token = parts.next()?;
     let directive_token = parts.next()?;
-    if parts.next().is_some() {
+    let has_tail = parts.next().is_some();
+
+    if role_token.contains(['\'', '"']) || directive_token.contains(['\'', '"']) {
+        return None;
+    }
+
+    let directive_has_trailer_punct = directive_token
+        .chars()
+        .last()
+        .is_some_and(|ch| TRAILER_PUNCT.contains(&ch));
+    if has_tail && !directive_has_trailer_punct {
         return None;
     }
 
     let role_token = role_token
-        .trim_matches(|ch: char| [',', ';', ':'].contains(&ch))
+        .trim_end_matches(|ch: char| TRAILER_PUNCT.contains(&ch))
         .trim_start_matches('@')
         .to_ascii_lowercase();
     let directive = directive_token
-        .trim_matches(|ch: char| [',', ';', ':', '.'].contains(&ch))
+        .trim_end_matches(|ch: char| TRAILER_PUNCT.contains(&ch))
         .to_ascii_lowercase();
 
     let role = if role_token == "codex" {
@@ -487,6 +546,32 @@ mod tests {
         let parsed = parse_directive("@codex poke").expect("directive should parse");
         assert_eq!(parsed.role, "codex-orch");
         assert_eq!(parsed.directive, DIRECTIVE_REPLY);
+    }
+
+    #[test]
+    fn directive_with_trailing_punct_allows_same_line_text() {
+        let parsed = parse_directive("@codex-orch reply: please review")
+            .expect("directive with punctuation should parse");
+        assert_eq!(parsed.role, "codex-orch");
+        assert_eq!(parsed.directive, DIRECTIVE_REPLY);
+    }
+
+    #[test]
+    fn directive_with_tail_without_punct_is_not_parsed() {
+        assert!(parse_directive("@codex-orch reply please review").is_none());
+    }
+
+    #[test]
+    fn cc_alias_maps_to_reply() {
+        let parsed =
+            parse_directive("cc @codex-orch please review").expect("cc alias should parse");
+        assert_eq!(parsed.role, "codex-orch");
+        assert_eq!(parsed.directive, DIRECTIVE_REPLY);
+    }
+
+    #[test]
+    fn directive_requires_start_of_line() {
+        assert!(parse_directive(" @codex-orch reply: please review").is_none());
     }
 
     #[test]
