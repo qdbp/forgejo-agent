@@ -6,7 +6,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::config::AgentConfig;
-use crate::types::{ApiIssue, ApiLabel, IssueRef, OpenState, RepoRef};
+use crate::types::{ApiIssue, ApiLabel, ApiPullRequest, IssueRef, OpenState, RepoRef};
 
 #[derive(Debug, Clone)]
 pub struct ForgejoClient {
@@ -80,6 +80,29 @@ struct CreatePullRequestBody<'a> {
     base: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     body: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MergePullMethod {
+    Merge,
+    Rebase,
+    RebaseMerge,
+    Squash,
+    FastForwardOnly,
+    ManuallyMerged,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MergePullRequestBody<'a> {
+    #[serde(rename = "Do")]
+    method: MergePullMethod,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    head_commit_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delete_branch_after_merge: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    force_merge: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -279,7 +302,7 @@ impl ForgejoClient {
         head: &str,
         base: &str,
         body: &str,
-    ) -> Result<Value> {
+    ) -> Result<ApiPullRequest> {
         let path = format!("/api/v1/repos/{}/{}/pulls", repo.owner, repo.repo);
         let payload = CreatePullRequestBody {
             title,
@@ -288,6 +311,42 @@ impl ForgejoClient {
             body: Some(body),
         };
         self.send_json(cfg, &Method::POST, &path, Some(&payload))
+    }
+
+    pub fn list_pull_requests(
+        &self,
+        cfg: &AgentConfig,
+        repo: &RepoRef,
+        state: &str,
+        limit: u32,
+    ) -> Result<Vec<ApiPullRequest>> {
+        let path = format!(
+            "/api/v1/repos/{}/{}/pulls?state={state}&limit={limit}",
+            repo.owner, repo.repo
+        );
+        self.send_json(cfg, &Method::GET, &path, Option::<&()>::None)
+    }
+
+    pub fn merge_pull_request(
+        &self,
+        cfg: &AgentConfig,
+        repo: &RepoRef,
+        pr_number: u64,
+        method: MergePullMethod,
+        head_commit_id: Option<&str>,
+        delete_branch_after_merge: bool,
+    ) -> Result<()> {
+        let path = format!(
+            "/api/v1/repos/{}/{}/pulls/{}/merge",
+            repo.owner, repo.repo, pr_number
+        );
+        let payload = MergePullRequestBody {
+            method,
+            head_commit_id,
+            delete_branch_after_merge: Some(delete_branch_after_merge),
+            force_merge: None,
+        };
+        self.send_empty(cfg, &Method::POST, &path, Some(&payload))
     }
 
     pub fn get_repo(&self, cfg: &AgentConfig, repo: &RepoRef) -> Result<Option<serde_json::Value>> {

@@ -274,6 +274,27 @@ pub struct ApiLabel {
     pub name: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ApiPrBranchInfo {
+    #[serde(rename = "ref")]
+    pub ref_name: String,
+    pub sha: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ApiPullRequest {
+    pub number: u64,
+    pub state: String,
+    pub title: String,
+    pub html_url: String,
+    #[serde(default)]
+    pub merged: bool,
+    #[serde(default)]
+    pub mergeable: Option<bool>,
+    pub head: ApiPrBranchInfo,
+    pub base: ApiPrBranchInfo,
+}
+
 fn deserialize_vec_or_empty<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
 where
     D: serde::Deserializer<'de>,

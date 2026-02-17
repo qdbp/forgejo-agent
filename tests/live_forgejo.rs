@@ -374,9 +374,19 @@ impl ForgejoFixture {
         fs::create_dir_all(&cfg_dir)
             .with_context(|| format!("failed to create {}", cfg_dir.display()))?;
 
-        let token_path = cfg_dir.join("token");
+        let token_path = cfg_dir.join("itest.token");
         fs::write(&token_path, format!("{}\n", self.token))
             .with_context(|| format!("failed writing token file: {}", token_path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut perms = fs::metadata(&token_path)
+                .with_context(|| format!("failed stat {}", token_path.display()))?
+                .permissions();
+            perms.set_mode(0o600);
+            fs::set_permissions(&token_path, perms)
+                .with_context(|| format!("failed chmod {}", token_path.display()))?;
+        }
 
         let config_path = cfg_dir.join("config.env");
         let config_body = format!(
@@ -1073,6 +1083,23 @@ fn write_orchd_dispatch_toml(path: &Path, inputs: OrchdDispatchTomlInputs<'_>) -
     use std::fmt::Write as _;
 
     let prompts_dir = ensure_test_prompt_bundle(path, inputs.actor)?;
+    // Rank ACL is enabled by default; ensure the Forgejo login we use for webhook actors has a
+    // stub role card so dispatch planning doesn't fail for "actor has no rank ACL policy".
+    let forgejo_login_role_path = prompts_dir
+        .join("roles")
+        .join(format!("{}.md", inputs.forgejo_login.to_ascii_lowercase()));
+    if !forgejo_login_role_path.exists() {
+        fs::write(
+            &forgejo_login_role_path,
+            format!("# {} role card\n\n- OF-10\n", inputs.forgejo_login),
+        )
+        .with_context(|| {
+            format!(
+                "failed writing stub role card {}",
+                forgejo_login_role_path.display()
+            )
+        })?;
+    }
     let preamble = prompts_dir.join("orchd-preamble.md");
     let fresh_env = prompts_dir.join("orchd-envelope-fresh.md");
     let follow_env = prompts_dir.join("orchd-envelope-followup.md");
@@ -2015,7 +2042,7 @@ fn live_orchd_impl_autoland_updates_remote_main() -> Result<()> {
     let after_head = git.bare_head_main()?;
     let after_count = git.bare_commit_count_main()?;
     if after_head == before_head {
-        bail!("expected autoland to advance main, but head stayed at {after_head}");
+        bail!("expected landing to advance main, but head stayed at {after_head}");
     }
     if after_count != before_count + 1 {
         bail!("expected main commit count to increase by 1 ({before_count} -> {after_count})");
@@ -2143,41 +2170,45 @@ fn live_orchd_impl_dirty_principal_blocks_push() -> Result<()> {
     let final_issue = wait_for_issue_label(
         &harness,
         issue_number,
-        "orchd/state/failed",
+        "orchd/state/completed",
         Duration::from_secs(60),
     )?;
-    if !issue_has_label(&final_issue, "state/blocked")? {
-        bail!("expected autoland failure to transition issue to state/blocked");
+    if !issue_has_label(&final_issue, "state/review")? {
+        bail!("expected dirty principal to not block remote merge; wanted state/review");
     }
 
     let status_reason =
         orchd_latest_dispatch_status_reason(&db_path, &harness.repo_ref, issue_number)?
             .ok_or_else(|| anyhow!("expected latest dispatch row for issue"))?;
-    if status_reason.0 != "failed_runtime" {
+    if status_reason.0 != "completed" {
         bail!(
-            "expected failed_runtime when principal preflight blocks autoland, got status={} reason={:?}",
+            "expected completed when principal is dirty but landing still succeeds, got status={} reason={:?}",
             status_reason.0,
             status_reason.1
         );
     }
-    if status_reason.1.as_deref() != Some("autoland_failed") {
-        bail!(
-            "expected autoland_failed reason code, got {:?}",
-            status_reason.1
-        );
+    if status_reason.1.as_deref() != Some("completed") {
+        bail!("expected completed reason code, got {:?}", status_reason.1);
     }
 
     let after_head = git.bare_head_main()?;
     let after_count = git.bare_commit_count_main()?;
-    if after_head != before_head {
+    if after_head == before_head {
+        bail!("expected remote main to advance despite dirty principal");
+    }
+    if after_count != before_count + 1 {
         bail!(
-            "expected preflight failure to block remote push; main moved from {before_head} to {after_head}"
+            "expected remote main commit count to increase by 1 ({before_count} -> {after_count})"
         );
     }
-    if after_count != before_count {
-        bail!(
-            "expected preflight failure to keep commit count unchanged ({before_count} -> {after_count})"
-        );
+
+    let principal_head = stdout_trim(&git_output_checked(
+        &harness.principal_workdir,
+        &["rev-parse", "HEAD"],
+        "git rev-parse HEAD (dirty principal workspace)",
+    )?)?;
+    if principal_head == after_head {
+        bail!("expected dirty principal to skip sync (principal already at landed head)");
     }
 
     Ok(())
@@ -2311,11 +2342,11 @@ fn live_orchd_impl_principal_ahead_is_autohealed() -> Result<()> {
     let after_head = git.bare_head_main()?;
     let after_count = git.bare_commit_count_main()?;
     if after_head == before_head {
-        bail!("expected autoland to advance remote main after principal ahead autoheal");
+        bail!("expected landing to advance remote main");
     }
-    if after_count != before_count + 2 {
+    if after_count != before_count + 1 {
         bail!(
-            "expected principal ahead commit plus dispatch commit to land ({before_count} -> {after_count})"
+            "expected remote main commit count to increase by 1 ({before_count} -> {after_count})"
         );
     }
     let principal_head = stdout_trim(&git_output_checked(
@@ -2323,9 +2354,9 @@ fn live_orchd_impl_principal_ahead_is_autohealed() -> Result<()> {
         &["rev-parse", "HEAD"],
         "git rev-parse HEAD (principal workspace after ahead autoheal)",
     )?)?;
-    if principal_head != after_head {
+    if principal_head == after_head {
         bail!(
-            "expected principal workspace to sync to landed remote head (principal={principal_head} remote={after_head})"
+            "expected principal-ahead workspace to diverge (principal={principal_head} remote={after_head})"
         );
     }
 
@@ -2432,38 +2463,12 @@ fn live_orchd_impl_allows_parallel_dispatches_per_repo() -> Result<()> {
     let _ = wait_for_issue_label(
         &harness,
         issue2,
-        "orchd/state/blocked",
-        Duration::from_secs(90),
-    )?;
-
-    // Live harness posts synthetic webhooks directly to orchd. In production,
-    // the autoland-conflict retry comment would trigger this follow-up webhook.
-    post_orchd_issue_comment_webhook(
-        &orchd.client,
-        &orchd.base_url,
-        &harness.repo_ref,
-        issue2,
-        harness.fixture.owner.as_str(),
-        "@codex-orch impl",
-    )?;
-
-    let _ = wait_for_issue_label(
-        &harness,
-        issue2,
         "orchd/state/completed",
-        Duration::from_secs(90),
+        Duration::from_secs(120),
     )?;
 
     let issue2_dispatch_statuses =
         orchd_issue_dispatch_statuses(&db_path, &harness.repo_ref, issue2)?;
-    if !issue2_dispatch_statuses
-        .iter()
-        .any(|status| status == "blocked")
-    {
-        bail!(
-            "expected parallel impl conflict retry path to produce a blocked dispatch before recovery; statuses={issue2_dispatch_statuses:?}"
-        );
-    }
     if issue2_dispatch_statuses.last().map(String::as_str) != Some("completed") {
         bail!(
             "expected final dispatch status for issue2 to be completed; statuses={issue2_dispatch_statuses:?}"
@@ -2473,7 +2478,7 @@ fn live_orchd_impl_allows_parallel_dispatches_per_repo() -> Result<()> {
     let after_count = git.bare_commit_count_main()?;
     if after_count != before_count + 2 {
         bail!(
-            "expected two parallel impl runs to autoland two commits ({before_count} -> {after_count})"
+            "expected two parallel impl runs to land two commits ({before_count} -> {after_count})"
         );
     }
     let principal_count = stdout_trim(&git_output_checked(

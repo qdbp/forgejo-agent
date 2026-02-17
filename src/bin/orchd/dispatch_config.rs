@@ -139,6 +139,30 @@ impl DispatchRankAclConfig {
         self.role_policies.contains_key(role_name.as_str())
     }
 
+    pub(super) fn assert_target_can_execute(
+        &self,
+        target_role: &str,
+        directive: &str,
+    ) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        let target_role = target_role.trim().to_ascii_lowercase();
+        let directive = directive.trim().to_ascii_lowercase();
+        let target_policy = self
+            .role_policies
+            .get(target_role.as_str())
+            .ok_or_else(|| anyhow!("target role '{target_role}' has no rank ACL policy"))?;
+        if !target_policy.own_directives.contains(directive.as_str()) {
+            return Err(anyhow!(
+                "target role '{target_role}' rank {} is not permitted to execute directive '{directive}'",
+                target_policy.rank
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn assert_actor_can_dispatch(
         &self,
         actor_login: &str,

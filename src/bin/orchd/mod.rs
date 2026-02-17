@@ -19,6 +19,9 @@ mod dispatch_config;
 // Dispatch errors + mapping to control-plane orchd runtime state. Read when adjusting failure semantics.
 mod errors;
 
+// Minimal `{{token}}` prompt templating utilities. Read when changing template syntax or rendering rules.
+mod template;
+
 // Shared in-memory types (webhook payloads, decision records, app state). Read when wiring event->dispatch flow.
 mod state;
 

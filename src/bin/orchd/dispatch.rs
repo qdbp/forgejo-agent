@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::fs;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
@@ -30,6 +29,7 @@ use super::repo;
 use super::run_dispatch::{CodexSandbox, CodexSessionId, DispatchExecSpecV1};
 use super::state::{AppState, DecisionRecord, EventRecord};
 use super::telemetry::{log_line, record_phase_latency_ms};
+use super::template;
 
 pub(super) const STARTING_DISPATCH_STALE_AFTER_SEC: i64 = 120;
 
@@ -216,59 +216,6 @@ fn codex_sandbox_for_directive(directive: &str) -> CodexSandbox {
     }
 }
 
-fn unresolved_prompt_tokens(text: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut remainder = text;
-    loop {
-        let Some(start) = remainder.find("{{") else {
-            break;
-        };
-        let after_start = &remainder[start + 2..];
-        let Some(end) = after_start.find("}}") else {
-            break;
-        };
-        let key = &after_start[..end];
-        if !key.is_empty()
-            && key
-                .bytes()
-                .all(|ch| ch.is_ascii_alphanumeric() || ch == b'_')
-        {
-            tokens.push(format!("{{{{{key}}}}}"));
-        }
-        remainder = &after_start[end + 2..];
-    }
-    tokens.sort();
-    tokens.dedup();
-    tokens
-}
-
-fn render_prompt(template: &str, values: &[(&str, &str)]) -> Result<String, DispatchError> {
-    let provided_keys: HashSet<&str> = values.iter().map(|(key, _)| *key).collect();
-    let unresolved: Vec<String> = unresolved_prompt_tokens(template)
-        .into_iter()
-        .filter(|token| {
-            let key = token
-                .strip_prefix("{{")
-                .and_then(|value| value.strip_suffix("}}"))
-                .unwrap_or_default();
-            !provided_keys.contains(key)
-        })
-        .collect();
-    if !unresolved.is_empty() {
-        return Err(DispatchError::PromptTemplate(format!(
-            "unresolved prompt tokens: {}",
-            unresolved.join(", ")
-        )));
-    }
-
-    let mut text = template.to_string();
-    for (key, value) in values {
-        let token = format!("{{{{{key}}}}}");
-        text = text.replace(&token, value);
-    }
-    Ok(text)
-}
-
 fn render_fresh_preamble(
     prompt_envelopes: &DispatchPromptEnvelopeConfig,
     rank_acl: &DispatchRankAclConfig,
@@ -290,24 +237,10 @@ fn render_fresh_preamble(
     })?;
     let acl_summary_md = rank_acl.acl_summary_markdown(role_name);
     let role_card_with_acl_md = format!("{role_card_md}\n\n{acl_summary_md}");
-    render_prompt(
+    template::render_prompt(
         &preamble_template,
         &[("role_card_md", &role_card_with_acl_md)],
     )
-}
-
-fn render_prompt_file(
-    template_path: &Path,
-    values: &[(&str, &str)],
-    label: &str,
-) -> Result<String, DispatchError> {
-    let template = fs::read_to_string(template_path).map_err(|err| {
-        DispatchError::Io(format!(
-            "failed reading {label} template {}: {err}",
-            template_path.display()
-        ))
-    })?;
-    render_prompt(&template, values)
 }
 
 fn render_dispatch_md(
@@ -326,7 +259,7 @@ fn render_dispatch_md(
         _ => "a Forgejo webhook event triggered dispatch",
     };
     let issue_ref = plan.issue_ref.to_string();
-    render_prompt_file(
+    template::render_prompt_file(
         &prompt_envelopes.turn_context_file,
         &[
             ("actor", &plan.actor),
@@ -350,7 +283,7 @@ fn render_issue_md(
         } else {
             plan.issue_body.as_str()
         };
-        render_prompt_file(
+        template::render_prompt_file(
             &prompt_envelopes.issue_fresh_file,
             &[("issue_title", issue_title), ("issue_body", issue_body)],
             "issue fresh",
@@ -361,7 +294,7 @@ fn render_issue_md(
         } else {
             plan.issue_delta_summary.as_str()
         };
-        render_prompt_file(
+        template::render_prompt_file(
             &prompt_envelopes.issue_followup_file,
             &[("issue_title", issue_title), ("issue_delta", issue_delta)],
             "issue followup",
@@ -568,7 +501,11 @@ async fn plan_dispatch(
         .to_ascii_lowercase();
     let self_directive =
         decision.reason_code == "explicit_directive" && !actor.is_empty() && actor == role_name;
-    let bypass_allowlist = self_directive || dispatch_config.rank_acl.has_role_policy(&actor);
+    // Assignee replies are implicitly scoped by the ticket assignment itself; allowlist applies to
+    // explicit directives, not to "reply because you're assigned here" triggers.
+    let assignee_reply = decision.reason_code == "assignee_reply";
+    let bypass_allowlist =
+        self_directive || assignee_reply || dispatch_config.rank_acl.has_role_policy(&actor);
     let policy_decision = if bypass_allowlist
         || dispatch_config
             .allowed_actors
@@ -582,10 +519,17 @@ async fn plan_dispatch(
     if policy_decision.outcome != DispatchPolicyOutcome::Allow {
         return Err(DispatchError::ActorNotAllowed(actor));
     }
-    dispatch_config
-        .rank_acl
-        .assert_actor_can_dispatch(&actor, &role_name, directive_name)
-        .map_err(|err| DispatchError::RankAclDenied(err.to_string()))?;
+    if assignee_reply {
+        dispatch_config
+            .rank_acl
+            .assert_target_can_execute(&role_name, directive_name)
+            .map_err(|err| DispatchError::RankAclDenied(err.to_string()))?;
+    } else {
+        dispatch_config
+            .rank_acl
+            .assert_actor_can_dispatch(&actor, &role_name, directive_name)
+            .map_err(|err| DispatchError::RankAclDenied(err.to_string()))?;
+    }
 
     let issue_number = record
         .issue_number
@@ -822,7 +766,7 @@ fn materialize_run_artifacts(
             plan.directive.prompt_file.display()
         ))
     })?;
-    let orders_md = render_prompt(&orders_template, &[])?;
+    let orders_md = template::render_prompt(&orders_template, &[])?;
 
     let (prompt_mode, envelope_path) = if plan.issue_session_id.is_some() {
         (
@@ -852,7 +796,7 @@ fn materialize_run_artifacts(
             envelope_path.display()
         ))
     })?;
-    let prompt = render_prompt(
+    let prompt = template::render_prompt(
         &envelope_template,
         &[
             ("preamble_md", &preamble_md),
@@ -1116,7 +1060,7 @@ mod tests {
 
     #[test]
     fn render_prompt_allows_brace_literals_in_injected_values() {
-        let rendered = super::render_prompt(
+        let rendered = super::template::render_prompt(
             "{{issue_md}}",
             &[(
                 "issue_md",
@@ -1129,7 +1073,7 @@ mod tests {
 
     #[test]
     fn render_prompt_rejects_missing_template_values() {
-        let err = super::render_prompt("{{missing_key}}", &[])
+        let err = super::template::render_prompt("{{missing_key}}", &[])
             .expect_err("expected unresolved template token error");
         assert!(matches!(err, DispatchError::PromptTemplate(_)));
     }
