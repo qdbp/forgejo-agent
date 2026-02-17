@@ -53,15 +53,6 @@ struct RoleCheckReport {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct ForgejoUser {
-    login: String,
-    #[serde(default)]
-    is_admin: bool,
-    #[serde(default)]
-    active: bool,
-}
-
-#[derive(Debug, Clone, Deserialize)]
 struct ForgejoTokenResponse {
     #[serde(default)]
     id: Option<i64>,
@@ -73,6 +64,13 @@ struct ForgejoTokenResponse {
 #[derive(Debug, Clone, Deserialize)]
 struct ForgejoApiErrorBody {
     message: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RoleTokenPrincipal {
+    login: String,
+    active: Option<bool>,
+    is_admin: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -509,58 +507,42 @@ fn evaluate_roles(
             }
         }
 
-        let token_login = if let Some(token) = token_contents.as_deref() {
-            match whoami_login_with_token(client, cfg, token) {
-                Ok(login) => {
-                    if login != role_cfg.forgejo_login {
+        let (token_login, user_active, user_admin) = if let Some(token) = token_contents.as_deref()
+        {
+            match whoami_with_token(client, cfg, token) {
+                Ok(principal) => {
+                    if principal.login != role_cfg.forgejo_login {
                         errors.push(format!(
                             "token resolves to '{}' but role forgejo_login is '{}'",
-                            login, role_cfg.forgejo_login
+                            principal.login, role_cfg.forgejo_login
                         ));
                     }
-                    Some(login)
+                    if principal.active.is_some_and(|active| !active) {
+                        errors.push("forgejo user is inactive".to_string());
+                    }
+                    let expected_admin = expected_admin_for_role(role_name.as_str());
+                    if let Some(is_admin) = principal.is_admin {
+                        if is_admin != expected_admin {
+                            errors.push(format!(
+                                "forgejo admin flag mismatch (expected {}, got {})",
+                                expected_admin, is_admin
+                            ));
+                        }
+                    } else {
+                        warnings.push(
+                            "token whoami response missing admin flag; admin posture unverified"
+                                .to_string(),
+                        );
+                    }
+                    (Some(principal.login), principal.active, principal.is_admin)
                 }
                 Err(err) => {
                     errors.push(format!("token whoami failed: {err}"));
-                    None
+                    (None, None, None)
                 }
             }
         } else {
-            None
-        };
-
-        let (user_active, user_admin) = match fetch_user_with_token(
-            cfg.base_url.as_str(),
-            cfg.token.as_str(),
-            role_cfg.forgejo_login.as_str(),
-        ) {
-            Ok(Some(user)) => {
-                if normalize_name(user.login.as_str()) != role_cfg.forgejo_login {
-                    errors.push(format!(
-                        "forgejo user lookup resolved '{}' instead of '{}'",
-                        user.login, role_cfg.forgejo_login
-                    ));
-                }
-                if !user.active {
-                    errors.push("forgejo user is inactive".to_string());
-                }
-                let expected_admin = expected_admin_for_role(role_name.as_str());
-                if user.is_admin != expected_admin {
-                    errors.push(format!(
-                        "forgejo admin flag mismatch (expected {}, got {})",
-                        expected_admin, user.is_admin
-                    ));
-                }
-                (Some(user.active), Some(user.is_admin))
-            }
-            Ok(None) => {
-                errors.push("forgejo user does not exist".to_string());
-                (None, None)
-            }
-            Err(err) => {
-                warnings.push(format!("forgejo user lookup failed: {err}"));
-                (None, None)
-            }
+            (None, None, None)
         };
 
         checks.push(RoleCheckSummary {
@@ -697,7 +679,7 @@ fn verify_token_maps_to_login(
     token: &str,
     expected_login: &str,
 ) -> Result<()> {
-    let actual = whoami_login_with_token(client, cfg, token)?;
+    let actual = whoami_with_token(client, cfg, token)?.login;
     if actual != expected_login {
         bail!(
             "token identity mismatch: expected '{}', got '{}'",
@@ -708,11 +690,11 @@ fn verify_token_maps_to_login(
     Ok(())
 }
 
-fn whoami_login_with_token(
+fn whoami_with_token(
     client: &ForgejoClient,
     cfg: &AgentConfig,
     token: &str,
-) -> Result<String> {
+) -> Result<RoleTokenPrincipal> {
     let mut cfg = cfg.clone();
     cfg.token = token.to_string();
     let who = client.whoami(&cfg)?;
@@ -720,16 +702,22 @@ fn whoami_login_with_token(
         .get("login")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| anyhow!("whoami response missing login field"))?;
-    Ok(normalize_name(login))
+    let active = who.get("active").and_then(serde_json::Value::as_bool);
+    let is_admin = who.get("is_admin").and_then(serde_json::Value::as_bool);
+    Ok(RoleTokenPrincipal {
+        login: normalize_name(login),
+        active,
+        is_admin,
+    })
 }
 
-fn fetch_user_with_token(base_url: &str, token: &str, login: &str) -> Result<Option<ForgejoUser>> {
-    let client = Client::builder()
+fn user_exists_with_token(base_url: &str, token: &str, login: &str) -> Result<bool> {
+    let http = Client::builder()
         .user_agent("forgejo-agent/role")
         .build()
         .context("failed creating HTTP client")?;
     let url = format!("{}/api/v1/users/{}", base_url.trim_end_matches('/'), login);
-    let response = client
+    let response = http
         .request(Method::GET, &url)
         .header("Accept", "application/json")
         .header("Authorization", format!("token {token}"))
@@ -737,19 +725,14 @@ fn fetch_user_with_token(base_url: &str, token: &str, login: &str) -> Result<Opt
         .with_context(|| format!("request failed: GET {url}"))?;
 
     if response.status().as_u16() == 404 {
-        return Ok(None);
+        return Ok(false);
     }
-
-    if !response.status().is_success() {
-        let status = response.status().as_u16();
-        let body = response.text().unwrap_or_else(|_| "<no body>".to_string());
-        bail!("GET {url} failed with {status}: {body}");
+    if response.status().is_success() {
+        return Ok(true);
     }
-
-    let user = response
-        .json::<ForgejoUser>()
-        .with_context(|| format!("invalid JSON from GET {url}"))?;
-    Ok(Some(user))
+    let status = response.status().as_u16();
+    let body = response.text().unwrap_or_else(|_| "<no body>".to_string());
+    bail!("GET {url} failed with {status}: {body}");
 }
 
 fn read_admin_token(path: Option<&Path>) -> Result<String> {
@@ -773,7 +756,7 @@ fn mint_role_token(
         .build()
         .context("failed creating HTTP client")?;
 
-    let user_exists = fetch_user_with_token(base_url, admin_token, login)?.is_some();
+    let user_exists = user_exists_with_token(base_url, admin_token, login)?;
     let user_created_in_run = if user_exists {
         false
     } else {
