@@ -56,7 +56,7 @@ struct DispatchPlan {
     issue_body: String,
     issue_url: String,
     issue_session_id: Option<String>,
-    issue_delta_summary: String,
+    issue_delta_md: String,
     dispatch_id: i64,
     lock_path: PathBuf,
     run_dir: PathBuf,
@@ -283,16 +283,25 @@ fn render_issue_md(
         } else {
             plan.issue_body.as_str()
         };
+        let issue_history = if plan.issue_delta_md.trim().is_empty() {
+            "(no prior issue activity captured)"
+        } else {
+            plan.issue_delta_md.as_str()
+        };
         template::render_prompt_file(
             &prompt_envelopes.issue_fresh_file,
-            &[("issue_title", issue_title), ("issue_body", issue_body)],
+            &[
+                ("issue_title", issue_title),
+                ("issue_body", issue_body),
+                ("issue_history", issue_history),
+            ],
             "issue fresh",
         )
     } else {
-        let issue_delta = if plan.issue_delta_summary.trim().is_empty() {
+        let issue_delta = if plan.issue_delta_md.trim().is_empty() {
             "(no new issue activity)"
         } else {
-            plan.issue_delta_summary.as_str()
+            plan.issue_delta_md.as_str()
         };
         template::render_prompt_file(
             &prompt_envelopes.issue_followup_file,
@@ -584,22 +593,36 @@ async fn plan_dispatch(
         number: intent.issue_number,
     };
     let issue = fetch_issue(state.clone(), issue_ref.clone()).await?;
-    let previous_event_cursor = db::issue_role_cursor_event_id(
-        &state.db_path,
-        &intent.repo_full_name,
-        intent.issue_number,
-        &intent.role,
-    )
-    .map_err(|err| DispatchError::Db(err.to_string()))?;
+
+    // Fresh sessions must be treated as amnesiac: we do not assume any prior role memory,
+    // even if a cursor exists (e.g. if a previous session was lost or corrupted).
+    let prompt_mode_fresh = issue_session_id.is_none();
+    let previous_event_cursor = if prompt_mode_fresh {
+        None
+    } else {
+        db::issue_role_cursor_event_id(
+            &state.db_path,
+            &intent.repo_full_name,
+            intent.issue_number,
+            &intent.role,
+        )
+        .map_err(|err| DispatchError::Db(err.to_string()))?
+    };
+    let delta_limit = if prompt_mode_fresh { 2000 } else { 200 };
     let delta_rows = db::issue_delta_rows(
         &state.db_path,
         &intent.repo_full_name,
         intent.issue_number,
         previous_event_cursor,
         current_event_id,
+        delta_limit,
     )
     .map_err(|err| DispatchError::Db(err.to_string()))?;
-    let issue_delta_summary = db::summarize_issue_delta(&delta_rows);
+    let issue_delta_md = if prompt_mode_fresh {
+        db::render_issue_history(&delta_rows, delta_limit)
+    } else {
+        db::summarize_issue_delta(&delta_rows)
+    };
 
     let now = Utc::now().to_rfc3339();
     let dispatch_id = match db::reserve_dispatch_starting(
@@ -738,7 +761,7 @@ async fn plan_dispatch(
             issue_body,
             issue_url,
             issue_session_id,
-            issue_delta_summary,
+            issue_delta_md,
             dispatch_id,
             lock_path: lock_path.clone(),
             run_dir,

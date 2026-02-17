@@ -5,3 +5,6 @@ Title:
 
 Body:
 {{issue_body}}
+
+Conversation so far:
+{{issue_history}}

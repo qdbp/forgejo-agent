@@ -514,6 +514,7 @@ pub(super) fn issue_delta_rows(
     issue_number: u64,
     after_event_id: Option<i64>,
     up_to_event_id: i64,
+    limit: usize,
 ) -> Result<Vec<IssueEventDeltaRow>> {
     let conn = open_db(db_path)?;
     let start_event_id = after_event_id.unwrap_or(0_i64);
@@ -530,7 +531,7 @@ pub(super) fn issue_delta_rows(
           AND event_text IS NOT NULL
           AND event_text != ''
         ORDER BY id ASC
-        LIMIT 200
+        LIMIT ?7
         ",
     )?;
     let rows = stmt
@@ -541,7 +542,8 @@ pub(super) fn issue_delta_rows(
                 start_event_id,
                 up_to_event_id,
                 EVENT_ISSUE_COMMENT,
-                EVENT_ISSUES
+                EVENT_ISSUES,
+                i64::try_from(limit)?,
             ],
             |row| {
                 Ok(IssueEventDeltaRow {
@@ -555,6 +557,40 @@ pub(super) fn issue_delta_rows(
         )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+pub(super) fn render_issue_history(rows: &[IssueEventDeltaRow], limit: usize) -> String {
+    let comments: Vec<&IssueEventDeltaRow> = rows
+        .iter()
+        .filter(|row| row.event_type == EVENT_ISSUE_COMMENT)
+        .collect();
+    if comments.is_empty() {
+        return "(no comments yet)".to_string();
+    }
+    let mut out = comments
+        .iter()
+        .map(|row| {
+            let timestamp = row
+                .source_created_at
+                .as_deref()
+                .filter(|text| !text.trim().is_empty())
+                .unwrap_or(row.received_at.as_str());
+            let actor = row
+                .actor_login
+                .as_deref()
+                .filter(|text| !text.trim().is_empty())
+                .unwrap_or("unknown");
+            let text = row.event_text.as_deref().unwrap_or("").trim_end();
+            format!("[{timestamp}] {actor}:\n{text}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n---\n\n");
+    if rows.len() >= limit {
+        out.push_str(
+            "\n\n(note: history may be truncated; run `forgejoctl issue show <issue>` for the full thread)",
+        );
+    }
+    out
 }
 
 pub(super) fn summarize_issue_delta(rows: &[IssueEventDeltaRow]) -> String {
