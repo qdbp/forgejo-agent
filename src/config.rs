@@ -60,6 +60,14 @@ fn systemd_token_file() -> Option<PathBuf> {
     None
 }
 
+fn owner_fallback_token_for_config(config_path: &Path) -> Result<PathBuf> {
+    let cfg_dir = config_path
+        .parent()
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!("config path has no parent: {}", config_path.display()))?;
+    Ok(cfg_dir.join("token"))
+}
+
 impl AgentConfig {
     pub fn load(config_override: Option<PathBuf>, token_override: Option<PathBuf>) -> Result<Self> {
         let config_path = if let Some(path) = config_override {
@@ -98,6 +106,7 @@ impl AgentConfig {
             .parse()
             .context("invalid FORGEJO_LEASE_MINUTES")?;
 
+        let owner_fallback_token = owner_fallback_token_for_config(&config_path)?;
         let token_file = if let Some(path) = token_override {
             path
         } else if let Ok(path) = std::env::var("FORGEJO_TOKEN_FILE") {
@@ -107,12 +116,20 @@ impl AgentConfig {
         } else if let Some(path) = vars.get("FORGEJO_TOKEN_FILE") {
             expand_tilde(path)?
         } else {
-            let cfg_dir = config_path
-                .parent()
-                .map(PathBuf::from)
-                .ok_or_else(|| anyhow!("config path has no parent: {}", config_path.display()))?;
-            cfg_dir.join("token")
+            owner_fallback_token.clone()
         };
+
+        let allow_owner_token = std::env::var("FORGEJO_ALLOW_OWNER_TOKEN")
+            .ok()
+            .is_some_and(|value| value == "1");
+        if token_file == owner_fallback_token && !allow_owner_token {
+            return Err(anyhow!(
+                "owner fallback token path is disabled for automation: {}. \
+Set FORGEJO_TOKEN_FILE to a dedicated role/control token under ~/.config/forgejo-agent/creds/. \
+Use FORGEJO_ALLOW_OWNER_TOKEN=1 only for break-glass recovery.",
+                owner_fallback_token.display()
+            ));
+        }
 
         let token = fs::read_to_string(&token_file)
             .with_context(|| format!("failed to read token file: {}", token_file.display()))?;

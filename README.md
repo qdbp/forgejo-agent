@@ -16,7 +16,11 @@ Direct raw API poking is discouraged for agents.
 2. `FORGEJO_TOKEN_FILE` from process environment
 3. systemd credential `CREDENTIALS_DIRECTORY/forgejo_token`
 4. `FORGEJO_TOKEN_FILE` in config file
-5. default `~/.config/forgejo-agent/token`
+5. owner fallback token path (`~/.config/forgejo-agent/token`) only when `FORGEJO_ALLOW_OWNER_TOKEN=1` (break-glass only)
+
+Automation policy:
+- Do not run automation as `main`.
+- Use dedicated principals (`orchd`, `codex-orch`, `codex-lead`, `codex-dev`) with dedicated tokens under `~/.config/forgejo-agent/creds/`.
 
 ## Install
 

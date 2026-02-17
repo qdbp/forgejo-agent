@@ -29,6 +29,10 @@ It reads:
 - `~/.config/forgejo-agent/config.env`
 - token from `FORGEJO_TOKEN_FILE`
 
+Owner fallback token (`~/.config/forgejo-agent/token`) is deprecated for automation.
+Set `FORGEJO_TOKEN_FILE` to a dedicated non-human principal token under
+`~/.config/forgejo-agent/creds/` (recommended: `codex-orch` for MCP admin workflows).
+
 Then starts MCP in stdio mode with environment variables.
 
 If needed, pin a custom binary path in `~/.config/forgejo-agent/config.env`:

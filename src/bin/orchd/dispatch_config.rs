@@ -834,6 +834,13 @@ fn validate_role_mappings(
                 role_name
             ));
         }
+        if forgejo_login == "main" {
+            return Err(anyhow!(
+                "dispatch config {} role '{}' uses forbidden forgejo_login 'main'; use a dedicated role principal",
+                config_path.display(),
+                role_name
+            ));
+        }
         if let Some(existing) = login_owners.insert(forgejo_login.clone(), role_name.clone()) {
             return Err(anyhow!(
                 "dispatch config {} roles '{}' and '{}' share forgejo_login '{}'",
@@ -856,21 +863,31 @@ fn validate_role_mappings(
         }
     }
 
-    if let Some(control_plane) = control_plane
-        && let Some(role_name) = roles.iter().find_map(|(role_name, role)| {
+    if let Some(control_plane) = control_plane {
+        if let Some(owner_token_path) = owner_token_path.as_ref()
+            && control_plane.token_file == *owner_token_path
+        {
+            return Err(anyhow!(
+                "dispatch config {} control_plane token_file {} points to owner fallback token; use dedicated machine token under ~/.config/forgejo-agent/creds/",
+                config_path.display(),
+                control_plane.token_file.display()
+            ));
+        }
+
+        if let Some(role_name) = roles.iter().find_map(|(role_name, role)| {
             if role.token_file == control_plane.token_file {
                 Some(role_name)
             } else {
                 None
             }
-        })
-    {
-        return Err(anyhow!(
-            "dispatch config {} control_plane token_file {} is shared with role '{}'",
-            config_path.display(),
-            control_plane.token_file.display(),
-            role_name
-        ));
+        }) {
+            return Err(anyhow!(
+                "dispatch config {} control_plane token_file {} is shared with role '{}'",
+                config_path.display(),
+                control_plane.token_file.display(),
+                role_name
+            ));
+        }
     }
 
     Ok(())
@@ -1683,6 +1700,103 @@ prompt_file = "{poke_prompt}"
 
         let err = load_dispatch_config(&config_path).expect_err("config should fail");
         assert!(err.to_string().contains("share forgejo_login"));
+        Ok(())
+    }
+
+    #[test]
+    fn load_dispatch_config_rejects_role_using_main_login() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path();
+        let config_path = root.join("dispatch.toml");
+        let prompts_dir = root.join("prompts");
+        let roles_dir = prompts_dir.join("roles");
+        fs::create_dir_all(&roles_dir)?;
+        fs::write(
+            roles_dir.join("codex-orch.md"),
+            "# codex-orch role card\n\n- OF-8\n",
+        )?;
+        fs::write(roles_dir.join("main.md"), "# main role card\n\n- OF-10\n")?;
+
+        let config_toml = format!(
+            r#"version = 1
+allowed_actors = ["main"]
+legacy_triggers = false
+
+[prompt_envelopes]
+preamble_file = "{preamble}"
+fresh_envelope = "{fresh}"
+followup_envelope = "{followup}"
+
+[roles.codex-orch]
+forgejo_login = "main"
+token_file = "{token}"
+
+[directives.poke]
+role = "codex-orch"
+prompt_file = "{poke_prompt}"
+"#,
+            preamble = prompts_dir.join("orchd-preamble.md").display(),
+            fresh = prompts_dir.join("orchd-envelope-fresh.md").display(),
+            followup = prompts_dir.join("orchd-envelope-followup.md").display(),
+            token = root.join("orch.token").display(),
+            poke_prompt = prompts_dir.join("orders").join("orchd-poke.md").display(),
+        );
+        fs::write(&config_path, config_toml)?;
+
+        let err = load_dispatch_config(&config_path).expect_err("config should fail");
+        assert!(err.to_string().contains("forbidden forgejo_login 'main'"));
+        Ok(())
+    }
+
+    #[test]
+    fn load_dispatch_config_rejects_control_plane_owner_fallback_token_path() -> Result<()> {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        let owner_token = Path::new(&home).join(".config/forgejo-agent/token");
+
+        let temp = tempdir()?;
+        let root = temp.path();
+        let config_path = root.join("dispatch.toml");
+        let prompts_dir = root.join("prompts");
+        let roles_dir = prompts_dir.join("roles");
+        fs::create_dir_all(&roles_dir)?;
+        fs::write(
+            roles_dir.join("codex-orch.md"),
+            "# codex-orch role card\n\n- OF-8\n",
+        )?;
+        fs::write(roles_dir.join("main.md"), "# main role card\n\n- OF-10\n")?;
+
+        let config_toml = format!(
+            r#"version = 1
+allowed_actors = ["main"]
+legacy_triggers = false
+
+[prompt_envelopes]
+preamble_file = "{preamble}"
+fresh_envelope = "{fresh}"
+followup_envelope = "{followup}"
+
+[roles.codex-orch]
+token_file = "{role_token}"
+
+[control_plane]
+token_file = "{owner_token}"
+
+[directives.poke]
+role = "codex-orch"
+prompt_file = "{poke_prompt}"
+"#,
+            preamble = prompts_dir.join("orchd-preamble.md").display(),
+            fresh = prompts_dir.join("orchd-envelope-fresh.md").display(),
+            followup = prompts_dir.join("orchd-envelope-followup.md").display(),
+            role_token = root.join("orch.token").display(),
+            owner_token = owner_token.display(),
+            poke_prompt = prompts_dir.join("orders").join("orchd-poke.md").display(),
+        );
+        fs::write(&config_path, config_toml)?;
+
+        let err = load_dispatch_config(&config_path).expect_err("config should fail");
+        assert!(err.to_string().contains("control_plane token_file"));
+        assert!(err.to_string().contains("owner fallback token"));
         Ok(())
     }
 

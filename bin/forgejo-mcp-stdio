@@ -11,7 +11,7 @@ cfg_file="${FORGEJO_AGENT_CONFIG_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/forgejo
 source "$cfg_file"
 
 : "${FORGEJO_BASE_URL:=http://127.0.0.1:3000}"
-token_file="${FORGEJO_TOKEN_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/forgejo-agent/token}"
+token_file="${FORGEJO_TOKEN_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/forgejo-agent/creds/codex-orch.token}"
 if [[ "$token_file" == ~/* ]]; then
   token_file="$HOME/${token_file#~/}"
 fi

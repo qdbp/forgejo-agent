@@ -3,10 +3,12 @@ set -euo pipefail
 
 cfg_dir="${XDG_CONFIG_HOME:-$HOME/.config}/forgejo-agent"
 cfg_file="$cfg_dir/config.env"
-token_file="$cfg_dir/token"
+token_file="$cfg_dir/creds/codex-orch.token"
 
 mkdir -p "$cfg_dir"
 chmod 700 "$cfg_dir"
+mkdir -p "$cfg_dir/creds"
+chmod 700 "$cfg_dir/creds"
 
 if [[ ! -f "$cfg_file" ]]; then
   cat > "$cfg_file" <<CFG
@@ -23,7 +25,7 @@ FORGEJO_LEASE_MINUTES=90
 FORGEJO_BLOCKED_LABEL=state/blocked
 FORGEJO_READY_LABEL=state/ready
 
-# Token is read from this file (do not commit it).
+# Token is read from this file (do not commit it). Owner fallback token paths are deprecated.
 FORGEJO_TOKEN_FILE=$token_file
 CFG
   chmod 600 "$cfg_file"
