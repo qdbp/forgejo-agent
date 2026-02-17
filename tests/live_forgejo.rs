@@ -1238,6 +1238,34 @@ fn wait_for_issue_label(
     }
 }
 
+fn wait_for_orchd_dispatch_status(
+    db_path: &Path,
+    repo_full_name: &str,
+    issue_number: u64,
+    status: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some((latest, _)) =
+            orchd_latest_dispatch_status_reason(db_path, repo_full_name, issue_number)?
+            && latest == status
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            let latest =
+                orchd_latest_dispatch_status_reason(db_path, repo_full_name, issue_number)?
+                    .map(|(status, reason)| format!("status={status} reason={reason:?}"))
+                    .unwrap_or_else(|| "<none>".to_string());
+            bail!(
+                "timed out waiting for orchd dispatch status '{status}' on issue {repo_full_name}#{issue_number} (latest {latest})",
+            );
+        }
+        thread::sleep(Duration::from_millis(120));
+    }
+}
+
 #[derive(Debug)]
 struct OrchdTestProcess {
     base_url: String,
@@ -2047,6 +2075,249 @@ fn live_orchd_impl_pr_landing_updates_remote_main() -> Result<()> {
     if after_count != before_count + 1 {
         bail!("expected main commit count to increase by 1 ({before_count} -> {after_count})");
     }
+    let principal_head = stdout_trim(&git_output_checked(
+        &harness.principal_workdir,
+        &["rev-parse", "HEAD"],
+        "git rev-parse HEAD (principal workspace)",
+    )?)?;
+    if principal_head != after_head {
+        bail!(
+            "expected principal workspace to sync to landed commit (principal={principal_head} remote={after_head})"
+        );
+    }
+    let origin_head = stdout_trim(&git_output_checked(
+        &harness.principal_workdir,
+        &["rev-parse", "origin/main"],
+        "git rev-parse origin/main (backup remote)",
+    )?)?;
+    if origin_head == after_head {
+        bail!(
+            "expected principal sync source to be Forgejo, but principal landed on origin/main (origin={origin_head} landed={after_head})"
+        );
+    }
+
+    let final_issue = harness.get_issue(issue_number)?;
+    if !issue_has_label(&final_issue, "state/review")? {
+        bail!("expected impl success to transition issue to state/review");
+    }
+    if issue_label_prefix_count(&final_issue, "orchd/state/")? != 1 {
+        bail!("expected exactly one orchd/state/* label after impl completion");
+    }
+
+    Ok(())
+}
+
+#[test]
+#[serial(live_forgejo)]
+fn live_orchd_impl_pr_landing_rebases_and_force_leases_branch() -> Result<()> {
+    if !live_tests_enabled() {
+        eprintln!(
+            "skipping live orchd integration test; enable with {}=1",
+            LIVE_TESTS_ENV
+        );
+        return Ok(());
+    }
+
+    let harness =
+        LiveHarness::bootstrap("live_orchd_impl_pr_landing_rebases_and_force_leases_branch")?;
+    let issue_number = harness.create_issue("orchd impl rebase", "issue body", "ready")?;
+
+    let git = GitWorkspace::from_fixture(&harness.fixture, &harness.repo_name)?;
+    let before_head = git.bare_head_main()?;
+    let before_count = git.bare_commit_count_main()?;
+
+    let backup_origin = harness
+        .fixture
+        .work_path
+        .join(format!("{}-origin-backup.git", harness.repo_name));
+    let mut init_backup = Command::new("git");
+    init_backup.args(["init", "--bare"]).arg(&backup_origin);
+    run_command_checked(&mut init_backup, "git init --bare backup origin remote")?;
+    let backup_origin_str = backup_origin.to_string_lossy().into_owned();
+    git_output_checked(
+        &harness.principal_workdir,
+        &["push", &backup_origin_str, "main:main"],
+        "git push main to backup origin remote",
+    )?;
+    git_output_checked(
+        &harness.principal_workdir,
+        &["remote", "set-url", "origin", &backup_origin_str],
+        "git remote set-url origin <backup>",
+    )?;
+    let forgejo_bare = harness.fixture.repo_git_dir(&harness.repo_name);
+    let forgejo_bare_str = forgejo_bare.to_string_lossy().into_owned();
+    git_output_checked(
+        &harness.principal_workdir,
+        &["remote", "add", "forgejo", &forgejo_bare_str],
+        "git remote add forgejo <fixture bare>",
+    )?;
+    git_output_checked(
+        &harness.principal_workdir,
+        &["fetch", "origin", "main"],
+        "git fetch origin main (backup remote)",
+    )?;
+
+    let fake_codex = ensure_fake_codex_bin()?;
+    let forgejoctl = forgejo_agent_bin()?;
+
+    let dispatch_cfg_path = harness
+        .fixture
+        .work_path
+        .join("orchd-dispatch-impl-rebase.toml");
+    write_orchd_dispatch_toml(
+        &dispatch_cfg_path,
+        OrchdDispatchTomlInputs {
+            actor: harness.fixture.owner.as_str(),
+            forgejo_login: harness.fixture.owner.as_str(),
+            repo_ref: harness.repo_ref.as_str(),
+            principal_workdir: &harness.principal_workdir,
+            codex_bin: &fake_codex,
+            token_file: &harness.token_path,
+            forgejoctl: &forgejoctl,
+            directives: &[OrchdTestDirective::Impl],
+            timeout_sec: 60,
+        },
+    )?;
+
+    let db_path = harness.fixture.work_path.join("orchd-impl-rebase.sqlite");
+    let orchd_stdout = harness
+        .fixture
+        .work_path
+        .join("orchd-impl-rebase-stdout.log");
+    let orchd_stderr = harness
+        .fixture
+        .work_path
+        .join("orchd-impl-rebase-stderr.log");
+    let port = pick_unused_port().ok_or_else(|| anyhow!("failed to pick unused port"))?;
+
+    let orchd = OrchdTestProcess::spawn(OrchdSpawnInputs {
+        listen_port: port,
+        db_path: &db_path,
+        repo_ref: &harness.repo_ref,
+        dispatch_cfg_path: &dispatch_cfg_path,
+        config_path: &harness.config_path,
+        token_path: &harness.token_path,
+        stdout_path: &orchd_stdout,
+        stderr_path: &orchd_stderr,
+        env: &[
+            ("FAKE_CODEX_MODE", "git_append_commit"),
+            ("FAKE_CODEX_GIT_FILE", "orchd-itest.txt"),
+            // Give the test harness time to advance `main` after the worktree is created.
+            ("FAKE_CODEX_SLEEP_MS", "3000"),
+        ],
+    })?;
+
+    post_orchd_issue_comment_webhook(
+        &orchd.client,
+        &orchd.base_url,
+        &harness.repo_ref,
+        issue_number,
+        harness.fixture.owner.as_str(),
+        "@codex-orch impl",
+    )?;
+
+    wait_for_orchd_dispatch_status(
+        &db_path,
+        &harness.repo_ref,
+        issue_number,
+        "running",
+        Duration::from_secs(15),
+    )?;
+
+    let advance_started = Instant::now();
+    let temp = TempDir::new().context("failed creating temp dir for main advance")?;
+    let askpass = temp.path().join("askpass.sh");
+    fs::write(
+        &askpass,
+        "#!/bin/sh\nset -eu\ncat \"${ORCHD_GIT_TOKEN_FILE:?missing ORCHD_GIT_TOKEN_FILE}\"\n",
+    )
+    .with_context(|| format!("failed writing {}", askpass.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut perms = fs::metadata(&askpass)
+            .with_context(|| format!("failed stat {}", askpass.display()))?
+            .permissions();
+        perms.set_mode(0o700);
+        fs::set_permissions(&askpass, perms)
+            .with_context(|| format!("failed chmod {}", askpass.display()))?;
+    }
+
+    let http_url = {
+        let mut url = url::Url::parse(&harness.fixture.base_url)
+            .context("invalid fixture base_url for git clone")?;
+        url.set_username(harness.fixture.owner.as_str())
+            .map_err(|()| anyhow!("failed to set username in fixture git url"))?;
+        url.set_path(&format!(
+            "/{}/{}.git",
+            harness.fixture.owner, harness.repo_name
+        ));
+        url.to_string()
+    };
+
+    let checkout = temp.path().join("advance-main");
+    let mut clone = Command::new("git");
+    clone.args(["clone"]).arg(&http_url).arg(&checkout);
+    clone
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", &askpass)
+        .env("ORCHD_GIT_TOKEN_FILE", &harness.token_path);
+    run_command_checked(&mut clone, "git clone via http for main advance")?;
+
+    let advance_file = checkout.join("orchd-advance-main.txt");
+    fs::write(&advance_file, "advance main during orchd dispatch\n")
+        .with_context(|| format!("failed writing {}", advance_file.display()))?;
+
+    let git_env = |cmd: &mut Command| {
+        cmd.env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_ASKPASS", &askpass)
+            .env("ORCHD_GIT_TOKEN_FILE", &harness.token_path);
+    };
+
+    let mut add = Command::new("git");
+    add.arg("-C")
+        .arg(&checkout)
+        .args(["add", "--", "orchd-advance-main.txt"]);
+    git_env(&mut add);
+    run_command_checked(&mut add, "git add orchd-advance-main.txt")?;
+
+    let mut commit = Command::new("git");
+    commit.arg("-C").arg(&checkout).args([
+        "-c",
+        "user.name=itest-advance",
+        "-c",
+        "user.email=itest-advance@localhost",
+        "commit",
+        "-m",
+        "itest: advance main",
+    ]);
+    git_env(&mut commit);
+    run_command_checked(&mut commit, "git commit advance main")?;
+
+    let mut push = Command::new("git");
+    push.arg("-C")
+        .arg(&checkout)
+        .args(["push", "origin", "HEAD:main"]);
+    git_env(&mut push);
+    run_command_checked(&mut push, "git push advance main")?;
+    harness.timer.record("git.advance_main", advance_started)?;
+
+    let _ = wait_for_issue_label(
+        &harness,
+        issue_number,
+        "orchd/state/completed",
+        Duration::from_secs(90),
+    )?;
+
+    let after_head = git.bare_head_main()?;
+    let after_count = git.bare_commit_count_main()?;
+    if after_head == before_head {
+        bail!("expected landing to advance main, but head stayed at {after_head}");
+    }
+    if after_count != before_count + 2 {
+        bail!("expected main commit count to increase by 2 ({before_count} -> {after_count})");
+    }
+
     let principal_head = stdout_trim(&git_output_checked(
         &harness.principal_workdir,
         &["rev-parse", "HEAD"],

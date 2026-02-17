@@ -396,13 +396,20 @@ fn evaluate_landing(args: &FinalizeDispatchArgs) -> LandingOutcome {
                     .map(|out| repo::git_stdout_trim(&out))
                     .unwrap_or_else(|_| rebased_sha.chars().take(12).collect::<String>());
 
+            // `git push --force-with-lease` without an explicit ref lease relies on remote-tracking
+            // refs (e.g. refs/remotes/origin/<branch>). We push to an authenticated URL, so we
+            // may not have a remote name with updated tracking state. Provide an explicit lease
+            // pinned to the pre-rebase head to avoid "stale info" false negatives while
+            // preserving safety (no overwrite if someone else updated the branch).
+            let lease_flag = format!("--force-with-lease=refs/heads/{branch}:{head_sha}");
+
             let push_result = repo::git_checked_with_token(
                 &args.db_path,
                 &args.token_file,
                 Some(&args.git_workdir),
                 &[
                     "push",
-                    "--force-with-lease",
+                    lease_flag.as_str(),
                     &git_url,
                     &format!("HEAD:{branch}"),
                 ],
