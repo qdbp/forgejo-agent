@@ -59,27 +59,27 @@ notify_send_bin = "/usr/bin/notify-send"
 
 [directives.design]
 role = "codex-orch"
-prompt_file = "../prompts/orchd-design.md"
+prompt_file = "../prompts/orders/orchd-design.md"
 timeout_sec = 1800
 
 [directives.investigate]
 role = "codex-orch"
-prompt_file = "../prompts/orchd-investigate.md"
+prompt_file = "../prompts/orders/orchd-investigate.md"
 timeout_sec = 2400
 
 [directives.impl]
 role = "codex-orch"
-prompt_file = "../prompts/orchd-impl.md"
+prompt_file = "../prompts/orders/orchd-impl.md"
 timeout_sec = 7200
 
 [directives.reply]
 role = "codex-orch"
-prompt_file = "../prompts/orchd-poke.md"
+prompt_file = "../prompts/orders/orchd-poke.md"
 timeout_sec = 1200
 
 [directives.poke]
 role = "codex-orch"
-prompt_file = "../prompts/orchd-poke.md"
+prompt_file = "../prompts/orders/orchd-poke.md"
 timeout_sec = 1200
 
 [trigger_guardrails]

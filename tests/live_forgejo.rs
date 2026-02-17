@@ -993,8 +993,8 @@ impl OrchdTestDirective {
 
     const fn prompt_file(self) -> &'static str {
         match self {
-            Self::Poke | Self::Reply => "orchd-poke.md",
-            Self::Impl => "orchd-impl.md",
+            Self::Poke | Self::Reply => "orders/orchd-poke.md",
+            Self::Impl => "orders/orchd-impl.md",
         }
     }
 }
@@ -1023,8 +1023,11 @@ fn ensure_test_prompt_bundle(config_path: &Path, actor: &str) -> Result<PathBuf>
         })?
         .join("itest-prompts");
     let roles_dir = bundle_dir.join("roles");
+    let orders_dir = bundle_dir.join("orders");
     fs::create_dir_all(&roles_dir)
         .with_context(|| format!("failed creating {}", roles_dir.display()))?;
+    fs::create_dir_all(&orders_dir)
+        .with_context(|| format!("failed creating {}", orders_dir.display()))?;
 
     let prompt_files = [
         "orchd-preamble.md",
@@ -1033,14 +1036,18 @@ fn ensure_test_prompt_bundle(config_path: &Path, actor: &str) -> Result<PathBuf>
         "orchd-turn-context.md",
         "orchd-issue-fresh.md",
         "orchd-issue-followup.md",
-        "orchd-impl.md",
-        "orchd-design.md",
-        "orchd-poke.md",
-        "orchd-investigate.md",
+        "orders/orchd-impl.md",
+        "orders/orchd-design.md",
+        "orders/orchd-poke.md",
+        "orders/orchd-investigate.md",
     ];
     for file in prompt_files {
         let src = source_prompts_dir.join(file);
         let dst = bundle_dir.join(file);
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed creating {}", parent.display()))?;
+        }
         fs::copy(&src, &dst)
             .with_context(|| format!("failed copying {} -> {}", src.display(), dst.display()))?;
     }

@@ -1414,7 +1414,7 @@ prompt_file = "{design_prompt}"
             fresh = prompts_dir.join("orchd-envelope-fresh.md").display(),
             followup = prompts_dir.join("orchd-envelope-followup.md").display(),
             token = root.join("token.txt").display(),
-            design_prompt = prompts_dir.join("orchd-design.md").display(),
+            design_prompt = prompts_dir.join("orders").join("orchd-design.md").display(),
         );
         fs::write(&config_path, config_toml)?;
 
@@ -1463,8 +1463,8 @@ prompt_file = "{reply_prompt}"
             fresh = prompts_dir.join("orchd-envelope-fresh.md").display(),
             followup = prompts_dir.join("orchd-envelope-followup.md").display(),
             token = root.join("token.txt").display(),
-            design_prompt = prompts_dir.join("orchd-design.md").display(),
-            reply_prompt = prompts_dir.join("orchd-poke.md").display(),
+            design_prompt = prompts_dir.join("orders").join("orchd-design.md").display(),
+            reply_prompt = prompts_dir.join("orders").join("orchd-poke.md").display(),
         );
         fs::write(&config_path, config_toml)?;
 
@@ -1521,7 +1521,7 @@ target_role = "codex-orch"
             fresh = prompts_dir.join("orchd-envelope-fresh.md").display(),
             followup = prompts_dir.join("orchd-envelope-followup.md").display(),
             token = root.join("token.txt").display(),
-            poke_prompt = prompts_dir.join("orchd-poke.md").display(),
+            poke_prompt = prompts_dir.join("orders").join("orchd-poke.md").display(),
         );
         fs::write(&config_path, config_toml)?;
 
@@ -1576,7 +1576,7 @@ prompt_file = "{poke_prompt}"
             fresh = prompts_dir.join("orchd-envelope-fresh.md").display(),
             followup = prompts_dir.join("orchd-envelope-followup.md").display(),
             shared_token = shared_token.display(),
-            poke_prompt = prompts_dir.join("orchd-poke.md").display(),
+            poke_prompt = prompts_dir.join("orders").join("orchd-poke.md").display(),
         );
         fs::write(&config_path, config_toml)?;
 
@@ -1623,7 +1623,7 @@ prompt_file = "{poke_prompt}"
             fresh = prompts_dir.join("orchd-envelope-fresh.md").display(),
             followup = prompts_dir.join("orchd-envelope-followup.md").display(),
             owner_token = owner_token.display(),
-            poke_prompt = prompts_dir.join("orchd-poke.md").display(),
+            poke_prompt = prompts_dir.join("orders").join("orchd-poke.md").display(),
         );
         fs::write(&config_path, config_toml)?;
 
@@ -1677,7 +1677,7 @@ prompt_file = "{poke_prompt}"
             followup = prompts_dir.join("orchd-envelope-followup.md").display(),
             token_alpha = root.join("alpha.token").display(),
             token_beta = root.join("beta.token").display(),
-            poke_prompt = prompts_dir.join("orchd-poke.md").display(),
+            poke_prompt = prompts_dir.join("orders").join("orchd-poke.md").display(),
         );
         fs::write(&config_path, config_toml)?;
 
@@ -1727,7 +1727,7 @@ prompt_file = "{reply_prompt}"
             fresh = prompts_dir.join("orchd-envelope-fresh.md").display(),
             followup = prompts_dir.join("orchd-envelope-followup.md").display(),
             token = root.join("token.txt").display(),
-            reply_prompt = prompts_dir.join("orchd-poke.md").display(),
+            reply_prompt = prompts_dir.join("orders").join("orchd-poke.md").display(),
         );
         fs::write(&config_path, config_toml)?;
 
