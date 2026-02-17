@@ -94,6 +94,9 @@ pub(super) struct RoleCheckArgs {
     pub(super) role: Option<String>,
     #[arg(long)]
     pub(super) json: bool,
+    /// Skip Forgejo API calls; only validate local invariants (role cards, token files, perms).
+    #[arg(long)]
+    pub(super) offline: bool,
 }
 
 #[derive(Args, Debug)]

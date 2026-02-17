@@ -115,8 +115,12 @@ pub(super) fn role_list_command(cli: &Cli, args: RoleListArgs) -> Result<()> {
 pub(super) fn role_check_command(cli: &Cli, args: RoleCheckArgs) -> Result<()> {
     let dispatch_config_path = resolve_dispatch_config_path(cli)?;
     let dispatch_config = load_dispatch_config(&dispatch_config_path)?;
-    let cfg = AgentConfig::load(cli.config.clone(), cli.token_file.clone())?;
-    let report = run_role_check(&dispatch_config, &cfg, args.role.as_deref())?;
+    let report = if args.offline {
+        run_role_check_offline(&dispatch_config, args.role.as_deref())
+    } else {
+        let cfg = AgentConfig::load(cli.config.clone(), cli.token_file.clone())?;
+        run_role_check(&dispatch_config, &cfg, args.role.as_deref())?
+    };
     if report.roles.is_empty() {
         if let Some(role_name) = args.role.as_deref() {
             bail!(
@@ -462,6 +466,13 @@ fn run_role_check(
     ))
 }
 
+fn run_role_check_offline(
+    dispatch_config: &DispatchConfig,
+    role_filter: Option<&str>,
+) -> RoleCheckReport {
+    evaluate_roles_offline(dispatch_config, role_filter.map(normalize_name))
+}
+
 fn evaluate_roles(
     config: &DispatchConfig,
     cfg: &AgentConfig,
@@ -554,6 +565,70 @@ fn evaluate_roles(
             token_login,
             user_active,
             user_admin,
+            errors,
+            warnings,
+        });
+    }
+
+    checks.sort_by(|left, right| left.role.cmp(&right.role));
+
+    let ok = checks.iter().all(|check| check.errors.is_empty());
+    RoleCheckReport { ok, roles: checks }
+}
+
+fn evaluate_roles_offline(config: &DispatchConfig, role_filter: Option<String>) -> RoleCheckReport {
+    let mut checks = Vec::new();
+
+    for (role_name, role_cfg) in &config.roles {
+        if let Some(filter) = role_filter.as_ref()
+            && filter != role_name
+        {
+            continue;
+        }
+
+        let role_card_file = config.prompt_envelopes.role_card_file_for(role_name);
+        let mut errors = Vec::new();
+        let mut warnings = Vec::new();
+
+        let expected_rank = match read_rank_from_role_card(&role_card_file) {
+            Ok(rank) => rank,
+            Err(err) => {
+                errors.push(format!("role card: {err}"));
+                None
+            }
+        };
+
+        let token_contents = match read_token_file(&role_cfg.token_file) {
+            Ok(token) => Some(token),
+            Err(err) => {
+                errors.push(format!("token file: {err}"));
+                None
+            }
+        };
+
+        if let Ok(meta) = fs::metadata(&role_cfg.token_file) {
+            let mode = meta.permissions().mode() & 0o777;
+            if (mode & 0o077) != 0 {
+                errors.push(format!(
+                    "token file mode {:o} is too permissive; expected 600 or stricter",
+                    mode
+                ));
+            }
+        }
+
+        if token_contents.is_some() {
+            warnings.push("offline role check: Forgejo token posture unverified".to_string());
+        }
+
+        checks.push(RoleCheckSummary {
+            role: role_name.clone(),
+            forgejo_login: role_cfg.forgejo_login.clone(),
+            token_file: role_cfg.token_file.to_string_lossy().into_owned(),
+            role_card_file: role_card_file.to_string_lossy().into_owned(),
+            expected_rank,
+            token_login: None,
+            user_active: None,
+            user_admin: None,
             errors,
             warnings,
         });

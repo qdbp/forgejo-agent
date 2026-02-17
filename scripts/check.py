@@ -51,6 +51,21 @@ def main() -> None:
 
     run(clippy_args)
     run(["cargo", "test"])
+    run(
+        [
+            "cargo",
+            "run",
+            "--quiet",
+            "--bin",
+            "orchd",
+            "--",
+            "--dispatch-config",
+            "config/orchd-dispatch.toml",
+            "role",
+            "check",
+            "--offline",
+        ]
+    )
     run([sys.executable, "scripts/verify_skill_sync.py"])
 
 
