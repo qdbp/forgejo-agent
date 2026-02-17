@@ -116,13 +116,20 @@ impl fmt::Display for DispatchRank {
 #[derive(Clone, Debug)]
 pub(super) struct DispatchRankAclRolePolicy {
     pub(super) rank: DispatchRank,
-    pub(super) directives: BTreeSet<String>,
+    pub(super) own_directives: BTreeSet<String>,
+    pub(super) delegation_directives: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug)]
+struct DispatchRankAclRankPolicy {
+    own_directives: BTreeSet<String>,
+    delegation_directives: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug)]
 pub(super) struct DispatchRankAclConfig {
     pub(super) enabled: bool,
-    rank_directives: BTreeMap<DispatchRank, BTreeSet<String>>,
+    rank_policies: BTreeMap<DispatchRank, DispatchRankAclRankPolicy>,
     role_policies: BTreeMap<String, DispatchRankAclRolePolicy>,
 }
 
@@ -155,17 +162,29 @@ impl DispatchRankAclConfig {
             .get(target_role.as_str())
             .ok_or_else(|| anyhow!("target role '{target_role}' has no rank ACL policy"))?;
 
-        if actor_policy.rank < target_policy.rank {
+        let strict_downrank = actor_policy.rank > target_policy.rank;
+        let uprank_reply_exception =
+            directive == DIRECTIVE_REPLY && actor_policy.rank < target_policy.rank;
+        if !strict_downrank && !uprank_reply_exception {
             return Err(anyhow!(
-                "actor '{actor_login}' rank {} cannot dispatch to higher-rank role '{target_role}' ({})",
+                "actor '{actor_login}' rank {} cannot delegate directive '{directive}' to role '{target_role}' rank {} (requires strict downrank; only uprank exception is reply)",
                 actor_policy.rank,
                 target_policy.rank
             ));
         }
-        if !actor_policy.directives.contains(directive.as_str()) {
+        if !actor_policy
+            .delegation_directives
+            .contains(directive.as_str())
+        {
             return Err(anyhow!(
-                "actor '{actor_login}' rank {} is not permitted directive '{directive}'",
+                "actor '{actor_login}' rank {} is not permitted to delegate directive '{directive}'",
                 actor_policy.rank
+            ));
+        }
+        if !target_policy.own_directives.contains(directive.as_str()) {
+            return Err(anyhow!(
+                "target role '{target_role}' rank {} is not permitted to execute directive '{directive}'",
+                target_policy.rank
             ));
         }
         Ok(())
@@ -176,22 +195,52 @@ impl DispatchRankAclConfig {
             return "## Rank ACL Envelope\n- disabled".to_string();
         }
 
-        let mut lines = vec!["## Rank ACL Envelope (Directive Scope v1)".to_string()];
-        for (rank, directives) in &self.rank_directives {
-            let directive_list = directives.iter().cloned().collect::<Vec<_>>().join(", ");
-            lines.push(format!("- rank {rank}: {directive_list}"));
-        }
-
-        let role_name = role_name.trim().to_ascii_lowercase();
-        if let Some(policy) = self.role_policies.get(role_name.as_str()) {
-            let directives = policy
-                .directives
+        let mut lines = vec![
+            "## Rank ACL Envelope (Delegation + Execution Scope v2)".to_string(),
+            "- Delegation edge policy: strict downrank only.".to_string(),
+            "- Exception: `reply` may travel uprank (subordinate -> superior).".to_string(),
+            "- `delegation_directives`: what this role may dispatch onto another role".to_string(),
+            "- `own_directives`: what directives this role may execute when targeted".to_string(),
+        ];
+        for (
+            rank,
+            DispatchRankAclRankPolicy {
+                own_directives,
+                delegation_directives,
+            },
+        ) in &self.rank_policies
+        {
+            let own_list = own_directives
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            let delegation_list = delegation_directives
                 .iter()
                 .cloned()
                 .collect::<Vec<_>>()
                 .join(", ");
             lines.push(format!(
-                "- effective for {role_name} ({rank}): {directives}",
+                "- rank {rank}: own={own_list}; delegation={delegation_list}"
+            ));
+        }
+
+        let role_name = role_name.trim().to_ascii_lowercase();
+        if let Some(policy) = self.role_policies.get(role_name.as_str()) {
+            let own = policy
+                .own_directives
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            let delegation = policy
+                .delegation_directives
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push(format!(
+                "- effective for {role_name} ({rank}): own={own}; delegation={delegation}",
                 rank = policy.rank
             ));
         } else {
@@ -488,6 +537,10 @@ impl Default for DispatchRankAclConfigFile {
 struct DispatchRankAclRankConfigFile {
     #[serde(default)]
     directives: Vec<String>,
+    #[serde(default)]
+    own_directives: Vec<String>,
+    #[serde(default)]
+    delegation_directives: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -495,6 +548,10 @@ struct DispatchRankAclRankConfigFile {
 struct DispatchRankAclRoleOverrideConfigFile {
     #[serde(default)]
     directives: Vec<String>,
+    #[serde(default)]
+    own_directives: Vec<String>,
+    #[serde(default)]
+    delegation_directives: Vec<String>,
 }
 
 fn default_codex_bin() -> String {
@@ -597,7 +654,14 @@ const fn default_rank_acl_enabled() -> bool {
     true
 }
 
-fn default_rank_directives() -> BTreeMap<DispatchRank, BTreeSet<String>> {
+fn acl_policy_with_shared_directives(directives: BTreeSet<String>) -> DispatchRankAclRankPolicy {
+    DispatchRankAclRankPolicy {
+        own_directives: directives.clone(),
+        delegation_directives: directives,
+    }
+}
+
+fn default_rank_directives() -> BTreeMap<DispatchRank, DispatchRankAclRankPolicy> {
     let mut policies = BTreeMap::new();
     let all_directives = [
         DIRECTIVE_DESIGN,
@@ -610,15 +674,26 @@ fn default_rank_directives() -> BTreeMap<DispatchRank, BTreeSet<String>> {
         .into_iter()
         .map(ToOwned::to_owned)
         .collect::<BTreeSet<_>>();
-    policies.insert(DispatchRank(10), all_directives.clone());
-    policies.insert(DispatchRank(8), all_directives.clone());
-    policies.insert(DispatchRank(6), all_directives);
+    policies.insert(
+        DispatchRank(10),
+        acl_policy_with_shared_directives(all_directives.clone()),
+    );
+    policies.insert(
+        DispatchRank(8),
+        acl_policy_with_shared_directives(all_directives.clone()),
+    );
+    policies.insert(
+        DispatchRank(6),
+        acl_policy_with_shared_directives(all_directives),
+    );
     policies.insert(
         DispatchRank(2),
-        [DIRECTIVE_IMPL, DIRECTIVE_REPLY, DIRECTIVE_POKE]
-            .into_iter()
-            .map(ToOwned::to_owned)
-            .collect(),
+        acl_policy_with_shared_directives(
+            [DIRECTIVE_IMPL, DIRECTIVE_REPLY, DIRECTIVE_POKE]
+                .into_iter()
+                .map(ToOwned::to_owned)
+                .collect(),
+        ),
     );
     policies
 }
@@ -650,6 +725,59 @@ fn parse_acl_directive_set(
             Ok(directive)
         })
         .collect()
+}
+
+fn compile_acl_directive_surfaces(
+    config_path: &Path,
+    source_prefix: &str,
+    legacy_directives: Vec<String>,
+    own_directives: Vec<String>,
+    delegation_directives: Vec<String>,
+) -> Result<DispatchRankAclRankPolicy> {
+    let has_own = !own_directives.is_empty();
+    let has_delegation = !delegation_directives.is_empty();
+    if (has_own || has_delegation) && !legacy_directives.is_empty() {
+        return Err(anyhow!(
+            "dispatch config {} {} mixes legacy 'directives' with 'own_directives'/'delegation_directives'",
+            config_path.display(),
+            source_prefix
+        ));
+    }
+
+    if !has_own && !has_delegation {
+        let directives = parse_acl_directive_set(
+            config_path,
+            &format!("{source_prefix}.directives"),
+            legacy_directives,
+        )?;
+        return Ok(acl_policy_with_shared_directives(directives));
+    }
+
+    let own_seed = if has_own {
+        own_directives.clone()
+    } else {
+        delegation_directives.clone()
+    };
+    let delegation_seed = if has_delegation {
+        delegation_directives
+    } else {
+        own_directives
+    };
+
+    let own = parse_acl_directive_set(
+        config_path,
+        &format!("{source_prefix}.own_directives"),
+        own_seed,
+    )?;
+    let delegation = parse_acl_directive_set(
+        config_path,
+        &format!("{source_prefix}.delegation_directives"),
+        delegation_seed,
+    )?;
+    Ok(DispatchRankAclRankPolicy {
+        own_directives: own,
+        delegation_directives: delegation,
+    })
 }
 
 fn parse_role_card_rank(role_card_md: &str) -> Option<DispatchRank> {
@@ -705,12 +833,12 @@ fn compile_rank_acl_config(
     if !raw.enabled {
         return Ok(DispatchRankAclConfig {
             enabled: false,
-            rank_directives: BTreeMap::new(),
+            rank_policies: BTreeMap::new(),
             role_policies: BTreeMap::new(),
         });
     }
 
-    let mut rank_directives = default_rank_directives();
+    let mut rank_policies = default_rank_directives();
     for (raw_rank, rank_policy) in raw.ranks {
         let rank = DispatchRank::parse(raw_rank.as_str()).with_context(|| {
             format!(
@@ -719,12 +847,18 @@ fn compile_rank_acl_config(
                 raw_rank
             )
         })?;
-        let source = format!("rank_acl.ranks.{}.directives", rank);
-        let directives = parse_acl_directive_set(config_path, &source, rank_policy.directives)?;
-        rank_directives.insert(rank, directives);
+        let source = format!("rank_acl.ranks.{rank}");
+        let policy = compile_acl_directive_surfaces(
+            config_path,
+            &source,
+            rank_policy.directives,
+            rank_policy.own_directives,
+            rank_policy.delegation_directives,
+        )?;
+        rank_policies.insert(rank, policy);
     }
 
-    let mut role_overrides: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut role_overrides: BTreeMap<String, DispatchRankAclRankPolicy> = BTreeMap::new();
     for (raw_role, role_policy) in raw.role_overrides {
         let role_name = raw_role.trim().to_ascii_lowercase();
         if role_name.is_empty() {
@@ -740,9 +874,15 @@ fn compile_rank_acl_config(
                 role_name
             ));
         }
-        let source = format!("rank_acl.role_overrides.{}.directives", role_name);
-        let directives = parse_acl_directive_set(config_path, &source, role_policy.directives)?;
-        role_overrides.insert(role_name, directives);
+        let source = format!("rank_acl.role_overrides.{role_name}");
+        let policy = compile_acl_directive_surfaces(
+            config_path,
+            &source,
+            role_policy.directives,
+            role_policy.own_directives,
+            role_policy.delegation_directives,
+        )?;
+        role_overrides.insert(role_name, policy);
     }
 
     let mut policy_roles: BTreeSet<String> = roles.keys().cloned().collect();
@@ -757,7 +897,7 @@ fn compile_rank_acl_config(
     let mut role_policies = BTreeMap::new();
     for role_name in policy_roles {
         let rank = read_role_card_rank(config_path, prompt_envelopes, role_name.as_str())?;
-        let rank_directives_for_role = rank_directives.get(&rank).ok_or_else(|| {
+        let rank_policy_for_role = rank_policies.get(&rank).ok_or_else(|| {
             anyhow!(
                 "dispatch config {} rank_acl is missing directives for rank {} (role '{}')",
                 config_path.display(),
@@ -766,26 +906,56 @@ fn compile_rank_acl_config(
             )
         })?;
 
-        let directives = if let Some(override_directives) = role_overrides.get(role_name.as_str()) {
-            let widened = override_directives
-                .difference(rank_directives_for_role)
+        let (own_directives, delegation_directives) = if let Some(override_policy) =
+            role_overrides.get(role_name.as_str())
+        {
+            let widened_own = override_policy
+                .own_directives
+                .difference(&rank_policy_for_role.own_directives)
                 .cloned()
                 .collect::<Vec<_>>();
-            if !widened.is_empty() {
+            if !widened_own.is_empty() {
                 return Err(anyhow!(
-                    "dispatch config {} rank_acl.role_overrides.{} widens rank {} envelope with directives: {}",
+                    "dispatch config {} rank_acl.role_overrides.{} widens rank {} own_directives envelope with directives: {}",
                     config_path.display(),
                     role_name,
                     rank,
-                    widened.join(", ")
+                    widened_own.join(", ")
                 ));
             }
-            override_directives.clone()
+            let widened_delegation = override_policy
+                .delegation_directives
+                .difference(&rank_policy_for_role.delegation_directives)
+                .cloned()
+                .collect::<Vec<_>>();
+            if !widened_delegation.is_empty() {
+                return Err(anyhow!(
+                    "dispatch config {} rank_acl.role_overrides.{} widens rank {} delegation_directives envelope with directives: {}",
+                    config_path.display(),
+                    role_name,
+                    rank,
+                    widened_delegation.join(", ")
+                ));
+            }
+            (
+                override_policy.own_directives.clone(),
+                override_policy.delegation_directives.clone(),
+            )
         } else {
-            rank_directives_for_role.clone()
+            (
+                rank_policy_for_role.own_directives.clone(),
+                rank_policy_for_role.delegation_directives.clone(),
+            )
         };
 
-        role_policies.insert(role_name, DispatchRankAclRolePolicy { rank, directives });
+        role_policies.insert(
+            role_name,
+            DispatchRankAclRolePolicy {
+                rank,
+                own_directives,
+                delegation_directives,
+            },
+        );
     }
 
     for role_name in roles.keys() {
@@ -800,7 +970,7 @@ fn compile_rank_acl_config(
 
     Ok(DispatchRankAclConfig {
         enabled: true,
-        rank_directives,
+        rank_policies,
         role_policies,
     })
 }
@@ -1846,10 +2016,146 @@ prompt_file = "{reply_prompt}"
         fs::write(&config_path, config_toml)?;
 
         let err = load_dispatch_config(&config_path).expect_err("config should fail");
+        let msg = err.to_string();
         assert!(
-            err.to_string()
-                .contains("rank_acl.role_overrides.codex-orch widens rank OF-8 envelope")
+            msg.contains(
+                "rank_acl.role_overrides.codex-orch widens rank OF-8 own_directives envelope"
+            ) || msg.contains(
+                "rank_acl.role_overrides.codex-orch widens rank OF-8 delegation_directives envelope"
+            )
         );
+        Ok(())
+    }
+
+    #[test]
+    fn rank_acl_enforces_strict_downrank_with_reply_exception() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path();
+        let config_path = root.join("dispatch.toml");
+        let prompts_dir = root.join("prompts");
+        let roles_dir = prompts_dir.join("roles");
+        let orders_dir = prompts_dir.join("orders");
+        fs::create_dir_all(&roles_dir)?;
+        fs::create_dir_all(&orders_dir)?;
+        fs::write(roles_dir.join("main.md"), "# main role card\n\n- OF-10\n")?;
+        fs::write(
+            roles_dir.join("codex-orch.md"),
+            "# orch role card\n\n- OF-8\n",
+        )?;
+        fs::write(
+            roles_dir.join("codex-lead.md"),
+            "# lead role card\n\n- OF-6\n",
+        )?;
+        fs::write(
+            roles_dir.join("codex-dev.md"),
+            "# dev role card\n\n- OF-2\n",
+        )?;
+        fs::write(
+            roles_dir.join("codex-auditor.md"),
+            "# auditor role card\n\n- OF-6\n",
+        )?;
+        fs::write(prompts_dir.join("orchd-preamble.md"), "preamble\n")?;
+        fs::write(
+            prompts_dir.join("orchd-envelope-fresh.md"),
+            "{{preamble_md}}\n",
+        )?;
+        fs::write(
+            prompts_dir.join("orchd-envelope-followup.md"),
+            "{{dispatch_md}}\n",
+        )?;
+        fs::write(orders_dir.join("orchd-poke.md"), "poke\n")?;
+        fs::write(root.join("orch.token"), "orch\n")?;
+        fs::write(root.join("lead.token"), "lead\n")?;
+        fs::write(root.join("dev.token"), "dev\n")?;
+        fs::write(root.join("auditor.token"), "auditor\n")?;
+
+        let config_toml = format!(
+            r#"version = 1
+allowed_actors = ["main"]
+forgejoctl_bin = "/home/main/.local/bin/forgejoctl"
+legacy_triggers = false
+
+[prompt_envelopes]
+preamble_file = "{preamble}"
+fresh_envelope = "{fresh}"
+followup_envelope = "{followup}"
+
+[roles.codex-orch]
+token_file = "{orch_token}"
+
+[roles.codex-lead]
+token_file = "{lead_token}"
+
+[roles.codex-dev]
+token_file = "{dev_token}"
+
+[roles.codex-auditor]
+token_file = "{auditor_token}"
+
+[directives.reply]
+role = "codex-orch"
+prompt_file = "{poke_prompt}"
+
+[rank_acl.ranks."OF-10"]
+delegation_directives = ["reply", "design"]
+own_directives = ["reply"]
+
+[rank_acl.ranks."OF-8"]
+delegation_directives = ["reply", "design"]
+own_directives = ["reply", "design"]
+
+[rank_acl.ranks."OF-6"]
+delegation_directives = ["reply", "design"]
+own_directives = ["reply", "design"]
+
+[rank_acl.ranks."OF-2"]
+delegation_directives = ["reply"]
+own_directives = ["reply"]
+"#,
+            preamble = prompts_dir.join("orchd-preamble.md").display(),
+            fresh = prompts_dir.join("orchd-envelope-fresh.md").display(),
+            followup = prompts_dir.join("orchd-envelope-followup.md").display(),
+            orch_token = root.join("orch.token").display(),
+            lead_token = root.join("lead.token").display(),
+            dev_token = root.join("dev.token").display(),
+            auditor_token = root.join("auditor.token").display(),
+            poke_prompt = orders_dir.join("orchd-poke.md").display(),
+        );
+        fs::write(&config_path, config_toml)?;
+
+        let config = load_dispatch_config(&config_path)?;
+        let acl = &config.rank_acl;
+
+        // reply exception: lead (OF-6) can trigger a reply from orch (OF-8).
+        assert!(
+            acl.assert_actor_can_dispatch("codex-lead", "codex-orch", "reply")
+                .is_ok()
+        );
+
+        // strict downrank: lead (OF-6) cannot delegate non-reply directives uprank.
+        assert!(
+            acl.assert_actor_can_dispatch("codex-lead", "codex-orch", "design")
+                .is_err()
+        );
+
+        // strict downrank: equal-rank delegation is rejected.
+        assert!(
+            acl.assert_actor_can_dispatch("codex-lead", "codex-auditor", "reply")
+                .is_err()
+        );
+
+        // exception: dev (OF-2) can delegate reply uprank to lead (OF-6).
+        assert!(
+            acl.assert_actor_can_dispatch("codex-dev", "codex-lead", "reply")
+                .is_ok()
+        );
+
+        // downrank delegation allowed: main (OF-10) to orch (OF-8).
+        assert!(
+            acl.assert_actor_can_dispatch("main", "codex-orch", "reply")
+                .is_ok()
+        );
+
         Ok(())
     }
 }
