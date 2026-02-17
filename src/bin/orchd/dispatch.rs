@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::fs;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
@@ -33,6 +34,57 @@ use super::telemetry::{log_line, record_phase_latency_ms};
 use super::template;
 
 pub(super) const STARTING_DISPATCH_STALE_AFTER_SEC: i64 = 120;
+
+fn strip_linux_deleted_suffix(path: &Path) -> Option<PathBuf> {
+    let raw = path.to_str()?;
+    let stripped = raw.strip_suffix(" (deleted)")?;
+    Some(PathBuf::from(stripped))
+}
+
+fn resolve_orchd_exe_from(
+    current_exe: Option<PathBuf>,
+    argv0: Option<PathBuf>,
+    path_env: Option<OsString>,
+) -> Result<PathBuf> {
+    let argv0_for_path_search = argv0
+        .as_ref()
+        .filter(|path| path.components().count() == 1)
+        .cloned();
+
+    let mut candidates = Vec::new();
+    if let Some(path) = current_exe {
+        candidates.push(path.clone());
+        if let Some(stripped) = strip_linux_deleted_suffix(&path) {
+            candidates.push(stripped);
+        }
+    }
+    if let Some(path) = argv0 {
+        candidates.push(path);
+    }
+
+    if let Some(existing) = candidates.into_iter().find(|candidate| candidate.exists()) {
+        return Ok(existing);
+    }
+
+    if let (Some(path_env), Some(argv0)) = (path_env, argv0_for_path_search) {
+        for dir in std::env::split_paths(&path_env) {
+            let candidate = dir.join(&argv0);
+            if candidate.exists() {
+                return Ok(candidate);
+            }
+        }
+    }
+
+    anyhow::bail!("unable to resolve orchd executable path")
+}
+
+fn resolve_orchd_exe() -> Result<PathBuf> {
+    resolve_orchd_exe_from(
+        std::env::current_exe().ok(),
+        std::env::args_os().next().map(PathBuf::from),
+        std::env::var_os("PATH"),
+    )
+}
 
 fn fail_dispatch_start(db_path: &Path, dispatch_id: i64, lock_path: &Path, err: &DispatchError) {
     let _ =
@@ -96,19 +148,36 @@ impl DispatchBackendAdapter for SystemdBackendAdapter {
     ) -> Result<RunHandle, DispatchError> {
         let unit_name = format!("orchd-dispatch-{}", plan.dispatch_id);
         let unit_ref = format!("{unit_name}.service");
-        let orchd_bin = std::env::current_exe().map_err(|err| {
-            DispatchError::Launch(format!("failed resolving orchd binary: {err}"))
+        let orchd_bin = resolve_orchd_exe().map_err(|err| {
+            DispatchError::Launch(format!("failed resolving orchd executable: {err}"))
         })?;
-        let status = Command::new("systemd-run")
+        let output = Command::new("systemd-run")
             .args(["--user", "--collect", "--unit", &unit_name])
             .arg(&orchd_bin)
             .args(["run-dispatch", "--spec"])
             .arg(&artifacts.spec_path)
-            .status()
+            .output()
             .map_err(|err| DispatchError::Launch(format!("failed launching systemd-run: {err}")))?;
-        if !status.success() {
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+
+            let mut detail = String::new();
+            let trimmed_stderr = stderr.trim();
+            if !trimmed_stderr.is_empty() {
+                detail.push_str("\nstderr:\n");
+                detail.push_str(trimmed_stderr);
+            }
+            let trimmed_stdout = stdout.trim();
+            if !trimmed_stdout.is_empty() {
+                detail.push_str("\nstdout:\n");
+                detail.push_str(trimmed_stdout);
+            }
+
             return Err(DispatchError::Launch(format!(
-                "systemd-run exited with status {status}"
+                "systemd-run exited with status {}{}",
+                output.status, detail
             )));
         }
         Ok(RunHandle {
@@ -174,8 +243,9 @@ impl DispatchBackendAdapter for LocalBackendAdapter {
             .append(true)
             .open(&log_path)
             .map_err(|err| DispatchError::Io(format!("failed opening local backend log: {err}")))?;
-        let orchd_bin = std::env::current_exe()
-            .map_err(|err| DispatchError::Io(format!("failed resolving orchd binary: {err}")))?;
+        let orchd_bin = resolve_orchd_exe().map_err(|err| {
+            DispatchError::Io(format!("failed resolving orchd executable: {err}"))
+        })?;
         let child = Command::new(&orchd_bin)
             .args(["run-dispatch", "--spec"])
             .arg(&artifacts.spec_path)
@@ -1048,7 +1118,9 @@ pub(super) async fn dispatch_issue(
 mod tests {
     use chrono::{Duration as ChronoDuration, Utc};
 
-    use super::{DispatchBackendKind, DispatchError, DispatchState, db};
+    use std::path::PathBuf;
+
+    use super::{DispatchBackendKind, DispatchError, DispatchState, db, resolve_orchd_exe_from};
 
     fn inflight_dispatch(status: DispatchState, started_at: String) -> db::InflightDispatch {
         db::InflightDispatch {
@@ -1061,6 +1133,29 @@ mod tests {
             backend_ref: Some("orchd-dispatch-1.service".to_string()),
             lock_path: None,
         }
+    }
+
+    #[test]
+    fn resolve_orchd_exe_strips_deleted_suffix_when_stripped_path_exists() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let exe_path = dir.path().join("orchd");
+        std::fs::write(&exe_path, b"").expect("create fake exe");
+
+        let deleted_path = dir.path().join("orchd (deleted)");
+        let resolved = resolve_orchd_exe_from(Some(deleted_path), None, None).expect("resolve exe");
+        assert_eq!(resolved, exe_path);
+    }
+
+    #[test]
+    fn resolve_orchd_exe_searches_path_for_bare_argv0() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let exe_path = dir.path().join("orchd");
+        std::fs::write(&exe_path, b"").expect("create fake exe");
+
+        let path_env = std::env::join_paths([dir.path()]).expect("join PATH");
+        let resolved = resolve_orchd_exe_from(None, Some(PathBuf::from("orchd")), Some(path_env))
+            .expect("resolve exe");
+        assert_eq!(resolved, exe_path);
     }
 
     #[test]
