@@ -27,7 +27,7 @@ use super::errors::DispatchError;
 use super::forgejoctl_cmd;
 use super::lexicon;
 use super::repo;
-use super::run_script::{DispatchRunScriptInputs, build_exec_run_script};
+use super::run_dispatch::{CodexSandbox, CodexSessionId, DispatchExecSpecV1};
 use super::state::{AppState, DecisionRecord, EventRecord};
 use super::telemetry::{log_line, record_phase_latency_ms};
 
@@ -64,7 +64,7 @@ struct DispatchPlan {
 
 #[derive(Debug, Clone)]
 struct DispatchRunArtifacts {
-    script_path: PathBuf,
+    spec_path: PathBuf,
 }
 
 trait DispatchBackendAdapter {
@@ -95,16 +95,14 @@ impl DispatchBackendAdapter for SystemdBackendAdapter {
     ) -> Result<RunHandle, DispatchError> {
         let unit_name = format!("orchd-dispatch-{}", plan.dispatch_id);
         let unit_ref = format!("{unit_name}.service");
+        let orchd_bin = std::env::current_exe().map_err(|err| {
+            DispatchError::Launch(format!("failed resolving orchd binary: {err}"))
+        })?;
         let status = Command::new("systemd-run")
-            .args([
-                "--user",
-                "--collect",
-                "--unit",
-                &unit_name,
-                "/usr/bin/env",
-                "bash",
-            ])
-            .arg(&artifacts.script_path)
+            .args(["--user", "--collect", "--unit", &unit_name])
+            .arg(&orchd_bin)
+            .args(["run-dispatch", "--spec"])
+            .arg(&artifacts.spec_path)
             .status()
             .map_err(|err| DispatchError::Launch(format!("failed launching systemd-run: {err}")))?;
         if !status.success() {
@@ -161,7 +159,7 @@ impl DispatchBackendAdapter for LocalBackendAdapter {
         _plan: &DispatchPlan,
         artifacts: &DispatchRunArtifacts,
     ) -> Result<RunHandle, DispatchError> {
-        let log_path = artifacts.script_path.parent().map_or_else(
+        let log_path = artifacts.spec_path.parent().map_or_else(
             || PathBuf::from("local-backend.log"),
             |parent| parent.join("local-backend.log"),
         );
@@ -175,9 +173,11 @@ impl DispatchBackendAdapter for LocalBackendAdapter {
             .append(true)
             .open(&log_path)
             .map_err(|err| DispatchError::Io(format!("failed opening local backend log: {err}")))?;
-        let child = Command::new("/usr/bin/env")
-            .arg("bash")
-            .arg(&artifacts.script_path)
+        let orchd_bin = std::env::current_exe()
+            .map_err(|err| DispatchError::Io(format!("failed resolving orchd binary: {err}")))?;
+        let child = Command::new(&orchd_bin)
+            .args(["run-dispatch", "--spec"])
+            .arg(&artifacts.spec_path)
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr))
             .spawn()
@@ -207,12 +207,12 @@ impl DispatchBackendAdapter for LocalBackendAdapter {
     }
 }
 
-fn codex_sandbox_for_directive(directive: &str) -> &'static str {
+fn codex_sandbox_for_directive(directive: &str) -> CodexSandbox {
     match directive {
         lexicon::DIRECTIVE_DESIGN | lexicon::DIRECTIVE_INVESTIGATE | lexicon::DIRECTIVE_REPLY => {
-            "read-only"
+            CodexSandbox::ReadOnly
         }
-        _ => "workspace-write",
+        _ => CodexSandbox::WorkspaceWrite,
     }
 }
 
@@ -868,7 +868,7 @@ fn materialize_run_artifacts(
     fs::write(plan.run_dir.join("prompt_mode.txt"), prompt_mode)
         .map_err(|err| DispatchError::Io(format!("failed writing prompt mode: {err}")))?;
 
-    let script_path = plan.run_dir.join("run.sh");
+    let spec_path = plan.run_dir.join("run-spec.json");
     let summary_path = plan.run_dir.join("summary.md");
     let completion_path = plan.run_dir.join("completion.md");
     let last_message_path = plan.run_dir.join("last_message.md");
@@ -878,53 +878,59 @@ fn materialize_run_artifacts(
         "{}#{}",
         plan.intent.repo_full_name, plan.intent.issue_number
     );
-    let orchd_bin = std::env::current_exe()
-        .map_err(|err| DispatchError::Io(format!("failed resolving orchd executable: {err}")))?;
 
-    let script_inputs = DispatchRunScriptInputs {
+    let issue_session_id = plan
+        .issue_session_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(CodexSessionId::parse)
+        .transpose()
+        .map_err(|err| DispatchError::Io(format!("invalid codex session id: {err:#}")))?;
+
+    let spec = DispatchExecSpecV1 {
+        version: 1,
         dispatch_id: plan.dispatch_id,
-        db_path: &state.db_path,
-        lock_path: &plan.lock_path,
-        run_dir: &plan.run_dir,
-        prompt_path: &prompt_path,
-        summary_path: &summary_path,
-        completion_path: &completion_path,
-        last_message_path: &last_message_path,
-        codex_log_path: &codex_log_path,
-        marker_path: &marker_path,
-        issue_ref_text: &issue_ref_text,
-        orchd_bin: &orchd_bin,
-        forgejoctl_bin: &dispatch_config.forgejoctl_bin,
-        forgejo_config_file: state.forgejo_config_file.as_deref(),
-        token_file: &plan.role.token_file,
+        db_path: state.db_path.clone(),
+        lock_path: plan.lock_path.clone(),
+        run_dir: plan.run_dir.clone(),
+        prompt_path,
+        summary_path,
+        completion_path,
+        last_message_path,
+        codex_log_path,
+        marker_path,
+        issue_ref: issue_ref_text,
+        issue_title: plan.issue_title.clone(),
+        issue_url: plan.issue_url.clone(),
+        forgejoctl_bin: dispatch_config.forgejoctl_bin.clone(),
+        forgejo_config_file: state.forgejo_config_file.clone(),
+        token_file: plan.role.token_file.clone(),
         control_token_file: dispatch_config
             .control_plane
             .as_ref()
-            .map(|control| control.token_file.as_path()),
-        workdir: &plan.workdir,
-        principal_workdir: plan.principal_workdir.as_deref(),
+            .map(|control| control.token_file.clone()),
+        workdir: plan.workdir.clone(),
+        principal_workdir: plan.principal_workdir.clone(),
         codex_sandbox: codex_sandbox_for_directive(&plan.intent.directive),
-        git_remote: &plan.git_remote,
-        git_base: &plan.git_base,
-        git_branch: &plan.git_branch,
-        issue_title: &plan.issue_title,
-        issue_url: &plan.issue_url,
-        codex_bin: &plan.role.codex_bin,
-        codex_role_arg: &plan.role.codex_role_arg,
-        issue_session_id: plan.issue_session_id.as_deref(),
-        directive_name: &plan.intent.directive,
-        role_name: &plan.intent.role,
+        git_remote: plan.git_remote.clone(),
+        git_base: plan.git_base.clone(),
+        git_branch: plan.git_branch.clone(),
+        codex_bin: plan.role.codex_bin.clone(),
+        codex_role_arg: plan.role.codex_role_arg.clone(),
+        issue_session_id,
+        directive: plan.intent.directive.clone(),
+        role_name: plan.intent.role.clone(),
         timeout_sec: plan.directive.timeout_sec,
     };
 
-    let script = match state.dispatch_mode {
-        DispatchMode::Exec => build_exec_run_script(&script_inputs),
+    match state.dispatch_mode {
+        DispatchMode::Exec => spec
+            .write_json(&spec_path)
+            .map_err(|err| DispatchError::Io(format!("failed writing run spec: {err:#}")))?,
         DispatchMode::DryRun => return Err(DispatchError::ConfigNotLoaded),
-    };
+    }
 
-    fs::write(&script_path, script)
-        .map_err(|err| DispatchError::Io(format!("failed writing run script: {err}")))?;
-    Ok(DispatchRunArtifacts { script_path })
+    Ok(DispatchRunArtifacts { spec_path })
 }
 
 fn launch_dispatch_backend(
@@ -1131,6 +1137,6 @@ mod tests {
     #[test]
     fn investigate_runs_read_only() {
         let sandbox = super::codex_sandbox_for_directive(super::lexicon::DIRECTIVE_INVESTIGATE);
-        assert_eq!(sandbox, "read-only");
+        assert!(matches!(sandbox, super::CodexSandbox::ReadOnly));
     }
 }

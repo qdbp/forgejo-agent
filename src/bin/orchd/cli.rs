@@ -40,6 +40,7 @@ pub(super) struct Cli {
 #[derive(Subcommand, Debug)]
 pub(super) enum OrchdCommand {
     FinalizeDispatch(Box<FinalizeDispatchArgs>),
+    RunDispatch(RunDispatchArgs),
     #[command(subcommand)]
     Issue(IssueCommand),
     #[command(subcommand)]
@@ -174,6 +175,12 @@ pub(super) struct FinalizeDispatchArgs {
     pub(super) token_file: PathBuf,
     #[arg(long = "principal-workdir")]
     pub(super) principal_workdir: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub(super) struct RunDispatchArgs {
+    #[arg(long)]
+    pub(super) spec: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]

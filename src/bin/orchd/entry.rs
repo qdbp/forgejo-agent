@@ -5,6 +5,7 @@ use super::cli::{Cli, IssueCommand, OrchdCommand, RoleCommand};
 use super::finalize;
 use super::issue;
 use super::role;
+use super::run_dispatch;
 use super::server;
 use super::telemetry::init_telemetry;
 
@@ -26,6 +27,7 @@ pub(super) fn run_entry() -> Result<()> {
 fn run_command(cli: &Cli, command: OrchdCommand) -> Result<()> {
     match command {
         OrchdCommand::FinalizeDispatch(args) => finalize::finalize_dispatch_command(*args),
+        OrchdCommand::RunDispatch(args) => run_dispatch::run_dispatch_command(args),
         OrchdCommand::Issue(command) => run_issue_command(cli, command),
         OrchdCommand::Role(command) => run_role_command(cli, command),
     }

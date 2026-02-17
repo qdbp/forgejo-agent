@@ -49,8 +49,8 @@ mod forgejoctl_cmd;
 // Dispatch finalization (db terminal transitions + autoland). Read when changing completion semantics.
 mod finalize;
 
-// Run script generation for codex offline execution + finalize handoff. Read when changing dispatch launch payload.
-mod run_script;
+// Typed dispatch runner used by backends (replaces generated run.sh). Read when changing codex execution/finalize boundary.
+mod run_dispatch;
 
 // Operator-facing issue subcommands (postmortem session resume). Read when extending orchd obs/issue CLI surface.
 mod issue;
