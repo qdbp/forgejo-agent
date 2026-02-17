@@ -408,10 +408,26 @@ fn evaluate_landing(args: &FinalizeDispatchArgs) -> LandingOutcome {
                     } else {
                         String::new()
                     };
-                    let body = format!(
-                        "PR landing blocked: merge still not possible after rebase.\n- PR: {}\n- branch: `{}` (base `{}`)\n\nretry: {}\n\nerror: {err:#}\n",
-                        pr.html_url, branch, args.git_base, retry_mention
-                    );
+                    let template_path = args
+                        .git_workdir
+                        .join("templates/orchd-landing-pr-merge-blocked.md");
+                    let body = template::render_prompt_file(
+                        &template_path,
+                        &[
+                            ("pr_url", pr.html_url.as_str()),
+                            ("branch", branch),
+                            ("base_branch", args.git_base.as_str()),
+                            ("retry_mention", retry_mention.as_str()),
+                            ("error", &format!("{err:#}")),
+                        ],
+                        "pr merge blocked",
+                    )
+                    .unwrap_or_else(|tpl_err| {
+                        format!(
+                            "PR landing blocked: merge still not possible after rebase.\n- PR: {}\n- branch: `{}` (base `{}`)\n\nretry: {}\n\nerror: {err:#}\n(template error: {tpl_err})\n",
+                            pr.html_url, branch, args.git_base, retry_mention
+                        )
+                    });
                     LandingOutcome::Blocked {
                         reason_code: "pr_merge_blocked".to_string(),
                         lines: vec![format!("pr landing blocked: merge failed: {err:#}")],
