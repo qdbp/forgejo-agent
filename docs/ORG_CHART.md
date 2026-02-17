@@ -1,4 +1,4 @@
-# Org Chart (Swarm v0)
+# Swarm Org Chart
 
 ## Identity Model
 
@@ -11,12 +11,13 @@
 
 - `main`: human owner. Final decision authority.
 - `codex-orch`: orchestration + platform administration. Acts on behalf of `main`.
+- `orchd`: orchestration daemon service principal (not a human, not a model). Performs mechanical control-plane writes and dispatch bookkeeping; never impersonates `main`.
 - `codex-lead`: repo-scoped design ownership and delegation layer.
 - `codex-dev`: implementation execution subordinates.
 
 ## Forgejo Permissions
 
-- `main` and `codex-orch` are Forgejo admins.
+- `main`, `codex-orch`, and `orchd` are Forgejo admins.
 - `codex-lead` is not a Forgejo admin; grant repo-local rights only in assigned repos.
 - Subordinate agents (for example `codex-dev`) must not be Forgejo admins.
 
@@ -29,4 +30,6 @@
   - file a concise bug report in `main/forgejo-agent` describing the missing permission.
 
 Operational note:
-- Every automation role should have permission to create issues/comments in `main/forgejo-agent` (even if it cannot write code in other repos), so blocked agents always have a "scream" path.
+- Every automation role should have permission to create issues/comments in
+  `main/forgejo-agent` (even if it cannot write code in other repos), so
+  blocked agents always have a "scream" path.

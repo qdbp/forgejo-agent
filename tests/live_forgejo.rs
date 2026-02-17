@@ -1938,7 +1938,7 @@ fn live_orchd_prompt_template_failure_marks_failed_start() -> Result<()> {
 
 #[test]
 #[serial(live_forgejo)]
-fn live_orchd_impl_autoland_updates_remote_main() -> Result<()> {
+fn live_orchd_impl_pr_landing_updates_remote_main() -> Result<()> {
     if !live_tests_enabled() {
         eprintln!(
             "skipping live orchd integration test; enable with {}=1",
@@ -1947,7 +1947,7 @@ fn live_orchd_impl_autoland_updates_remote_main() -> Result<()> {
         return Ok(());
     }
 
-    let harness = LiveHarness::bootstrap("live_orchd_impl_autoland_updates_remote_main")?;
+    let harness = LiveHarness::bootstrap("live_orchd_impl_pr_landing_updates_remote_main")?;
     let issue_number = harness.create_issue("orchd impl smoke", "issue body", "ready")?;
 
     let git = GitWorkspace::from_fixture(&harness.fixture, &harness.repo_name)?;

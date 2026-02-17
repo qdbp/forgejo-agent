@@ -9,6 +9,7 @@
 - Agents must claim before editing, then release or close when done.
 - Branches and commits must reference issue ID.
 - Agents should mutate Forgejo state through `forgejoctl`.
+- `orchd`-dispatched checkouts are cloned from local Forgejo; in those checkouts, `origin` points at local Forgejo (not GitHub).
 
 ## Reply etiquette
 
@@ -79,7 +80,7 @@ Current semantics:
 
 - `design`: produce high-level design/spec response and drive state toward `spec`.
 - `investigate`: run bounded feasibility/current-state/options discovery in read-only mode; include evidence and concrete next-step guidance without auto-advancing workflow state.
-- `impl`: execute implementation loop and autoland to `main` on success (multiple impl turns may run in parallel; conflicts are handled via follow-up rebase turns).
+- `impl`: execute implementation loop; on success, orchd pushes your branch, opens/ensures a PR, and attempts a fast-forward-only merge into `main` (with a rebase+retry path; remaining conflicts are punted back to a follow-up `impl` turn).
 - `reply`: conversational “status/next action” response (read-only); `poke` is an alias.
 
 Role note:
@@ -89,4 +90,4 @@ Role note:
 
 - Branch: `i/<id>-short-slug` (example: `i/123-cache-index`)
 - Commit footer: `Refs: main/backlog#123`
-- PR body (if any): include same `Refs:` line
+- PR body (if you edit/create it manually): include same `Refs:` line (orchd may auto-create a minimal PR body).

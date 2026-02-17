@@ -9,8 +9,9 @@
 - If blocked, explain exactly what decision/input is needed to unblock.
 - Produce a clean commit (or commit series) with tests/format/lints passing.
 - Include `Refs: <owner/repo#N>` in each commit footer.
-- Do NOT merge; do NOT push. orchd will attempt a fast-forward autoland to `main` after you finish.
-- If orchd reports a fast-forward/autoland conflict, rebase on latest `main` and continue via the follow-up `impl` turn.
+- Do NOT merge. Do NOT push by default. orchd will push your branch to local Forgejo, ensure a PR exists, and attempt a fast-forward-only merge into `main`.
+- If orchd reports PR landing blocked, follow the instructions it posts (rebase, resolve conflicts, push with `--force-with-lease`), then retry via a follow-up `impl` turn.
+- Note: in your orchd-managed checkout, `origin` points at local Forgejo (not GitHub). Do not run `scripts/push-both.sh` from inside that checkout.
 - Include commit refs, verification summary, and residual risk in the final response.
 - Keep issue workflow current: transition to `state/review` on success, or `state/blocked` with a terse unblock comment when stopped by blockers.
 - Keep issue comments terse and natural-language (no rigid field templates).
