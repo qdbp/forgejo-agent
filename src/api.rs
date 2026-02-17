@@ -1,16 +1,19 @@
 use anyhow::{Context, Result, bail};
 use reqwest::Method;
 use reqwest::blocking::{Client, RequestBuilder};
+use reqwest::header::LOCATION;
+use reqwest::redirect::Policy;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use url::Url;
 
 use crate::config::AgentConfig;
 use crate::types::{ApiIssue, ApiLabel, ApiPullRequest, IssueRef, OpenState, RepoRef};
 
 #[derive(Debug, Clone)]
 pub struct ForgejoClient {
-    base_url: String,
+    base_url: Url,
     http: Client,
 }
 
@@ -126,23 +129,67 @@ impl ForgejoClient {
     pub fn new(cfg: &AgentConfig) -> Result<Self> {
         let http = Client::builder()
             .user_agent("forgejo-agent/0.1")
+            .redirect(Policy::none())
             .build()
             .context("failed to create HTTP client")?;
         Ok(Self {
-            base_url: cfg.base_url.as_str().trim_end_matches('/').to_string(),
+            base_url: cfg.base_url.clone(),
             http,
         })
     }
 
-    fn endpoint(&self, path: &str) -> String {
-        format!("{}{}", self.base_url, path)
+    fn endpoint(&self, path: &str) -> Result<Url> {
+        self.base_url
+            .join(path)
+            .with_context(|| format!("failed building endpoint URL for {path}"))
     }
 
-    fn request(&self, cfg: &AgentConfig, method: &Method, path: &str) -> RequestBuilder {
+    fn request(&self, cfg: &AgentConfig, method: &Method, url: Url) -> RequestBuilder {
         self.http
-            .request(method.clone(), self.endpoint(path))
+            .request(method.clone(), url)
             .header("Accept", "application/json")
             .header("Authorization", format!("token {}", cfg.token))
+    }
+
+    fn same_origin(a: &Url, b: &Url) -> bool {
+        a.scheme() == b.scheme()
+            && a.host_str() == b.host_str()
+            && a.port_or_known_default() == b.port_or_known_default()
+    }
+
+    fn api_path_with_query(url: &Url) -> String {
+        let mut path = url.path().to_string();
+        if let Some(query) = url.query() {
+            path.push('?');
+            path.push_str(query);
+        }
+        path
+    }
+
+    fn repo_api_route(url: &Url) -> Option<String> {
+        let rest = url.path().strip_prefix("/api/v1/repos/")?;
+        let mut segments = rest.split('/').filter(|segment| !segment.is_empty());
+        let _owner = segments.next()?;
+        let _repo = segments.next()?;
+        let mut route = segments.collect::<Vec<_>>().join("/");
+        route = route.trim_end_matches('/').to_string();
+        if let Some(query) = url.query()
+            && !query.is_empty()
+        {
+            route.push('?');
+            route.push_str(query);
+        }
+        Some(route)
+    }
+
+    fn is_repo_canonicalization_redirect(from: &Url, to: &Url) -> bool {
+        let Some(from_route) = Self::repo_api_route(from) else {
+            return false;
+        };
+        let Some(to_route) = Self::repo_api_route(to) else {
+            return false;
+        };
+        from_route == to_route
     }
 
     fn send_json<T, B>(
@@ -156,39 +203,75 @@ impl ForgejoClient {
         T: DeserializeOwned,
         B: Serialize + ?Sized,
     {
-        let req = self.request(cfg, method, path);
-        let req = if let Some(body) = body {
-            req.header("Content-Type", "application/json").json(body)
-        } else {
-            req
-        };
+        const MAX_REDIRECTS: u8 = 10;
 
-        let resp = req
-            .send()
-            .with_context(|| format!("request failed: {method} {path}"))?;
-        let status = resp.status();
-        let text = resp
-            .text()
-            .with_context(|| format!("failed reading response body for {method} {path}"))?;
+        let mut url = self.endpoint(path)?;
 
-        if !status.is_success() {
-            return Err(ApiHttpError {
-                status: status.as_u16(),
-                method: method.to_string(),
-                path: path.to_string(),
-                body: text,
+        for _ in 0..MAX_REDIRECTS {
+            let req = self.request(cfg, method, url.clone());
+            let req = if let Some(body) = body {
+                req.header("Content-Type", "application/json").json(body)
+            } else {
+                req
+            };
+
+            let resp = req
+                .send()
+                .with_context(|| format!("request failed: {method} {}", url.as_str()))?;
+            let status = resp.status();
+            if status.is_redirection() {
+                let location = resp
+                    .headers()
+                    .get(LOCATION)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned)
+                    .context("redirect response missing Location header")?;
+                let next = url
+                    .join(&location)
+                    .with_context(|| format!("invalid redirect Location header: {location}"))?;
+                if !Self::same_origin(&self.base_url, &next) {
+                    bail!("refusing cross-origin redirect to {}", next.as_str());
+                }
+                if !next.path().starts_with("/api/v1/") {
+                    bail!("refusing non-API redirect to {}", next.as_str());
+                }
+                if method != Method::GET && !Self::is_repo_canonicalization_redirect(&url, &next) {
+                    bail!(
+                        "unexpected redirect for {} {} -> {}",
+                        method,
+                        Self::api_path_with_query(&url),
+                        Self::api_path_with_query(&next)
+                    );
+                }
+                url = next;
+                continue;
             }
-            .into());
+
+            let text = resp.text().with_context(|| {
+                format!("failed reading response body for {method} {}", url.as_str())
+            })?;
+
+            if !status.is_success() {
+                return Err(ApiHttpError {
+                    status: status.as_u16(),
+                    method: method.to_string(),
+                    path: Self::api_path_with_query(&url),
+                    body: text,
+                }
+                .into());
+            }
+
+            return serde_json::from_str(&text).with_context(|| {
+                format!(
+                    "failed parsing JSON response for {} {}: {}",
+                    method,
+                    Self::api_path_with_query(&url),
+                    text.chars().take(200).collect::<String>()
+                )
+            });
         }
 
-        serde_json::from_str(&text).with_context(|| {
-            format!(
-                "failed parsing JSON response for {} {}: {}",
-                method,
-                path,
-                text.chars().take(200).collect::<String>()
-            )
-        })
+        bail!("too many redirects for {method} {}", url.as_str());
     }
 
     fn send_empty<B>(
@@ -201,29 +284,65 @@ impl ForgejoClient {
     where
         B: Serialize + ?Sized,
     {
-        let req = self.request(cfg, method, path);
-        let req = if let Some(body) = body {
-            req.header("Content-Type", "application/json").json(body)
-        } else {
-            req
-        };
-        let resp = req
-            .send()
-            .with_context(|| format!("request failed: {method} {path}"))?;
-        let status = resp.status();
-        let text = resp
-            .text()
-            .with_context(|| format!("failed reading response body for {method} {path}"))?;
-        if !status.is_success() {
-            return Err(ApiHttpError {
-                status: status.as_u16(),
-                method: method.to_string(),
-                path: path.to_string(),
-                body: text,
+        const MAX_REDIRECTS: u8 = 10;
+
+        let mut url = self.endpoint(path)?;
+
+        for _ in 0..MAX_REDIRECTS {
+            let req = self.request(cfg, method, url.clone());
+            let req = if let Some(body) = body {
+                req.header("Content-Type", "application/json").json(body)
+            } else {
+                req
+            };
+            let resp = req
+                .send()
+                .with_context(|| format!("request failed: {method} {}", url.as_str()))?;
+            let status = resp.status();
+            if status.is_redirection() {
+                let location = resp
+                    .headers()
+                    .get(LOCATION)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned)
+                    .context("redirect response missing Location header")?;
+                let next = url
+                    .join(&location)
+                    .with_context(|| format!("invalid redirect Location header: {location}"))?;
+                if !Self::same_origin(&self.base_url, &next) {
+                    bail!("refusing cross-origin redirect to {}", next.as_str());
+                }
+                if !next.path().starts_with("/api/v1/") {
+                    bail!("refusing non-API redirect to {}", next.as_str());
+                }
+                if method != Method::GET && !Self::is_repo_canonicalization_redirect(&url, &next) {
+                    bail!(
+                        "unexpected redirect for {} {} -> {}",
+                        method,
+                        Self::api_path_with_query(&url),
+                        Self::api_path_with_query(&next)
+                    );
+                }
+                url = next;
+                continue;
             }
-            .into());
+
+            let text = resp.text().with_context(|| {
+                format!("failed reading response body for {method} {}", url.as_str())
+            })?;
+            if !status.is_success() {
+                return Err(ApiHttpError {
+                    status: status.as_u16(),
+                    method: method.to_string(),
+                    path: Self::api_path_with_query(&url),
+                    body: text,
+                }
+                .into());
+            }
+            return Ok(());
         }
-        Ok(())
+
+        bail!("too many redirects for {method} {}", url.as_str());
     }
 
     pub fn whoami(&self, cfg: &AgentConfig) -> Result<serde_json::Value> {
