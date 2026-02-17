@@ -1037,25 +1037,29 @@ pub(super) fn latest_issue_active_dispatch(
     Ok(dispatch)
 }
 
-pub(super) fn latest_issue_resume_dispatch(
+pub(super) fn list_issue_resume_dispatches(
     db_path: &Path,
     repo_full_name: &str,
     issue_number: u64,
-) -> Result<Option<IssueResumeDispatch>> {
+    target_role: Option<&str>,
+) -> Result<Vec<IssueResumeDispatch>> {
     let conn = open_db(db_path)?;
-    let dispatch = conn
-        .query_row(
-            r"
-            SELECT id, status, target_role, codex_session_id
-            FROM dispatches
-            WHERE repo_full_name = ?1
-              AND issue_number = ?2
-              AND codex_session_id IS NOT NULL
-              AND codex_session_id != ''
-            ORDER BY id DESC
-            LIMIT 1
-            ",
-            params![repo_full_name, i64::try_from(issue_number)?],
+    let role_filter = target_role.map(str::to_ascii_lowercase);
+    let mut stmt = conn.prepare(
+        r"
+        SELECT id, status, target_role, codex_session_id
+        FROM dispatches
+        WHERE repo_full_name = ?1
+          AND issue_number = ?2
+          AND codex_session_id IS NOT NULL
+          AND codex_session_id != ''
+          AND (?3 IS NULL OR lower(target_role) = ?3)
+        ORDER BY id DESC
+        ",
+    )?;
+    let rows = stmt
+        .query_map(
+            params![repo_full_name, i64::try_from(issue_number)?, role_filter],
             |row| {
                 let status_raw: String = row.get(1)?;
                 let status = parse_dispatch_state_literal(&status_raw, 1)?;
@@ -1066,9 +1070,9 @@ pub(super) fn latest_issue_resume_dispatch(
                     codex_session_id: row.get(3)?,
                 })
             },
-        )
-        .optional()?;
-    Ok(dispatch)
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 pub(super) fn latest_repo_inflight_impl_dispatch_id(
@@ -1151,12 +1155,14 @@ pub(super) fn mark_dispatch_failed_runtime(
     Ok(())
 }
 
-pub(super) fn latest_issue_codex_session_id(
+pub(super) fn latest_issue_role_codex_session_id(
     db_path: &Path,
     repo_full_name: &str,
     issue_number: u64,
+    target_role: &str,
 ) -> Result<Option<String>> {
     let conn = open_db(db_path)?;
+    let role_filter = target_role.to_ascii_lowercase();
     let session_id = conn
         .query_row(
             r"
@@ -1164,12 +1170,13 @@ pub(super) fn latest_issue_codex_session_id(
             FROM dispatches
             WHERE repo_full_name = ?1
               AND issue_number = ?2
+              AND lower(target_role) = ?3
               AND codex_session_id IS NOT NULL
               AND codex_session_id != ''
             ORDER BY id DESC
             LIMIT 1
             ",
-            params![repo_full_name, i64::try_from(issue_number)?],
+            params![repo_full_name, i64::try_from(issue_number)?, role_filter],
             |row| row.get::<_, String>(0),
         )
         .optional()?;
@@ -1764,7 +1771,7 @@ mod tests {
     }
 
     #[test]
-    fn latest_issue_resume_dispatch_returns_latest_session_row() {
+    fn list_issue_resume_dispatches_returns_latest_session_row() {
         let db_path = temp_db_path("issue-resume-row");
         super::init_db(&db_path).expect("db init");
         let decision_id = seed_decision_id(&db_path);
@@ -1785,14 +1792,125 @@ mod tests {
             None,
         );
 
-        let latest = super::latest_issue_resume_dispatch(&db_path, "main/orchd-debug", 15)
-            .expect("query latest dispatch")
+        let latest = super::list_issue_resume_dispatches(&db_path, "main/orchd-debug", 15, None)
+            .expect("query latest dispatches")
+            .into_iter()
+            .next()
             .expect("latest dispatch present");
         assert_eq!(second_id, first_id + 1);
         assert_eq!(latest.id, first_id);
         assert_eq!(latest.status, DispatchState::Completed);
         assert_eq!(latest.target_role, "codex-orch");
         assert_eq!(latest.codex_session_id.as_deref(), Some("session-old"));
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn list_issue_resume_dispatches_honors_role_filter() {
+        let db_path = temp_db_path("issue-resume-role-filter");
+        super::init_db(&db_path).expect("db init");
+        let decision_id = seed_decision_id(&db_path);
+        let orch_id = insert_dispatch_row(
+            &db_path,
+            decision_id,
+            21,
+            DispatchState::Completed,
+            "codex-orch",
+            Some("session-orch"),
+        );
+        let lead_id = insert_dispatch_row(
+            &db_path,
+            decision_id,
+            21,
+            DispatchState::Completed,
+            "codex-lead",
+            Some("session-lead"),
+        );
+
+        let latest_lead = super::list_issue_resume_dispatches(
+            &db_path,
+            "main/orchd-debug",
+            21,
+            Some("codex-lead"),
+        )
+        .expect("query lead dispatch")
+        .into_iter()
+        .next()
+        .expect("lead dispatch present");
+        assert_eq!(latest_lead.id, lead_id);
+        assert_eq!(
+            latest_lead.codex_session_id.as_deref(),
+            Some("session-lead")
+        );
+
+        let latest_orch = super::list_issue_resume_dispatches(
+            &db_path,
+            "main/orchd-debug",
+            21,
+            Some("codex-orch"),
+        )
+        .expect("query orch dispatch")
+        .into_iter()
+        .next()
+        .expect("orch dispatch present");
+        assert_eq!(latest_orch.id, orch_id);
+        assert_eq!(
+            latest_orch.codex_session_id.as_deref(),
+            Some("session-orch")
+        );
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn latest_issue_role_codex_session_id_is_role_scoped() {
+        let db_path = temp_db_path("issue-session-role-scope");
+        super::init_db(&db_path).expect("db init");
+        let decision_id = seed_decision_id(&db_path);
+        insert_dispatch_row(
+            &db_path,
+            decision_id,
+            18,
+            DispatchState::Completed,
+            "codex-orch",
+            Some("session-orch"),
+        );
+        insert_dispatch_row(
+            &db_path,
+            decision_id,
+            18,
+            DispatchState::Completed,
+            "codex-lead",
+            Some("session-lead"),
+        );
+
+        let orch_session = super::latest_issue_role_codex_session_id(
+            &db_path,
+            "main/orchd-debug",
+            18,
+            "codex-orch",
+        )
+        .expect("query orch session");
+        assert_eq!(orch_session.as_deref(), Some("session-orch"));
+
+        let lead_session = super::latest_issue_role_codex_session_id(
+            &db_path,
+            "main/orchd-debug",
+            18,
+            "codex-lead",
+        )
+        .expect("query lead session");
+        assert_eq!(lead_session.as_deref(), Some("session-lead"));
+
+        let missing = super::latest_issue_role_codex_session_id(
+            &db_path,
+            "main/orchd-debug",
+            18,
+            "codex-dev",
+        )
+        .expect("query missing session");
+        assert!(missing.is_none());
 
         let _ = fs::remove_file(db_path);
     }

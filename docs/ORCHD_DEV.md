@@ -27,7 +27,7 @@ Core behavior:
   - registered config triggers
 - enforces logical trigger dedupe keys so replayed deliveries do not re-dispatch the same logical event
 - enforces anti-spiral guardrails on trigger-fired dispatches (`depth`, `rate`, `cooldown`, `self-loop`)
-- supports postmortem session re-entry via `orchd issue resume <repo> <issue_number>`
+- supports postmortem session inspection/re-entry via `orchd issue sessions|resume`
 - provides role hygiene subcommands:
   - `orchd role list`
   - `orchd role check [--role <name>]`
@@ -140,10 +140,17 @@ cargo run --bin orchd -- \
 
 ## Postmortem Resume
 
-Re-open the latest recorded session for an issue:
+List resumable sessions for an issue:
 
 ```bash
-cargo run --bin orchd -- issue resume forgejo-agent 20 -- --no-alt-screen
+cargo run --bin orchd -- issue sessions forgejo-agent 20
+```
+
+Resume a specific session for an issue:
+
+```bash
+cargo run --bin orchd -- issue resume forgejo-agent 20 --role codex-lead -- --no-alt-screen
+cargo run --bin orchd -- issue resume forgejo-agent 20 --dispatch-id 123 -- --no-alt-screen
 ```
 
 Behavior is intentionally strict:
@@ -151,6 +158,7 @@ Behavior is intentionally strict:
 - owner is hardcoded to `main` (`forgejo-agent 20` maps to `main/forgejo-agent#20`)
 - errors if any non-terminal dispatch exists for that issue
 - errors if no `codex_session_id` exists in dispatch history
+- errors if multiple role sessions exist and no `--role` or `--dispatch-id` is supplied
 - never falls back to spawning a fresh Codex session
 
 ## Role Hygiene

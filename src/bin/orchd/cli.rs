@@ -48,6 +48,7 @@ pub(super) enum OrchdCommand {
 
 #[derive(Subcommand, Debug)]
 pub(super) enum IssueCommand {
+    Sessions(IssueSessionsArgs),
     Resume(IssueResumeArgs),
 }
 
@@ -59,9 +60,23 @@ pub(super) enum RoleCommand {
 }
 
 #[derive(Args, Debug)]
+pub(super) struct IssueSessionsArgs {
+    pub(super) repo: String,
+    pub(super) issue_number: u64,
+    #[arg(long)]
+    pub(super) role: Option<String>,
+    #[arg(long)]
+    pub(super) json: bool,
+}
+
+#[derive(Args, Debug)]
 pub(super) struct IssueResumeArgs {
     pub(super) repo: String,
     pub(super) issue_number: u64,
+    #[arg(long)]
+    pub(super) role: Option<String>,
+    #[arg(long = "dispatch-id")]
+    pub(super) dispatch_id: Option<i64>,
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub(super) codex_resume_args: Vec<String>,
 }

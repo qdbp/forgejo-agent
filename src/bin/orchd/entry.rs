@@ -33,6 +33,7 @@ fn run_command(cli: &Cli, command: OrchdCommand) -> Result<()> {
 
 fn run_issue_command(cli: &Cli, command: IssueCommand) -> Result<()> {
     match command {
+        IssueCommand::Sessions(args) => issue::issue_sessions_command(&cli.db_path, args),
         IssueCommand::Resume(args) => issue::issue_resume_command(&cli.db_path, args),
     }
 }

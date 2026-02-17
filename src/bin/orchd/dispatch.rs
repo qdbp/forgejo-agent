@@ -625,10 +625,11 @@ async fn plan_dispatch(
         });
     }
 
-    let issue_session_id = db::latest_issue_codex_session_id(
+    let issue_session_id = db::latest_issue_role_codex_session_id(
         &state.db_path,
         &intent.repo_full_name,
         intent.issue_number,
+        &intent.role,
     )
     .map_err(|err| DispatchError::Db(err.to_string()))?;
     let lock_path = repo::acquire_repo_lock(&state.db_path, &intent.repo_full_name)?;

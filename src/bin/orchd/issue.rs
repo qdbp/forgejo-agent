@@ -2,8 +2,9 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
+use serde::Serialize;
 
-use super::cli::IssueResumeArgs;
+use super::cli::{IssueResumeArgs, IssueSessionsArgs};
 use super::db;
 use super::paths::expand_tilde_path;
 
@@ -32,6 +33,67 @@ fn codex_role_bin() -> PathBuf {
 
 fn codex_role_arg(target_role: &str) -> &str {
     target_role.strip_prefix("codex-").unwrap_or(target_role)
+}
+
+fn normalized_role_filter(role: Option<&str>) -> Result<Option<String>> {
+    role.map(|raw| {
+        let role = raw.trim().to_ascii_lowercase();
+        if role.is_empty() {
+            bail!("role filter must be non-empty when provided");
+        }
+        Ok(role)
+    })
+    .transpose()
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct IssueSessionSummary {
+    dispatch_id: i64,
+    status: String,
+    target_role: String,
+    codex_session_id: String,
+}
+
+fn issue_session_summaries(rows: &[db::IssueResumeDispatch]) -> Vec<IssueSessionSummary> {
+    rows.iter()
+        .map(|row| IssueSessionSummary {
+            dispatch_id: row.id,
+            status: row.status.as_db_str().to_string(),
+            target_role: row.target_role.clone(),
+            codex_session_id: row.codex_session_id.clone().unwrap_or_default(),
+        })
+        .collect()
+}
+
+pub(super) fn issue_sessions_command(db_path_raw: &str, args: IssueSessionsArgs) -> Result<()> {
+    let repo = validate_repo_name(&args.repo)?;
+    let repo_full_name = format!("{ISSUE_OWNER}/{repo}");
+    let db_path = expand_tilde_path(db_path_raw)?;
+    let role_filter = normalized_role_filter(args.role.as_deref())?;
+    let rows = db::list_issue_resume_dispatches(
+        &db_path,
+        &repo_full_name,
+        args.issue_number,
+        role_filter.as_deref(),
+    )?;
+    let summaries = issue_session_summaries(&rows);
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&summaries)?);
+        return Ok(());
+    }
+
+    println!(
+        "{:<12} {:<16} {:<18} {}",
+        "dispatch_id", "status", "role", "session_id"
+    );
+    for row in summaries {
+        println!(
+            "{:<12} {:<16} {:<18} {}",
+            row.dispatch_id, row.status, row.target_role, row.codex_session_id
+        );
+    }
+    Ok(())
 }
 
 fn run_codex_resume(target_role: &str, session_id: &str, trailing_args: &[String]) -> Result<()> {
@@ -73,8 +135,52 @@ pub(super) fn issue_resume_command(db_path_raw: &str, args: IssueResumeArgs) -> 
             active.status.as_db_str()
         );
     }
-    let latest = db::latest_issue_resume_dispatch(&db_path, &repo_full_name, args.issue_number)?
-        .ok_or_else(|| anyhow!("issue {issue_ref} has no associated codex_session_id"))?;
+    let role_filter = normalized_role_filter(args.role.as_deref())?;
+    let all_rows = db::list_issue_resume_dispatches(
+        &db_path,
+        &repo_full_name,
+        args.issue_number,
+        role_filter.as_deref(),
+    )?;
+    if all_rows.is_empty() {
+        bail!("issue {issue_ref} has no associated codex_session_id");
+    }
+
+    let latest = if let Some(dispatch_id) = args.dispatch_id {
+        all_rows
+            .iter()
+            .find(|row| row.id == dispatch_id)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow!(
+                    "dispatch {} is not a resumable session for {}",
+                    dispatch_id,
+                    issue_ref
+                )
+            })?
+    } else {
+        if role_filter.is_none() {
+            let unique_roles = all_rows
+                .iter()
+                .map(|row| row.target_role.as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            if unique_roles.len() > 1 {
+                let roles = unique_roles.into_iter().collect::<Vec<_>>().join(", ");
+                bail!(
+                    "issue {} has sessions for multiple roles ({}); re-run with --role <role> or --dispatch-id <id> (hint: orchd issue sessions {} {})",
+                    issue_ref,
+                    roles,
+                    repo,
+                    args.issue_number
+                );
+            }
+        }
+        all_rows
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow!("issue {issue_ref} has no associated codex_session_id"))?
+    };
+
     if !latest.status.is_terminal() {
         bail!(
             "issue {issue_ref} has non-terminal latest dispatch {} ({})",

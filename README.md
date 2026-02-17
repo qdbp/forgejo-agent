@@ -135,9 +135,9 @@ Core behavior:
 - sqlite event/decision/dispatch persistence
 - runtime dispatch status projected to `orchd/state/*` labels (`queued|running|blocked|failed|completed`)
 - one active dispatch per issue (duplicates blocked while running)
-- issue-scoped codex session reuse (`codex exec resume`) from latest `codex_session_id`
+- issue+role-scoped codex session reuse (`codex exec resume`) from latest `codex_session_id`
 - periodic heartbeat + reconcile scan logs
-- postmortem issue resume via `orchd issue resume <repo> <issue_number> [-- <codex resume args...>]`
+- postmortem issue session inspection/resume via `orchd issue sessions` and `orchd issue resume`
 
 Role launch wrapper:
 
@@ -216,13 +216,16 @@ cargo run --bin orchd -- \
 Postmortem resume by issue (owner is fixed to `main`):
 
 ```bash
-cargo run --bin orchd -- issue resume forgejo-agent 20 -- --no-alt-screen
+cargo run --bin orchd -- issue sessions forgejo-agent 20
+cargo run --bin orchd -- issue resume forgejo-agent 20 --role codex-lead -- --no-alt-screen
+cargo run --bin orchd -- issue resume forgejo-agent 20 --dispatch-id 123 -- --no-alt-screen
 ```
 
 `issue resume` fails fast when:
 
 - the issue has any non-terminal dispatch (`queued|launching|starting|running`)
 - no `codex_session_id` has been recorded for the issue
+- multiple role sessions exist and neither `--role` nor `--dispatch-id` is supplied
 
 Health check:
 
