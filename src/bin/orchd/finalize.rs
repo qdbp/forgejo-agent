@@ -274,7 +274,9 @@ fn evaluate_landing(args: &FinalizeDispatchArgs) -> LandingOutcome {
                     lines: vec![format!("pr landing failed: {err:#}")],
                 };
             };
-            if !matches!(http.status, 409 | 423) {
+            // Forgejo documents 409/423 here, but we have observed intermittent 5xx from the merge
+            // endpoint in cases that are still recoverable via "fetch+rebase+retry".
+            if !(matches!(http.status, 409 | 423) || http.status >= 500) {
                 return LandingOutcome::Failure {
                     reason_code: "landing_pr_merge_failed".to_string(),
                     lines: vec![format!("pr landing failed: {http}")],
