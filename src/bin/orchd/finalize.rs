@@ -1,7 +1,7 @@
 use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use tracing::{info, info_span};
@@ -11,6 +11,7 @@ use forgejo_agent::config::AgentConfig;
 
 use forgejo_agent::orchd_dispatch_core::{DispatchEventKind, DispatchState};
 use forgejo_agent::types::OrchdRuntimeState;
+use forgejo_agent::types::RepoRef;
 
 use super::cli::FinalizeDispatchArgs;
 use super::db;
@@ -96,6 +97,47 @@ fn whoami_login(api: &ForgejoClient, cfg: &AgentConfig) -> Result<String> {
         .and_then(|value| value.as_str())
         .ok_or_else(|| anyhow!("whoami missing login field"))?;
     Ok(login.to_string())
+}
+
+fn merge_ff_only_with_retry(
+    api: &ForgejoClient,
+    cfg: &AgentConfig,
+    repo_ref: &RepoRef,
+    pr_number: u64,
+    head_sha: &str,
+    lines: &mut Vec<String>,
+) -> Result<()> {
+    const MAX_ATTEMPTS: u32 = 3;
+    const SLEEP_SEC: u64 = 10;
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        let merge_attempt = api.merge_pull_request(
+            cfg,
+            repo_ref,
+            pr_number,
+            MergePullMethod::FastForwardOnly,
+            Some(head_sha),
+            true,
+        );
+        match merge_attempt {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                let Some(http) = err.downcast_ref::<ApiHttpError>() else {
+                    return Err(err);
+                };
+                if http.status >= 500 && attempt < MAX_ATTEMPTS {
+                    lines.push(format!(
+                        "pr_merge_retry: transient server error status={} attempt={}/{}",
+                        http.status, attempt, MAX_ATTEMPTS
+                    ));
+                    std::thread::sleep(Duration::from_secs(SLEEP_SEC));
+                    continue;
+                }
+                return Err(err);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn evaluate_landing(args: &FinalizeDispatchArgs) -> LandingOutcome {
@@ -242,15 +284,7 @@ fn evaluate_landing(args: &FinalizeDispatchArgs) -> LandingOutcome {
         }
     };
 
-    let merge_attempt = api.merge_pull_request(
-        &cfg,
-        &repo_ref,
-        pr.number,
-        MergePullMethod::FastForwardOnly,
-        Some(&head_sha),
-        true,
-    );
-    match merge_attempt {
+    match merge_ff_only_with_retry(&api, &cfg, &repo_ref, pr.number, &head_sha, &mut lines) {
         Ok(()) => {
             lines.push(format!(
                 "pr_merge: ff-only #{} ({})",
