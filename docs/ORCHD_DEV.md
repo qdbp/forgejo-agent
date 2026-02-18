@@ -45,6 +45,63 @@ Dispatch behavior is configured in `config/orchd-dispatch.toml`:
 - prompt envelopes (`prompt_envelopes.fresh_envelope`, `prompt_envelopes.followup_envelope`)
 - control-plane command path (`forgejoctl_bin`)
 
+## Reading Material (DocPlan)
+
+`orchd` can inject repo/global “reading material” into the *fresh* prompt envelope (never on follow-ups).
+
+### Global Rules (orchd-owned)
+
+In `config/orchd-dispatch.toml`:
+
+```toml
+[reading_material]
+max_doc_bytes = 262144
+max_total_bytes = 1048576
+
+[[reading_material.rule]]
+kind = "point"                       # include|point
+ref = "repo:main/forgejo-agent:docs/AGENT_WORKFLOW.md"
+roles = ["*"]
+directives = ["*"]
+order = 10
+importance = "recommended"           # required|recommended
+```
+
+### Repo Rules (repo-owned)
+
+In the *dispatched repo root*:
+
+```toml
+# .orchd/config.toml
+[docs]
+
+[[docs.rule]]
+kind = "include"
+ref = "workdir:docs/SECURITY.md"
+roles = ["codex-dev"]
+directives = ["impl"]
+order = 10
+importance = "required"
+```
+
+Notes:
+- `workdir:` resolves relative to the repo being dispatched.
+- `repo:` resolves only if the target repo exists in `repo_bindings` (so refs are grounded in known local checkouts).
+- Missing/unreadable docs are warned (logs + `doc-plan.json`) and omitted from the prompt.
+
+### Prompt Preview
+
+Render the prompt (or inspect the DocPlan) without running a dispatch:
+
+```bash
+cargo run --bin orchd -- prompt preview main/foo#123 --role codex-dev --directive impl
+cargo run --bin orchd -- prompt preview main/foo#123 --role codex-dev --directive impl --json
+```
+
+### Postmortem Artifacts
+
+Each dispatch run dir includes `doc-plan.json` next to `prompt.md`.
+
 ## Trigger Spec
 
 `orchd` has a single trigger engine. Legacy behavior (explicit directives + assignee reply)

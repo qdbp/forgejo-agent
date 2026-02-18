@@ -9,6 +9,8 @@ use serde::Deserialize;
 use forgejo_agent::orchd_dispatch_core::DispatchNotificationPhase;
 use forgejo_agent::types::RepoRef;
 
+use super::reading_material::ReadingMaterialSpecSet;
+
 use super::lexicon::{
     DIRECTIVE_AUDIT, DIRECTIVE_DESIGN, DIRECTIVE_IMPL, DIRECTIVE_INVESTIGATE, DIRECTIVE_REPLY,
     EVENT_ISSUE_COMMENT, EVENT_ISSUES, directive_is_known,
@@ -19,6 +21,7 @@ use super::paths::expand_tilde_path;
 pub(super) struct DispatchConfig {
     pub(super) allowed_actors: Vec<String>,
     pub(super) prompt_envelopes: DispatchPromptEnvelopeConfig,
+    pub(super) reading_material: ReadingMaterialSpecSet,
     pub(super) notifications: DispatchNotificationsConfig,
     pub(super) rank_acl: DispatchRankAclConfig,
     pub(super) roles: HashMap<String, DispatchRoleConfig>,
@@ -380,6 +383,8 @@ struct DispatchConfigFile {
     allowed_actors: Vec<String>,
     #[serde(default)]
     prompt_envelopes: DispatchPromptEnvelopeConfigFile,
+    #[serde(default)]
+    reading_material: ReadingMaterialSpecSet,
     #[serde(default)]
     notifications: DispatchNotificationsConfigFile,
     #[serde(default)]
@@ -1301,6 +1306,7 @@ pub(super) fn load_dispatch_config(path: &Path) -> Result<DispatchConfig> {
     Ok(DispatchConfig {
         allowed_actors,
         prompt_envelopes,
+        reading_material: raw.reading_material,
         notifications: DispatchNotificationsConfig {
             enabled: raw.notifications.enabled,
             poll_sec: raw.notifications.poll_sec.max(1),

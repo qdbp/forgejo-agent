@@ -16,6 +16,9 @@ mod paths;
 // orchd dispatch configuration parsing/types. Read when changing prompt templates, roles, or directives.
 mod dispatch_config;
 
+// Reading material (DocPlan) config + render. Read when changing doc inclusion policy or prompt bloat controls.
+mod reading_material;
+
 // Dispatch errors + mapping to control-plane orchd runtime state. Read when adjusting failure semantics.
 mod errors;
 
@@ -63,6 +66,9 @@ mod issue;
 
 // Role inventory/check/add subcommands for dispatch identity hygiene. Read when onboarding roles or debugging role drift.
 mod role;
+
+// Prompt inspection utilities (preview rendered prompt + DocPlan). Read when debugging prompt composition.
+mod prompt;
 
 // Logging + tracing initialization. Read when debugging orchd logs or adding new observability.
 mod telemetry;

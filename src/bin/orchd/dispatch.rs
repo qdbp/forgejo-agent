@@ -25,6 +25,7 @@ use super::dispatch_config::{
 use super::errors::DispatchError;
 use super::forgejoctl_cmd;
 use super::lexicon;
+use super::reading_material;
 use super::repo;
 use super::run_dispatch::{CodexSandbox, CodexSessionId, DispatchExecSpecV1};
 use super::state::{AppState, DecisionRecord, EventRecord};
@@ -217,7 +218,7 @@ fn codex_sandbox_for_directive(directive: &str) -> CodexSandbox {
     }
 }
 
-fn render_fresh_preamble(
+pub(super) fn render_fresh_preamble(
     prompt_envelopes: &DispatchPromptEnvelopeConfig,
     rank_acl: &DispatchRankAclConfig,
     role_name: &str,
@@ -813,6 +814,15 @@ fn materialize_run_artifacts(
 
     let dispatch_md = render_dispatch_md(&dispatch_config.prompt_envelopes, plan, prompt_mode)?;
     let issue_md = render_issue_md(&dispatch_config.prompt_envelopes, plan, prompt_mode)?;
+    let reading_outcome = reading_material::build_reading_material(
+        &dispatch_config.reading_material,
+        &plan.intent.role,
+        &plan.intent.directive,
+        prompt_mode,
+        &plan.workdir,
+        &dispatch_config.repo_bindings,
+    );
+    let reading_material_md = reading_outcome.markdown;
 
     let envelope_template = fs::read_to_string(envelope_path).map_err(|err| {
         DispatchError::Io(format!(
@@ -825,6 +835,7 @@ fn materialize_run_artifacts(
         &[
             ("preamble_md", &preamble_md),
             ("dispatch_md", &dispatch_md),
+            ("reading_material_md", &reading_material_md),
             ("issue_md", &issue_md),
             ("orders_md", &orders_md),
         ],
@@ -835,6 +846,11 @@ fn materialize_run_artifacts(
         .map_err(|err| DispatchError::Io(format!("failed writing prompt: {err}")))?;
     fs::write(plan.run_dir.join("prompt_mode.txt"), prompt_mode)
         .map_err(|err| DispatchError::Io(format!("failed writing prompt mode: {err}")))?;
+    let doc_plan_path = plan.run_dir.join("doc-plan.json");
+    let doc_plan_json = serde_json::to_string_pretty(&reading_outcome.doc_plan)
+        .map_err(|err| DispatchError::Io(format!("failed serializing doc plan: {err}")))?;
+    fs::write(&doc_plan_path, doc_plan_json)
+        .map_err(|err| DispatchError::Io(format!("failed writing doc plan: {err}")))?;
 
     let spec_path = plan.run_dir.join("run-spec.json");
     let summary_path = plan.run_dir.join("summary.md");

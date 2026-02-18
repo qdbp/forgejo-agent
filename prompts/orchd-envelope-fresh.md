@@ -15,6 +15,8 @@ preferred. Observe good issue etiquette and use clear natural language.
 
 {{dispatch_md}}
 
+{{reading_material_md}}
+
 {{orders_md}}
 
 {{issue_md}}

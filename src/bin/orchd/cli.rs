@@ -42,9 +42,16 @@ pub(super) enum OrchdCommand {
     FinalizeDispatch(Box<FinalizeDispatchArgs>),
     RunDispatch(RunDispatchArgs),
     #[command(subcommand)]
+    Prompt(PromptCommand),
+    #[command(subcommand)]
     Issue(IssueCommand),
     #[command(subcommand)]
     Role(RoleCommand),
+}
+
+#[derive(Subcommand, Debug)]
+pub(super) enum PromptCommand {
+    Preview(PromptPreviewArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -184,6 +191,34 @@ pub(super) struct FinalizeDispatchArgs {
 pub(super) struct RunDispatchArgs {
     #[arg(long)]
     pub(super) spec: PathBuf,
+}
+
+#[derive(Args, Debug)]
+pub(super) struct PromptPreviewArgs {
+    pub(super) issue_ref: IssueRef,
+    #[arg(long)]
+    pub(super) role: String,
+    #[arg(long)]
+    pub(super) directive: String,
+    #[arg(long, value_enum, default_value_t = PromptMode::Fresh)]
+    pub(super) mode: PromptMode,
+    #[arg(long)]
+    pub(super) json: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(super) enum PromptMode {
+    Fresh,
+    Followup,
+}
+
+impl PromptMode {
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fresh => "fresh",
+            Self::Followup => "followup",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]

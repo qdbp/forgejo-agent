@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use super::cli::{Cli, IssueCommand, OrchdCommand, RoleCommand};
+use super::cli::{Cli, IssueCommand, OrchdCommand, PromptCommand, RoleCommand};
 use super::finalize;
 use super::issue;
+use super::prompt;
 use super::role;
 use super::run_dispatch;
 use super::server;
@@ -28,8 +29,15 @@ fn run_command(cli: &Cli, command: OrchdCommand) -> Result<()> {
     match command {
         OrchdCommand::FinalizeDispatch(args) => finalize::finalize_dispatch_command(*args),
         OrchdCommand::RunDispatch(args) => run_dispatch::run_dispatch_command(args),
+        OrchdCommand::Prompt(command) => run_prompt_command(cli, command),
         OrchdCommand::Issue(command) => run_issue_command(cli, command),
         OrchdCommand::Role(command) => run_role_command(cli, command),
+    }
+}
+
+fn run_prompt_command(cli: &Cli, command: PromptCommand) -> Result<()> {
+    match command {
+        PromptCommand::Preview(args) => prompt::prompt_preview_command(cli, args),
     }
 }
 
