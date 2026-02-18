@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::process::Command;
 use std::time::Duration as StdDuration;
 
@@ -139,6 +140,7 @@ fn notify_dispatch_phases(
     state: &AppState,
     config: &DispatchNotificationsConfig,
     baseline: NotificationBaseline,
+    suppress_threads: &HashSet<String>,
 ) -> Result<()> {
     let candidates = db::pending_dispatch_phase_notifications(
         &state.db_path,
@@ -148,6 +150,27 @@ fn notify_dispatch_phases(
     )?;
     for candidate in candidates {
         let thread = thread_key(&candidate.repo_full_name, candidate.issue_number);
+        if suppress_threads.contains(&thread) {
+            let inserted = db::record_notification_delivery(
+                &state.db_path,
+                &candidate.dedupe_key,
+                "dispatch_phase_suppressed",
+            )?;
+            if inserted {
+                log_line(
+                    "dispatch_notification_suppressed",
+                    json!({
+                        "dispatch_id": candidate.dispatch_id,
+                        "phase": candidate.phase.as_db_str(),
+                        "repo": candidate.repo_full_name,
+                        "issue_number": candidate.issue_number,
+                        "directive": candidate.directive,
+                        "target_role": candidate.target_role,
+                    }),
+                );
+            }
+            continue;
+        }
         let summary = dispatch_summary(&candidate);
         let body = dispatch_body(&candidate);
         match send_notification(config, &summary, &body, &thread) {
@@ -192,7 +215,8 @@ fn notify_replies(
     state: &AppState,
     config: &DispatchNotificationsConfig,
     baseline: NotificationBaseline,
-) -> Result<()> {
+) -> Result<HashSet<String>> {
+    let mut notified_threads = HashSet::new();
     let candidates = db::pending_reply_notifications(
         &state.db_path,
         &config.watch_login,
@@ -205,6 +229,7 @@ fn notify_replies(
         let body = reply_body(&candidate);
         match send_notification(config, summary, &body, &thread) {
             Ok(()) => {
+                notified_threads.insert(thread.clone());
                 let inserted = db::record_notification_delivery(
                     &state.db_path,
                     &candidate.dedupe_key,
@@ -236,7 +261,7 @@ fn notify_replies(
             }
         }
     }
-    Ok(())
+    Ok(notified_threads)
 }
 
 fn notify_once(
@@ -244,8 +269,10 @@ fn notify_once(
     config: &DispatchNotificationsConfig,
     baseline: NotificationBaseline,
 ) -> Result<()> {
-    notify_dispatch_phases(state, config, baseline)?;
-    notify_replies(state, config, baseline)?;
+    // Prefer reply notifications over dispatch phase notifications to avoid double-notifying the
+    // operator when a dispatch both updates state and posts a comment.
+    let reply_threads = notify_replies(state, config, baseline)?;
+    notify_dispatch_phases(state, config, baseline, &reply_threads)?;
     Ok(())
 }
 
