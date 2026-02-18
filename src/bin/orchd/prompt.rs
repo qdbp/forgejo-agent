@@ -8,14 +8,14 @@ use forgejo_agent::config::AgentConfig;
 use super::cli::{Cli, PromptMode, PromptPreviewArgs};
 use super::dispatch::render_fresh_preamble;
 use super::dispatch_config::load_dispatch_config;
-use super::paths::expand_tilde_path;
+use super::paths::{expand_tilde_path, resolve_dispatch_config_path};
 use super::reading_material;
 use super::repo;
 use super::state::AppState;
 use super::template;
 
 pub(super) fn prompt_preview_command(cli: &Cli, args: PromptPreviewArgs) -> Result<()> {
-    let dispatch_config_path = expand_tilde_path(&cli.dispatch_config)?;
+    let dispatch_config_path = resolve_dispatch_config_path(&cli.dispatch_config)?;
     let dispatch_config = load_dispatch_config(&dispatch_config_path)?;
 
     let role_name = args.role.trim().to_ascii_lowercase();

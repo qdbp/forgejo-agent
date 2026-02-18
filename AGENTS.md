@@ -3,14 +3,14 @@
 ## Start Here
 
 - Read `README.md` first for the canonical operator/developer workflow and command patterns.
-- Treat `docs/skill-sync/checklist.md` as mandatory when `forgejoctl` CLI surface changes.
+- Treat `/home/main/swarm/docs/skill-sync/checklist.md` as mandatory when `forgejoctl` CLI surface changes.
 
 ## Rust Quality Gate
 
 - For any Rust code change in this repo, run `python3 scripts/check.py` before finishing.
 - Treat any failure from `scripts/check.py` as blocking; do not ship until green.
 - Prefer fixing code over weakening lint settings; only add an allow when there is a clear policy reason.
-- Follow `docs/TESTING_POLICY.md` for tiered test requirements.
+- Follow `/home/main/swarm/docs/TESTING_POLICY.md` for tiered test requirements.
 - If you touch `src/main.rs`, `src/api.rs`, `src/policy.rs`, `src/types.rs`, or `tests/live_forgejo.rs`, also run:
   - `FORGEJO_LIVE_TESTS=1 cargo test --test live_forgejo -- --nocapture`
 
@@ -32,9 +32,9 @@
 When CLI surface changes (commands/flags/state names):
 
 1. run `python3 /home/main/forgejo-agent/scripts/verify_skill_sync.py --update`
-2. review `docs/skill-sync/cli-surface.txt`
+2. review `/home/main/swarm/docs/skill-sync/cli-surface.txt`
 3. update this skill’s command/reference guidance
-4. update `docs/skill-sync/checklist.md`
+4. update `/home/main/swarm/docs/skill-sync/checklist.md`
 5. run `python3 /home/main/forgejo-agent/scripts/check.py`
 
 ## Delivery Policy

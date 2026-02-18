@@ -12,7 +12,7 @@ need_cmd jq
 FORGEJOCTL_BIN="${FORGEJOCTL_BIN:-$HOME/.local/bin/forgejoctl}"
 ORCHD_BIN="${ORCHD_BIN:-$HOME/.local/bin/orchd}"
 ORCHD_TOKEN_FILE="${ORCHD_TOKEN_FILE:-$HOME/.config/forgejo-agent/creds/orchd.token}"
-DISPATCH_CONFIG_DEFAULT="$SCRIPT_DIR/../config/orchd-dispatch.toml"
+DISPATCH_CONFIG_DEFAULT="${SWARM_HOME:-$HOME/swarm}/config/orchd-dispatch.toml"
 AGENTS_SNIPPET_TEMPLATE="$SCRIPT_DIR/../templates/repo-agents-assimilation-snippet.md"
 
 usage() {
@@ -28,7 +28,7 @@ End-to-end repo assimilation for orchd dispatch:
 options:
   --repo OWNER/REPO              required
   --local-path PATH              required (local git checkout)
-  --dispatch-config PATH         default: config/orchd-dispatch.toml
+  --dispatch-config PATH         default: $HOME/swarm/config/orchd-dispatch.toml
   --dispatch-git-remote NAME     default: origin
   --dispatch-git-base BRANCH     default: main
   --forgejo-remote NAME          default: forgejo

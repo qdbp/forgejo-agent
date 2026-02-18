@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
+from pathlib import Path
 
 
 def run(argv: list[str]) -> None:
@@ -51,6 +53,11 @@ def main() -> None:
 
     run(clippy_args)
     run(["cargo", "test"])
+
+    swarm_home = Path(os.environ.get("SWARM_HOME", str(Path.home() / "swarm")))
+    dispatch_config = swarm_home / "config/orchd-dispatch.toml"
+    if not dispatch_config.is_file():
+        raise SystemExit(f"missing dispatch config: {dispatch_config}")
     run(
         [
             "cargo",
@@ -60,7 +67,7 @@ def main() -> None:
             "orchd",
             "--",
             "--dispatch-config",
-            "config/orchd-dispatch.toml",
+            str(dispatch_config),
             "role",
             "check",
             "--offline",

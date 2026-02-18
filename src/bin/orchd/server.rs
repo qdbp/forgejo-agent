@@ -25,7 +25,7 @@ use super::errors::runtime_state_for_dispatch_error;
 use super::inquisition::{InquisitionSpec, maybe_spawn_inquisition};
 use super::lexicon::{DIRECTIVE_IMPL, EVENT_ISSUE_COMMENT, EVENT_ISSUES};
 use super::notifier;
-use super::paths::expand_tilde_path;
+use super::paths::{expand_tilde_path, resolve_dispatch_config_path};
 use super::projection;
 use super::role;
 use super::state::{
@@ -57,7 +57,7 @@ pub(super) async fn run_server(cli: Cli) -> Result<()> {
     tokio::task::spawn_blocking(move || enforce_machine_identity(&identity_cfg))
         .await
         .context("startup identity guard task failed")??;
-    let dispatch_config_path = expand_tilde_path(&cli.dispatch_config)?;
+    let dispatch_config_path = resolve_dispatch_config_path(&cli.dispatch_config)?;
     let dispatch_config = match cli.dispatch_mode {
         DispatchMode::DryRun => None,
         DispatchMode::Exec => Some(load_dispatch_config(&dispatch_config_path)?),

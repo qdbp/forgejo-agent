@@ -10,6 +10,19 @@ Agents should use one executable for Forgejo operations:
 
 Direct raw API poking is discouraged for agents.
 
+## Swarm Home
+
+Swarm doctrine and configuration are owned by the private `main/swarm` repo,
+checked out at:
+
+- `/home/main/swarm`
+
+This is the canonical home for:
+
+- `docs/` (swarm-wide runbooks and workflow contract)
+- `prompts/` (role cards, orders, envelopes)
+- `config/orchd-dispatch.toml` (orchd dispatch + reading material routing)
+
 `forgejoctl` token discovery order:
 
 1. `--token-file`
@@ -141,7 +154,7 @@ Core behavior:
 
 Role launch wrapper:
 
-- `orchd` dispatches Codex through the repo-managed wrapper `bin/codex-role` (configured in `config/orchd-dispatch.toml`), not by clobbering `/usr/bin/codex`.
+- `orchd` dispatches Codex through the repo-managed wrapper `bin/codex-role` (configured in `/home/main/swarm/config/orchd-dispatch.toml`), not by clobbering `/usr/bin/codex`.
 - `orchd` service auth uses `~/.config/forgejo-agent/creds/orchd.token` so orchestrator actions never impersonate `main`.
 
 Role hygiene commands:
@@ -167,7 +180,7 @@ cargo run --bin orchd -- \
   --reconcile-sec 45 \
   --dispatch-mode exec \
   --dispatch-backend systemd \
-  --dispatch-config /home/main/forgejo-agent/config/orchd-dispatch.toml
+  --dispatch-config /home/main/swarm/config/orchd-dispatch.toml
 ```
 
 Run (`exec` + local backend, convenient for tests):
@@ -182,7 +195,7 @@ cargo run --bin orchd -- \
   --reconcile-sec 45 \
   --dispatch-mode exec \
   --dispatch-backend local \
-  --dispatch-config /home/main/forgejo-agent/config/orchd-dispatch.toml
+  --dispatch-config /home/main/swarm/config/orchd-dispatch.toml
 ```
 
 Run as user service (recommended for easy restart/visibility):
@@ -250,7 +263,7 @@ python3 /home/main/forgejo-agent/scripts/check.py
 To onboard another repository into orchd/Forgejo "it just works" mode, use the
 single-package runbook:
 
-- `docs/REPO_ASSIMILATION.md`
+- `/home/main/swarm/docs/REPO_ASSIMILATION.md`
 
 Primary command:
 
@@ -308,7 +321,7 @@ Installed hooks:
 
 - verifies `forgejoctl` CLI surface snapshot/hash
 - requires matching hash + command block in `~/.codex/skills/forgejoctl/SKILL.md`
-- requires matching hash/checklist acknowledgement in `docs/skill-sync/checklist.md`
+- requires matching hash/checklist acknowledgement in `/home/main/swarm/docs/skill-sync/checklist.md`
 
 If CLI shape changes intentionally:
 
@@ -319,12 +332,12 @@ python3 /home/main/forgejo-agent/scripts/check.py
 
 ## Docs
 
-- `docs/ROOT_SETUP.md`
-- `docs/TESTING_POLICY.md`
-- `docs/AGENT_WORKFLOW.md`
-- `docs/WORKER_LOOP.md`
-- `docs/ORCHD_DEV.md`
-- `docs/ORCHD_PROMPT_STATE_PLAN.md` (historical draft)
-- `docs/MCP_SETUP.md`
-- `docs/SECURITY.md`
-- `docs/skill-sync/checklist.md`
+- `/home/main/swarm/docs/ROOT_SETUP.md`
+- `/home/main/swarm/docs/TESTING_POLICY.md`
+- `/home/main/swarm/docs/AGENT_WORKFLOW.md`
+- `/home/main/swarm/docs/WORKER_LOOP.md`
+- `/home/main/swarm/docs/ORCHD_DEV.md`
+- `/home/main/swarm/docs/ORCHD_PROMPT_STATE_PLAN.md` (historical draft)
+- `/home/main/swarm/docs/MCP_SETUP.md`
+- `/home/main/swarm/docs/SECURITY.md`
+- `/home/main/swarm/docs/skill-sync/checklist.md`

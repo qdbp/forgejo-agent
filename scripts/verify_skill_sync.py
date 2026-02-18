@@ -12,16 +12,18 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SNAPSHOT_PATH = REPO_ROOT / "docs/skill-sync/cli-surface.txt"
-HASH_PATH = REPO_ROOT / "docs/skill-sync/cli-surface.sha256"
-CHECKLIST_PATH = REPO_ROOT / "docs/skill-sync/checklist.md"
+SWARM_HOME = Path(os.environ.get("SWARM_HOME", str(Path.home() / "swarm")))
+SWARM_DOCS = SWARM_HOME / "docs"
+SNAPSHOT_PATH = SWARM_DOCS / "skill-sync/cli-surface.txt"
+HASH_PATH = SWARM_DOCS / "skill-sync/cli-surface.sha256"
+CHECKLIST_PATH = SWARM_DOCS / "skill-sync/checklist.md"
 DEFAULT_SKILL_PATH = Path.home() / ".codex/skills/forgejoctl/SKILL.md"
 
 BLOCK_START = "<!-- BEGIN FORGEJOCTL_COMMAND_SET -->"
 BLOCK_END = "<!-- END FORGEJOCTL_COMMAND_SET -->"
 
 CHECKLIST_ITEMS = (
-    "Verified skill command reference against docs/skill-sync/cli-surface.txt.",
+    "Verified skill command reference against swarm/docs/skill-sync/cli-surface.txt.",
     "Updated skill procedural guidance for any CLI/workflow changes.",
     "Re-ran python3 /home/main/forgejo-agent/scripts/check.py after sync updates.",
 )
@@ -237,7 +239,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--update",
         action="store_true",
-        help="Regenerate docs/skill-sync/cli-surface.txt and cli-surface.sha256",
+        help="Regenerate swarm/docs/skill-sync/cli-surface.txt and cli-surface.sha256",
     )
     parser.add_argument(
         "--skill-path",

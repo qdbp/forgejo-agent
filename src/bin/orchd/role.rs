@@ -16,7 +16,7 @@ use forgejo_agent::types::RepoRef;
 
 use super::cli::{Cli, RoleAddArgs, RoleCheckArgs, RoleListArgs};
 use super::dispatch_config::{DispatchConfig, load_dispatch_config};
-use super::paths::expand_tilde_path;
+use super::paths::{expand_tilde_path, resolve_dispatch_config_path};
 
 const DEFAULT_CODEX_BIN: &str = "/home/main/forgejo-agent/bin/codex-role";
 const DEFAULT_ROLE_TEMPLATE: &str = "templates/role-card-template.md";
@@ -88,7 +88,7 @@ struct RemoteProvisioningReceipt {
 }
 
 pub(super) fn role_list_command(cli: &Cli, args: RoleListArgs) -> Result<()> {
-    let dispatch_config_path = resolve_dispatch_config_path(cli)?;
+    let dispatch_config_path = resolve_dispatch_config_path(cli.dispatch_config.as_str())?;
     let dispatch_config = load_dispatch_config(&dispatch_config_path)?;
     let mut rows = collect_role_summaries(&dispatch_config);
     rows.sort_by(|left, right| left.role.cmp(&right.role));
@@ -113,7 +113,7 @@ pub(super) fn role_list_command(cli: &Cli, args: RoleListArgs) -> Result<()> {
 }
 
 pub(super) fn role_check_command(cli: &Cli, args: RoleCheckArgs) -> Result<()> {
-    let dispatch_config_path = resolve_dispatch_config_path(cli)?;
+    let dispatch_config_path = resolve_dispatch_config_path(cli.dispatch_config.as_str())?;
     let dispatch_config = load_dispatch_config(&dispatch_config_path)?;
     let report = if args.offline {
         run_role_check_offline(&dispatch_config, args.role.as_deref())
@@ -191,7 +191,7 @@ pub(super) fn enforce_startup_role_check(
 }
 
 pub(super) fn role_add_command(cli: &Cli, args: RoleAddArgs) -> Result<()> {
-    let dispatch_config_path = resolve_dispatch_config_path(cli)?;
+    let dispatch_config_path = resolve_dispatch_config_path(cli.dispatch_config.as_str())?;
     let dispatch_config = load_dispatch_config(&dispatch_config_path)?;
     let cfg = AgentConfig::load(cli.config.clone(), cli.token_file.clone())?;
     let client = ForgejoClient::new(&cfg)?;
@@ -642,11 +642,6 @@ fn evaluate_roles_offline(config: &DispatchConfig, role_filter: Option<String>) 
 
 fn expected_admin_for_role(role_name: &str) -> bool {
     matches!(role_name, "main" | "codex-orch")
-}
-
-fn resolve_dispatch_config_path(cli: &Cli) -> Result<PathBuf> {
-    let raw = cli.dispatch_config.as_str();
-    expand_tilde_path(raw)
 }
 
 fn normalize_name(raw: &str) -> String {
