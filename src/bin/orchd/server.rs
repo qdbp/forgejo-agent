@@ -209,7 +209,7 @@ pub(super) async fn run_server(cli: Cli) -> Result<()> {
     let mode_name = state.dispatch_mode.as_str();
     let backend_name = state.dispatch_backend.as_str();
 
-    match dispatch::heal_stale_inflight_dispatches(&state.db_path) {
+    match dispatch::heal_stale_inflight_dispatches(&state).await {
         Ok(healed) => {
             log_line(
                 "startup_stale_heal_complete",

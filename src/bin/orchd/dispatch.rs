@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde_json::json;
 use tracing::{info, info_span};
@@ -15,7 +15,7 @@ use forgejo_agent::orchd_dispatch_core::{
     DispatchBackendKind, DispatchIntentV1, DispatchPolicyOutcome, DispatchState,
     PolicyDecision as DispatchPolicyDecision, RunHandle,
 };
-use forgejo_agent::types::{ApiIssue, IssueRef, RepoRef};
+use forgejo_agent::types::{ApiIssue, IssueRef, OrchdRuntimeState, RepoRef, WorkflowState};
 
 use super::cli::{DispatchBackend, DispatchMode};
 use super::db;
@@ -27,6 +27,7 @@ use super::errors::DispatchError;
 use super::forgejoctl_cmd;
 use super::lexicon;
 use super::paths::expand_tilde_path;
+use super::projection;
 use super::reading_material;
 use super::repo;
 use super::run_dispatch::{
@@ -38,6 +39,7 @@ use super::template;
 use super::webhook;
 
 pub(super) const STARTING_DISPATCH_STALE_AFTER_SEC: i64 = 120;
+const STALE_DISPATCH_REASON_CODE: &str = "stale_dispatch_autohealed";
 
 fn strip_linux_deleted_suffix(path: &Path) -> Option<PathBuf> {
     let raw = path.to_str()?;
@@ -496,14 +498,132 @@ fn should_heal_dispatch_stale(
     }
 }
 
-fn find_issue_inflight_dispatch_with_healing(
-    db_path: &Path,
+fn is_workflow_label(label_name: &str) -> bool {
+    WorkflowState::from_label(label_name).is_some()
+}
+
+fn transition_issue_to_ready(
+    api: &ForgejoClient,
+    state: &AppState,
+    issue_ref: &IssueRef,
+    issue: &ApiIssue,
+) -> Result<()> {
+    let ready_label_id = api
+        .ensure_label(
+            &state.cfg,
+            &issue_ref.repo,
+            WorkflowState::Ready.label(),
+            "5319e7",
+            "workflow state",
+            true,
+        )?
+        .id;
+    let mut replacement_ids = issue
+        .labels
+        .iter()
+        .filter(|label| !is_workflow_label(&label.name))
+        .map(|label| label.id)
+        .collect::<Vec<_>>();
+    replacement_ids.push(ready_label_id);
+    replacement_ids.sort_unstable();
+    replacement_ids.dedup();
+    api.replace_issue_label_ids(&state.cfg, issue_ref, replacement_ids)?;
+    Ok(())
+}
+
+async fn release_stale_issue_claim_and_reset_workflow(
+    state: AppState,
+    repo_full_name: String,
+    issue_number: u64,
+) -> Result<()> {
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let api = ForgejoClient::new(&state.cfg)
+            .context("initializing Forgejo client for stale dispatch reap")?;
+        let repo = RepoRef::parse(&repo_full_name).context("parsing stale dispatch repo")?;
+        let issue_ref = IssueRef {
+            repo,
+            number: issue_number,
+        };
+        let issue = api
+            .get_issue(&state.cfg, &issue_ref)
+            .with_context(|| format!("loading issue {issue_ref} for stale dispatch reap"))?;
+
+        for label in issue.claimed_labels() {
+            api.remove_issue_label(&state.cfg, &issue_ref, label.id)
+                .with_context(|| {
+                    format!(
+                        "removing stale claim label {} from issue {issue_ref}",
+                        label.name
+                    )
+                })?;
+        }
+
+        let refreshed = api
+            .get_issue(&state.cfg, &issue_ref)
+            .with_context(|| format!("reloading issue {issue_ref} after claim removal"))?;
+        if refreshed.workflow_state()? == Some(WorkflowState::InProgress) {
+            transition_issue_to_ready(&api, &state, &issue_ref, &refreshed).with_context(|| {
+                format!("resetting issue {issue_ref} workflow from in-progress to ready")
+            })?;
+        }
+        Ok(())
+    })
+    .await
+    .context("stale dispatch reap task join failure")??;
+    Ok(())
+}
+
+async fn reconcile_stale_autoheal_projection(state: &AppState, dispatch: &db::InflightDispatch) {
+    if let Err(err) = release_stale_issue_claim_and_reset_workflow(
+        state.clone(),
+        dispatch.repo_full_name.clone(),
+        dispatch.issue_number,
+    )
+    .await
+    {
+        log_line(
+            "dispatch_autoheal_reap_failed",
+            json!({
+                "dispatch_id": dispatch.id,
+                "repo": &dispatch.repo_full_name,
+                "issue_number": dispatch.issue_number,
+                "error": err.to_string(),
+            }),
+        );
+    }
+
+    if let Err(err) = projection::project_issue_runtime_state(
+        state.clone(),
+        &dispatch.repo_full_name,
+        dispatch.issue_number,
+        OrchdRuntimeState::Failed,
+        Some(STALE_DISPATCH_REASON_CODE),
+        None,
+    )
+    .await
+    {
+        log_line(
+            "dispatch_autoheal_projection_failed",
+            json!({
+                "dispatch_id": dispatch.id,
+                "repo": &dispatch.repo_full_name,
+                "issue_number": dispatch.issue_number,
+                "runtime_state": OrchdRuntimeState::Failed.label(),
+                "reason_code": STALE_DISPATCH_REASON_CODE,
+                "error": err.to_string(),
+            }),
+        );
+    }
+}
+
+async fn find_issue_inflight_dispatch_with_healing(
+    state: &AppState,
     repo_full_name: &str,
     issue_number: u64,
 ) -> Result<Option<i64>> {
     loop {
         let Some(dispatch) =
-            db::latest_issue_inflight_dispatch(db_path, repo_full_name, issue_number)?
+            db::latest_issue_inflight_dispatch(&state.db_path, repo_full_name, issue_number)?
         else {
             return Ok(None);
         };
@@ -511,9 +631,9 @@ fn find_issue_inflight_dispatch_with_healing(
             return Ok(Some(dispatch.id));
         }
         db::mark_dispatch_failed_runtime(
-            db_path,
+            &state.db_path,
             dispatch.id,
-            "stale_dispatch_autohealed",
+            STALE_DISPATCH_REASON_CODE,
             "auto-healed stale in-flight dispatch before launch",
         )?;
         if let Some(lock_path) = dispatch.lock_path.as_deref() {
@@ -525,25 +645,28 @@ fn find_issue_inflight_dispatch_with_healing(
                 "dispatch_id": dispatch.id,
                 "repo": repo_full_name,
                 "issue_number": issue_number,
-                "status": dispatch.status,
-                "reason_code": "stale_dispatch_autohealed",
+                "status": dispatch.status.as_db_str(),
+                "reason_code": STALE_DISPATCH_REASON_CODE,
             }),
         );
+        reconcile_stale_autoheal_projection(state, &dispatch).await;
     }
 }
 
-pub(super) fn heal_stale_inflight_dispatches(db_path: &Path) -> Result<usize, DispatchError> {
-    let inflight =
-        db::list_inflight_dispatches(db_path).map_err(|err| DispatchError::Db(err.to_string()))?;
+pub(super) async fn heal_stale_inflight_dispatches(
+    state: &AppState,
+) -> Result<usize, DispatchError> {
+    let inflight = db::list_inflight_dispatches(&state.db_path)
+        .map_err(|err| DispatchError::Db(err.to_string()))?;
     let mut healed = 0usize;
     for dispatch in inflight {
         if !should_heal_dispatch_stale(&dispatch, &dispatch.repo_full_name, dispatch.issue_number) {
             continue;
         }
         db::mark_dispatch_failed_runtime(
-            db_path,
+            &state.db_path,
             dispatch.id,
-            "stale_dispatch_autohealed",
+            STALE_DISPATCH_REASON_CODE,
             "auto-healed stale in-flight dispatch during startup sweep",
         )
         .map_err(|err| DispatchError::Db(err.to_string()))?;
@@ -554,12 +677,13 @@ pub(super) fn heal_stale_inflight_dispatches(db_path: &Path) -> Result<usize, Di
             "dispatch_autohealed",
             json!({
                 "dispatch_id": dispatch.id,
-                "repo": dispatch.repo_full_name,
+                "repo": &dispatch.repo_full_name,
                 "issue_number": dispatch.issue_number,
-                "status": dispatch.status,
-                "reason_code": "stale_dispatch_autohealed",
+                "status": dispatch.status.as_db_str(),
+                "reason_code": STALE_DISPATCH_REASON_CODE,
             }),
         );
+        reconcile_stale_autoheal_projection(state, &dispatch).await;
         healed += 1;
     }
     Ok(healed)
@@ -703,10 +827,11 @@ async fn plan_dispatch(
     }
 
     if let Some(dispatch_id) = find_issue_inflight_dispatch_with_healing(
-        &state.db_path,
+        state,
         &intent.repo_full_name,
         intent.issue_number,
     )
+    .await
     .map_err(|err| DispatchError::Db(err.to_string()))?
     {
         return Err(DispatchError::IssueDispatchInFlight {
