@@ -116,6 +116,30 @@ fn merge_endpoint_reports_try_again_later(http: &ApiHttpError) -> bool {
     http.status == 405 && http.body.contains("Please try again later")
 }
 
+fn fetch_open_pr_mergeable_state(
+    api: &ForgejoClient,
+    cfg: &AgentConfig,
+    repo_ref: &RepoRef,
+    pr_number: u64,
+) -> Option<bool> {
+    api.list_pull_requests(cfg, repo_ref, "open", 200)
+        .ok()?
+        .into_iter()
+        .find(|pr| pr.number == pr_number)
+        .and_then(|pr| pr.mergeable)
+}
+
+fn classify_persistent_merge_block(mergeable_state: Option<bool>) -> (&'static str, &'static str) {
+    if mergeable_state == Some(false) {
+        (
+            "pr_not_mergeable",
+            "mergeability is false after retry; manual conflict resolution is required",
+        )
+    } else {
+        ("pr_merge_blocked", "merge still blocked after retry")
+    }
+}
+
 fn merge_ff_only_with_retry(
     api: &ForgejoClient,
     cfg: &AgentConfig,
@@ -554,6 +578,18 @@ fn evaluate_landing_target(
                     } else {
                         String::new()
                     };
+                    let mergeable_state = err
+                        .downcast_ref::<ApiHttpError>()
+                        .and_then(|http| merge_endpoint_reports_try_again_later(http).then_some(()))
+                        .and_then(|()| {
+                            fetch_open_pr_mergeable_state(&api, &cfg, &repo_ref, pr.number)
+                        });
+                    let (reason_code, detail) = classify_persistent_merge_block(mergeable_state);
+                    let template_error = if reason_code == "pr_not_mergeable" {
+                        format!("{detail}\n\nraw error: {err:#}")
+                    } else {
+                        format!("{err:#}")
+                    };
                     let template_path = args
                         .git_workdir
                         .join("templates/orchd-landing-pr-merge-blocked.md");
@@ -564,7 +600,7 @@ fn evaluate_landing_target(
                             ("branch", branch),
                             ("base_branch", target.git_base),
                             ("retry_mention", retry_mention.as_str()),
-                            ("error", &format!("{err:#}")),
+                            ("error", template_error.as_str()),
                         ],
                         "pr merge blocked",
                     )
@@ -575,13 +611,13 @@ fn evaluate_landing_target(
                         )
                     });
                     LandingOutcome::Blocked {
-                        reason_code: "pr_merge_blocked".to_string(),
-                        lines: vec![format!("{prefix}pr landing blocked: merge failed: {err:#}")],
+                        reason_code: reason_code.to_string(),
+                        lines: vec![format!("{prefix}pr landing blocked: {detail}: {err:#}")],
                         comment: Some(LandingCommentSpec {
-                            delivery_kind: "pr_merge_blocked",
+                            delivery_kind: reason_code,
                             dedupe_key: format!(
-                                "dispatch:{}:{}:pr_merge_blocked",
-                                args.dispatch_id, target.kind
+                                "dispatch:{}:{}:{}",
+                                args.dispatch_id, target.kind, reason_code
                             ),
                             body,
                         }),
@@ -932,6 +968,7 @@ pub(super) fn finalize_dispatch_command(args: FinalizeDispatchArgs) -> Result<()
 mod tests {
     use std::path::PathBuf;
 
+    use super::classify_persistent_merge_block;
     use super::merge_endpoint_reports_try_again_later;
     use super::work_state_transition_target;
     use forgejo_agent::api::ApiHttpError;
@@ -954,6 +991,25 @@ mod tests {
             body: "{\"message\":\"Pull request is work in progress\"}".to_string(),
         };
         assert!(!merge_endpoint_reports_try_again_later(&other_405));
+    }
+
+    #[test]
+    fn persistent_merge_block_is_classified_from_mergeable_state() {
+        assert_eq!(
+            classify_persistent_merge_block(Some(false)),
+            (
+                "pr_not_mergeable",
+                "mergeability is false after retry; manual conflict resolution is required"
+            )
+        );
+        assert_eq!(
+            classify_persistent_merge_block(None),
+            ("pr_merge_blocked", "merge still blocked after retry")
+        );
+        assert_eq!(
+            classify_persistent_merge_block(Some(true)),
+            ("pr_merge_blocked", "merge still blocked after retry")
+        );
     }
 
     #[test]

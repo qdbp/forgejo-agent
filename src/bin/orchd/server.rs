@@ -13,10 +13,10 @@ use rusqlite::OptionalExtension;
 use rusqlite::params;
 use serde_json::json;
 
-use forgejo_agent::api::ForgejoClient;
+use forgejo_agent::api::{ApiHttpError, ForgejoClient, MergePullMethod};
 use forgejo_agent::config::AgentConfig;
 use forgejo_agent::policy::STATE_LABEL_COLOR;
-use forgejo_agent::types::{IssueRef, OrchdRuntimeState, RepoRef, WorkflowState};
+use forgejo_agent::types::{ApiPullRequest, IssueRef, OrchdRuntimeState, RepoRef, WorkflowState};
 
 use super::cli::{Cli, DispatchMode};
 use super::db;
@@ -40,6 +40,102 @@ use super::webhook::{
     decide, extract_event_context, extract_header, load_secret, synthetic_delivery_id,
     trigger_dedupe_key, verify_signature,
 };
+
+const AUTOMERGE_BRANCH_PREFIXES: [&str; 2] = ["orchd/", "i/"];
+const AUTOMERGE_MAX_ATTEMPTS: u32 = 3;
+const AUTOMERGE_RETRY_SLEEP_SEC: u64 = 3;
+
+#[derive(Debug, Default, Clone, Copy)]
+struct AutomergeSweepStats {
+    repos_scanned: usize,
+    prs_scanned: usize,
+    candidates: usize,
+    merged: usize,
+    skipped_not_candidate: usize,
+    skipped_not_mergeable: usize,
+    skipped_transient: usize,
+    errors: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutomergeAttemptOutcome {
+    Merged,
+    NotMergeable,
+    TryLater,
+}
+
+fn merge_endpoint_reports_try_again_later(http: &ApiHttpError) -> bool {
+    http.status == 405 && http.body.contains("Please try again later")
+}
+
+fn is_automerge_candidate_branch(branch: &str) -> bool {
+    AUTOMERGE_BRANCH_PREFIXES
+        .iter()
+        .any(|prefix| branch.starts_with(prefix))
+}
+
+fn is_automerge_candidate_pr(pr: &ApiPullRequest) -> bool {
+    if pr.merged || !pr.state.eq_ignore_ascii_case("open") {
+        return false;
+    }
+    is_automerge_candidate_branch(pr.head.ref_name.as_str())
+}
+
+fn refresh_open_pr_mergeable_state(
+    api: &ForgejoClient,
+    cfg: &AgentConfig,
+    repo: &RepoRef,
+    pr_number: u64,
+) -> Option<bool> {
+    api.list_pull_requests(cfg, repo, "open", 200)
+        .ok()?
+        .into_iter()
+        .find(|pr| pr.number == pr_number)
+        .and_then(|pr| pr.mergeable)
+}
+
+fn attempt_automerge_pr(
+    api: &ForgejoClient,
+    cfg: &AgentConfig,
+    repo: &RepoRef,
+    pr: &ApiPullRequest,
+) -> Result<AutomergeAttemptOutcome> {
+    for attempt in 1..=AUTOMERGE_MAX_ATTEMPTS {
+        match api.merge_pull_request(
+            cfg,
+            repo,
+            pr.number,
+            MergePullMethod::FastForwardOnly,
+            Some(pr.head.sha.as_str()),
+            true,
+        ) {
+            Ok(()) => return Ok(AutomergeAttemptOutcome::Merged),
+            Err(err) => {
+                let Some(http) = err.downcast_ref::<ApiHttpError>() else {
+                    return Err(err);
+                };
+                let transient_405 = merge_endpoint_reports_try_again_later(http);
+                if attempt < AUTOMERGE_MAX_ATTEMPTS && (http.status >= 500 || transient_405) {
+                    std::thread::sleep(StdDuration::from_secs(AUTOMERGE_RETRY_SLEEP_SEC));
+                    continue;
+                }
+                if transient_405 {
+                    let mergeable = refresh_open_pr_mergeable_state(api, cfg, repo, pr.number);
+                    return Ok(if mergeable == Some(false) {
+                        AutomergeAttemptOutcome::NotMergeable
+                    } else {
+                        AutomergeAttemptOutcome::TryLater
+                    });
+                }
+                if matches!(http.status, 409 | 423) {
+                    return Ok(AutomergeAttemptOutcome::NotMergeable);
+                }
+                return Err(err);
+            }
+        }
+    }
+    Ok(AutomergeAttemptOutcome::TryLater)
+}
 
 pub(super) async fn run_server(cli: Cli) -> Result<()> {
     let listen_addr: SocketAddr = cli
@@ -334,6 +430,91 @@ async fn ensure_repo_webhooks_for_default_owner(state: &AppState) -> Result<()> 
     })
     .await
     .context("repo webhook ensure join failure")?
+}
+
+async fn run_global_automerge_sweep(state: &AppState) -> Result<AutomergeSweepStats> {
+    let cfg = state.cfg.clone();
+    let owner = state.cfg.default_repo.owner.clone();
+    tokio::task::spawn_blocking(move || -> Result<AutomergeSweepStats> {
+        let api = ForgejoClient::new(&cfg)?;
+        let repos = api.list_user_repos(&cfg, owner.as_str(), 1000)?;
+        let mut sweep_stats = AutomergeSweepStats::default();
+        for repo in repos {
+            let Some(repo_full_name) = repo.get("full_name").and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            let Ok(repo_ref) = RepoRef::parse(repo_full_name) else {
+                continue;
+            };
+            sweep_stats.repos_scanned += 1;
+
+            let prs = match api.list_pull_requests(&cfg, &repo_ref, "open", 200) {
+                Ok(prs) => prs,
+                Err(err) => {
+                    sweep_stats.errors += 1;
+                    log_line(
+                        "automerge_repo_scan_error",
+                        json!({
+                            "repo": repo_ref.to_string(),
+                            "error": err.to_string(),
+                        }),
+                    );
+                    continue;
+                }
+            };
+            sweep_stats.prs_scanned += prs.len();
+
+            for pr in prs {
+                if !is_automerge_candidate_pr(&pr) {
+                    sweep_stats.skipped_not_candidate += 1;
+                    continue;
+                }
+                sweep_stats.candidates += 1;
+                if pr.mergeable == Some(false) {
+                    sweep_stats.skipped_not_mergeable += 1;
+                    continue;
+                }
+
+                match attempt_automerge_pr(&api, &cfg, &repo_ref, &pr) {
+                    Ok(AutomergeAttemptOutcome::Merged) => {
+                        sweep_stats.merged += 1;
+                        log_line(
+                            "automerge_pr_merged",
+                            json!({
+                                "repo": repo_ref.to_string(),
+                                "pr": pr.number,
+                                "url": pr.html_url,
+                                "head_branch": pr.head.ref_name,
+                            }),
+                        );
+                    }
+                    Ok(AutomergeAttemptOutcome::NotMergeable) => {
+                        sweep_stats.skipped_not_mergeable += 1;
+                    }
+                    Ok(AutomergeAttemptOutcome::TryLater) => {
+                        sweep_stats.skipped_transient += 1;
+                    }
+                    Err(err) => {
+                        sweep_stats.errors += 1;
+                        log_line(
+                            "automerge_pr_error",
+                            json!({
+                                "repo": repo_ref.to_string(),
+                                "pr": pr.number,
+                                "url": pr.html_url,
+                                "error": err.to_string(),
+                            }),
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(sweep_stats)
+    })
+    .await
+    .context("automerge sweep join failure")?
 }
 
 async fn webhook_handler(
@@ -957,6 +1138,35 @@ async fn reconcile_once(state: &AppState) -> Result<()> {
             }),
         );
     }
+    if matches!(state.dispatch_mode, DispatchMode::Exec) {
+        match run_global_automerge_sweep(state).await {
+            Ok(sweep_stats) => {
+                log_line(
+                    "automerge_sweep",
+                    json!({
+                        "owner": state.cfg.default_repo.owner,
+                        "repos_scanned": sweep_stats.repos_scanned,
+                        "prs_scanned": sweep_stats.prs_scanned,
+                        "candidates": sweep_stats.candidates,
+                        "merged": sweep_stats.merged,
+                        "skipped_not_candidate": sweep_stats.skipped_not_candidate,
+                        "skipped_not_mergeable": sweep_stats.skipped_not_mergeable,
+                        "skipped_transient": sweep_stats.skipped_transient,
+                        "errors": sweep_stats.errors,
+                    }),
+                );
+            }
+            Err(err) => {
+                log_line(
+                    "automerge_sweep_error",
+                    json!({
+                        "owner": state.cfg.default_repo.owner,
+                        "error": err.to_string(),
+                    }),
+                );
+            }
+        }
+    }
     let cfg = state.cfg.clone();
     let repo = state.reconcile_repo.clone();
 
@@ -1029,4 +1239,63 @@ async fn reconcile_once(state: &AppState) -> Result<()> {
         }),
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_automerge_candidate_branch, is_automerge_candidate_pr};
+    use forgejo_agent::types::{ApiPrBranchInfo, ApiPullRequest};
+
+    fn sample_pr(branch: &str, state: &str, merged: bool) -> ApiPullRequest {
+        ApiPullRequest {
+            number: 1,
+            state: state.to_string(),
+            title: "t".to_string(),
+            html_url: "http://127.0.0.1:3000/main/r/pulls/1".to_string(),
+            merged,
+            mergeable: Some(true),
+            head: ApiPrBranchInfo {
+                ref_name: branch.to_string(),
+                sha: "abc123".to_string(),
+            },
+            base: ApiPrBranchInfo {
+                ref_name: "main".to_string(),
+                sha: "def456".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn automerge_branch_candidates_are_narrow() {
+        assert!(is_automerge_candidate_branch(
+            "orchd/d10/rmain-swarm-i1-impl"
+        ));
+        assert!(is_automerge_candidate_branch("i/106-global-automerge"));
+        assert!(!is_automerge_candidate_branch("feature/manual-experiment"));
+        assert!(!is_automerge_candidate_branch("main"));
+    }
+
+    #[test]
+    fn automerge_candidate_pr_requires_open_unmerged_state() {
+        assert!(is_automerge_candidate_pr(&sample_pr(
+            "orchd/d10/rmain-swarm-i1-impl",
+            "open",
+            false
+        )));
+        assert!(!is_automerge_candidate_pr(&sample_pr(
+            "orchd/d10/rmain-swarm-i1-impl",
+            "closed",
+            false
+        )));
+        assert!(!is_automerge_candidate_pr(&sample_pr(
+            "orchd/d10/rmain-swarm-i1-impl",
+            "open",
+            true
+        )));
+        assert!(!is_automerge_candidate_pr(&sample_pr(
+            "feature/manual-experiment",
+            "open",
+            false
+        )));
+    }
 }
