@@ -12,6 +12,7 @@ use forgejo_agent::types::RepoRef;
 use super::dispatch_config::DispatchRepoBindingConfig;
 
 const REPO_CONFIG_PATH: &str = ".orchd/config.toml";
+const STYLE_GUIDE_REPO_FULL_NAME: &str = "main/swarm";
 
 const DEFAULT_MAX_DOC_BYTES: u64 = 256 * 1024;
 const DEFAULT_MAX_TOTAL_BYTES: u64 = 1024 * 1024;
@@ -381,7 +382,20 @@ fn min_budget(a: u64, b: u64) -> u64 {
     a.min(b)
 }
 
-fn load_repo_config(repo_root: &Path) -> Result<Option<ReadingMaterialSpecSet>, String> {
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct StyleGuidesConfigFile {
+    #[serde(default, alias = "languages")]
+    langs: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RepoReadingMaterialConfig {
+    docs: ReadingMaterialSpecSet,
+    style_guides: StyleGuidesConfigFile,
+}
+
+fn load_repo_config(repo_root: &Path) -> Result<Option<RepoReadingMaterialConfig>, String> {
     let path = repo_root.join(REPO_CONFIG_PATH);
     if !path.exists() {
         return Ok(None);
@@ -390,13 +404,65 @@ fn load_repo_config(repo_root: &Path) -> Result<Option<ReadingMaterialSpecSet>, 
         .map_err(|err| format!("read failed {}: {err}", path.display()))?;
     let root: RepoOrchdConfigFile =
         toml::from_str(&text).map_err(|err| format!("invalid {}: {err}", path.display()))?;
-    Ok(root.docs)
+    Ok(Some(RepoReadingMaterialConfig {
+        docs: root.docs.unwrap_or_default(),
+        style_guides: root.style_guides,
+    }))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct LangSlug(String);
+
+impl LangSlug {
+    fn parse(raw: &str) -> Result<Self, String> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return Err("lang slug is empty".to_string());
+        }
+
+        let slug = raw.to_ascii_lowercase();
+        if !slug
+            .bytes()
+            .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_'))
+        {
+            return Err(format!(
+                "invalid lang slug '{raw}' (expected only [a-z0-9_-])"
+            ));
+        }
+        Ok(Self(slug))
+    }
+
+    const fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+fn normalize_style_guide_langs(raw: &[String], warnings: &mut Vec<String>) -> Vec<LangSlug> {
+    let mut slugs = BTreeSet::new();
+    for lang in raw {
+        match LangSlug::parse(lang) {
+            Ok(slug) => {
+                slugs.insert(slug);
+            }
+            Err(err) => warnings.push(format!("style_guides.langs: {err}")),
+        }
+    }
+    slugs.into_iter().collect()
+}
+
+fn style_guide_doc_ref(slug: &LangSlug) -> Result<DocRef, String> {
+    DocRef::parse(&format!(
+        "repo:{STYLE_GUIDE_REPO_FULL_NAME}:docs/{}.md",
+        slug.as_str()
+    ))
 }
 
 #[derive(Debug, Deserialize)]
 struct RepoOrchdConfigFile {
     #[serde(default)]
     docs: Option<ReadingMaterialSpecSet>,
+    #[serde(default)]
+    style_guides: StyleGuidesConfigFile,
     #[serde(flatten)]
     _unknown: HashMap<String, toml::Value>,
 }
@@ -445,12 +511,24 @@ pub(super) fn build_reading_material(
         }
     };
 
-    let empty_repo_cfg = ReadingMaterialSpecSet::default();
+    let empty_repo_cfg = RepoReadingMaterialConfig {
+        docs: ReadingMaterialSpecSet::default(),
+        style_guides: StyleGuidesConfigFile::default(),
+    };
     let repo_cfg = repo.as_ref().unwrap_or(&empty_repo_cfg);
     let budgets = DocBudgets {
-        max_doc_bytes: min_budget(global.max_doc_bytes, repo_cfg.max_doc_bytes),
-        max_total_bytes: min_budget(global.max_total_bytes, repo_cfg.max_total_bytes),
+        max_doc_bytes: min_budget(global.max_doc_bytes, repo_cfg.docs.max_doc_bytes),
+        max_total_bytes: min_budget(global.max_total_bytes, repo_cfg.docs.max_total_bytes),
     };
+    let style_guide_langs =
+        normalize_style_guide_langs(&repo_cfg.style_guides.langs, &mut warnings);
+    let missing_style_guide_binding =
+        !style_guide_langs.is_empty() && !repo_bindings.contains_key(STYLE_GUIDE_REPO_FULL_NAME);
+    if missing_style_guide_binding {
+        warnings.push(format!(
+            "style_guides requires repo_bindings entry for {STYLE_GUIDE_REPO_FULL_NAME}"
+        ));
+    }
 
     let mut rules = Vec::new();
     rules.extend(
@@ -462,22 +540,73 @@ pub(super) fn build_reading_material(
     );
     rules.extend(
         repo_cfg
+            .docs
             .rule
             .iter()
             .enumerate()
             .map(|(idx, rule)| (RuleLayer::Repo, idx, rule)),
     );
 
+    let mut matched_repo_doc_refs = BTreeSet::new();
     let mut parsed = Vec::new();
     for (layer, idx, spec) in rules {
         let source = format!("{layer:?} rule {idx}");
         match spec.parse(&source) {
             Ok(parsed_rule) => {
                 if parsed_rule.roles.matches(&role) && parsed_rule.directives.matches(&directive) {
+                    let key = parsed_rule.doc_ref.display();
+                    if layer == RuleLayer::Repo {
+                        matched_repo_doc_refs.insert(key);
+                    }
                     parsed.push((layer, parsed_rule));
                 }
             }
             Err(err) => warnings.push(err),
+        }
+    }
+
+    // Treat explicit `[docs]` rules as higher-precedence than `[style_guides]` sugar for the
+    // current role+directive: if a doc is already matched by `[docs]`, do not synthesize it.
+    if !missing_style_guide_binding {
+        for lang in &style_guide_langs {
+            let doc_ref = match style_guide_doc_ref(lang) {
+                Ok(v) => v,
+                Err(err) => {
+                    warnings.push(format!(
+                        "style_guides.langs '{}' produced invalid doc ref: {err}",
+                        lang.as_str()
+                    ));
+                    continue;
+                }
+            };
+            let key = doc_ref.display();
+            if matched_repo_doc_refs.contains(&key) {
+                continue;
+            }
+
+            let kind = if directive == "impl" {
+                DocKind::Include
+            } else {
+                DocKind::Point
+            };
+            parsed.push((
+                RuleLayer::Repo,
+                ReadingMaterialRule {
+                    kind,
+                    doc_ref,
+                    roles: SelectorSet {
+                        any: true,
+                        values: BTreeSet::new(),
+                    },
+                    directives: SelectorSet {
+                        any: true,
+                        values: BTreeSet::new(),
+                    },
+                    order: 50,
+                    importance: DocImportance::Recommended,
+                    max_bytes: None,
+                },
+            ));
         }
     }
 
@@ -620,19 +749,9 @@ fn render_reading_material_markdown(
 
             let blurb = doc_blurb(&doc.doc_ref, Some(&content));
             let _ = writeln!(&mut out, "### {}", blurb.title);
-            let _ = writeln!(
-                &mut out,
-                "ref: {} (importance: {})",
-                path.display(),
-                doc_importance_str(doc.importance)
-            );
             out.push('\n');
 
-            let doc_title = doc_title_from_path(&path);
-            let _ = writeln!(
-                &mut out,
-                "The document titled {doc_title} is included in the block below:"
-            );
+            let _ = writeln!(&mut out, "Included below:");
             let fence = backtick_fence(&content);
             let _ = writeln!(&mut out, "{fence}md");
             out.push_str(&content);
@@ -731,16 +850,6 @@ fn fallback_title_from_ref(doc_ref: &str) -> String {
         .and_then(|v| v.to_str())
         .unwrap_or(path)
         .to_string()
-}
-
-fn doc_title_from_path(path: &Path) -> String {
-    if let Some(stem) = path.file_stem().and_then(|v| v.to_str()) {
-        return stem.to_string();
-    }
-    if let Some(name) = path.file_name().and_then(|v| v.to_str()) {
-        return name.to_string();
-    }
-    path.to_string_lossy().into_owned()
 }
 
 fn is_md_fence(line_trimmed: &str) -> bool {
@@ -945,7 +1054,10 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{DocDisposition, DocRef, ReadingMaterialSpecSet, build_reading_material};
+    use super::{
+        DispatchRepoBindingConfig, DocDisposition, DocRef, ReadingMaterialSpecSet,
+        build_reading_material,
+    };
 
     fn write_file(root: &TempDir, rel: &str, body: &str) {
         let path = root.path().join(rel);
@@ -1003,16 +1115,8 @@ importance = "recommended"
         assert!(outcome.markdown.contains("## Reading material"));
         assert!(outcome.markdown.contains("### a.txt"));
         let a_path = tmp.path().join("docs/a.txt").to_string_lossy().into_owned();
-        assert!(
-            outcome
-                .markdown
-                .contains(&format!("ref: {a_path} (importance: required)"))
-        );
-        assert!(
-            outcome
-                .markdown
-                .contains("The document titled a is included in the block below:")
-        );
+        assert!(!outcome.markdown.contains(&format!("ref: {a_path}")));
+        assert!(outcome.markdown.contains("Included below:"));
         assert!(outcome.markdown.contains("alpha"));
         assert!(outcome.markdown.contains("End document"));
         assert!(outcome.markdown.contains("### Pointers"));
@@ -1029,6 +1133,81 @@ importance = "recommended"
         assert_eq!(docs[1].disposition, DocDisposition::Pointed);
         assert!(docs[0].sha256.as_deref().unwrap_or_default().len() >= 64);
         assert!(docs[0].bytes.unwrap_or_default() > 0);
+    }
+
+    #[test]
+    fn style_guides_include_for_impl_and_point_for_non_impl() {
+        let repo = TempDir::new().unwrap();
+        write_file(
+            &repo,
+            ".orchd/config.toml",
+            r#"
+[style_guides]
+langs = ["rust"]
+"#,
+        );
+
+        let swarm = TempDir::new().unwrap();
+        write_file(
+            &swarm,
+            "docs/rust.md",
+            r"# Rust Style Guide
+
+First sentence. Second sentence.
+",
+        );
+
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            "main/swarm".to_string(),
+            DispatchRepoBindingConfig {
+                local_path: swarm.path().to_path_buf(),
+                git_remote: "origin".to_string(),
+                git_base: "main".to_string(),
+                sidecar_repo: None,
+            },
+        );
+
+        let global = ReadingMaterialSpecSet::default();
+
+        let impl_outcome = build_reading_material(
+            &global,
+            "codex-dev",
+            "impl",
+            "fresh",
+            repo.path(),
+            &bindings,
+        );
+        assert!(impl_outcome.markdown.contains("### Rust Style Guide"));
+        assert_eq!(impl_outcome.doc_plan.docs.len(), 1);
+        assert_eq!(
+            impl_outcome.doc_plan.docs[0].doc_ref,
+            "repo:main/swarm:docs/rust.md"
+        );
+        assert_eq!(
+            impl_outcome.doc_plan.docs[0].disposition,
+            DocDisposition::Included
+        );
+
+        let design_outcome = build_reading_material(
+            &global,
+            "codex-orch",
+            "design",
+            "fresh",
+            repo.path(),
+            &bindings,
+        );
+        assert!(design_outcome.markdown.contains("### Pointers"));
+        assert!(design_outcome.markdown.contains("Rust Style Guide (ref:"));
+        assert_eq!(design_outcome.doc_plan.docs.len(), 1);
+        assert_eq!(
+            design_outcome.doc_plan.docs[0].doc_ref,
+            "repo:main/swarm:docs/rust.md"
+        );
+        assert_eq!(
+            design_outcome.doc_plan.docs[0].disposition,
+            DocDisposition::Pointed
+        );
     }
 
     #[test]
@@ -1089,11 +1268,7 @@ importance = "recommended"
         );
 
         assert!(outcome.markdown.contains("### Included Doc"));
-        assert!(
-            outcome
-                .markdown
-                .contains("The document titled included is included in the block below:")
-        );
+        assert!(outcome.markdown.contains("Included below:"));
         // Nested ``` in markdown docs should not terminate the outer fence (````).
         assert!(outcome.markdown.contains("````md"));
         assert!(outcome.markdown.contains("End document"));
