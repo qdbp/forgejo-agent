@@ -280,12 +280,36 @@ pub(super) fn ensure_repo_checkout(
     let checkout = repo_checkout_root(&state.db_path, role, &repo)?;
     let git_dir = checkout.join(".git");
     if git_dir.is_dir() {
-        let _ = git_checked_with_token(
+        // Keep the checkout's remote URL and working tree aligned with the
+        // Forgejo repo head. This matters when a repo's history is rewritten
+        // (for example the repo was deleted/recreated or force-pushed), which
+        // can leave an old checkout on an unrelated history.
+        let url = forgejo_http_git_url(&state.cfg.base_url, &role.forgejo_login, repo_full_name)?;
+        let _ = git_run_checked(&checkout, &["remote", "set-url", DEFAULT_GIT_REMOTE, &url]);
+        git_checked_with_token(
             &state.db_path,
             &role.token_file,
             Some(&checkout),
             &["fetch", DEFAULT_GIT_REMOTE, DEFAULT_GIT_BASE_BRANCH],
-        );
+        )?;
+        let base_ref = format!("{}/{}", DEFAULT_GIT_REMOTE, DEFAULT_GIT_BASE_BRANCH);
+        // Prefer a named branch for ergonomics, but fall back to detached in the
+        // rare case the branch is locked by another worktree.
+        if git_run_checked(
+            &checkout,
+            &[
+                "checkout",
+                "-f",
+                "-B",
+                DEFAULT_GIT_BASE_BRANCH,
+                base_ref.as_str(),
+            ],
+        )
+        .is_err()
+        {
+            git_run_checked(&checkout, &["checkout", "--detach", base_ref.as_str()])?;
+        }
+        let _ = git_run_checked(&checkout, &["reset", "--hard", base_ref.as_str()]);
         let _ = db::update_repo_local_path(&state.db_path, repo_full_name, &checkout);
         return Ok(checkout);
     }
