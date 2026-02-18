@@ -251,6 +251,8 @@ impl FromStr for WorkflowState {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self> {
+        let s = s.trim();
+        let s = s.strip_prefix("state/").unwrap_or(s);
         match s {
             "triage" => Ok(Self::Triage),
             "spec" => Ok(Self::Spec),
@@ -353,7 +355,7 @@ impl ApiIssue {
 
 #[cfg(test)]
 mod tests {
-    use super::OrchdRuntimeState;
+    use super::{OrchdRuntimeState, WorkflowState};
     use anyhow::Result;
 
     #[test]
@@ -373,6 +375,15 @@ mod tests {
     fn orchd_runtime_state_parses_known_values() -> Result<()> {
         let parsed: OrchdRuntimeState = "running".parse()?;
         assert_eq!(parsed, OrchdRuntimeState::Running);
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_state_parses_label_names() -> Result<()> {
+        let parsed: WorkflowState = "state/in-progress".parse()?;
+        assert_eq!(parsed, WorkflowState::InProgress);
+        let parsed: WorkflowState = "state/ready".parse()?;
+        assert_eq!(parsed, WorkflowState::Ready);
         Ok(())
     }
 }

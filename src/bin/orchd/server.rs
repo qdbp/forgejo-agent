@@ -15,7 +15,8 @@ use serde_json::json;
 
 use forgejo_agent::api::ForgejoClient;
 use forgejo_agent::config::AgentConfig;
-use forgejo_agent::types::{IssueRef, OrchdRuntimeState, RepoRef};
+use forgejo_agent::policy::STATE_LABEL_COLOR;
+use forgejo_agent::types::{IssueRef, OrchdRuntimeState, RepoRef, WorkflowState};
 
 use super::cli::{Cli, DispatchMode};
 use super::db;
@@ -934,13 +935,50 @@ async fn reconcile_once(state: &AppState) -> Result<()> {
     let cfg = state.cfg.clone();
     let repo = state.reconcile_repo.clone();
 
-    let scanned_open = tokio::task::spawn_blocking(move || {
-        let api = ForgejoClient::new(&cfg)?;
-        api.list_issues(&cfg, &repo, "open", 100)
-            .map(|items| items.len())
-    })
-    .await
-    .context("reconcile join failure")??;
+    let (scanned_open, normalized_triage) =
+        tokio::task::spawn_blocking(move || -> Result<(usize, usize)> {
+            let api = ForgejoClient::new(&cfg)?;
+            let issues = api.list_issues(&cfg, &repo, "open", 100)?;
+            let scanned_open = issues.len();
+
+            // Keep open issues from being "stateless" for workflow operations:
+            // missing workflow label => default to triage.
+            let mut triage_id = None;
+            let mut normalized_triage = 0usize;
+            for issue in issues {
+                if issue.pull_request.is_some() {
+                    continue;
+                }
+                let Ok(None) = issue.workflow_state() else {
+                    continue;
+                };
+
+                let id = if let Some(id) = triage_id {
+                    id
+                } else {
+                    let (name, color, description, exclusive) = STATE_LABEL_COLOR
+                        .iter()
+                        .find(|(name, ..)| *name == WorkflowState::Triage.label())
+                        .copied()
+                        .unwrap_or(("state/triage", "8a8a8a", "needs triage", true));
+                    let ensured =
+                        api.ensure_label(&cfg, &repo, name, color, description, exclusive)?;
+                    triage_id = Some(ensured.id);
+                    ensured.id
+                };
+
+                let issue_ref = IssueRef {
+                    repo: repo.clone(),
+                    number: issue.number,
+                };
+                let _ = api.add_issue_label_ids(&cfg, &issue_ref, vec![id]);
+                normalized_triage += 1;
+            }
+
+            Ok((scanned_open, normalized_triage))
+        })
+        .await
+        .context("reconcile join failure")??;
 
     let conn = db::open_db(&state.db_path)?;
     let now = Utc::now().to_rfc3339();
@@ -961,6 +999,7 @@ async fn reconcile_once(state: &AppState) -> Result<()> {
         json!({
             "repo": state.reconcile_repo.to_string(),
             "scanned_open": scanned_open,
+            "normalized_triage": normalized_triage,
             "status": "ok",
         }),
     );

@@ -36,14 +36,28 @@ else
 fi
 
 # systemd user services often lack user bin dirs in PATH; make sure our tools exist.
-new_path="${PATH:-}"
+#
+# Keep system dirs ahead of user dirs to avoid shadowing (e.g. a broken ~/.local/bin/python3).
+new_path="${PATH:-/usr/local/bin:/usr/bin:/bin}"
+
+# Remove any existing user-bin entries so we can append them deterministically.
+filtered=""
+IFS=':' read -r -a path_parts <<<"$new_path"
+for part in "${path_parts[@]}"; do
+  [[ -n "$part" ]] || continue
+  case "$part" in
+    "$HOME/bin" | "$HOME/.local/bin") continue ;;
+    *) ;;
+  esac
+  if [[ ":${filtered}:" != *":${part}:"* ]]; then
+    filtered="${filtered:+${filtered}:}${part}"
+  fi
+done
+new_path="$filtered"
+
 for d in "$HOME/bin" "$HOME/.local/bin"; do
   if [[ -d "$d" ]] && [[ ":${new_path}:" != *":${d}:"* ]]; then
-    if [[ -n "$new_path" ]]; then
-      new_path="${d}:${new_path}"
-    else
-      new_path="$d"
-    fi
+    new_path="${new_path:+${new_path}:}${d}"
   fi
 done
 

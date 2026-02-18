@@ -107,6 +107,15 @@ EOF
 /home/main/.local/bin/forgejoctl issue transition main/backlog#1 --to in-progress
 /home/main/.local/bin/forgejoctl issue transition main/backlog#1 --to review
 
+# Workflow states accept either bare names or label names:
+# - `ready` / `state/ready`
+# - `in-progress` / `state/in-progress`
+# - `review` / `state/review`
+#
+# Policy: new issues start in `triage`. If an issue has no `state/*` label yet (for example,
+# it was created in the Forgejo UI without labels), treat it as triage and transition it before
+# claiming work.
+
 # orchd runtime state projection (exclusive orchd/state/* label)
 /home/main/.local/bin/forgejoctl issue orchd-state main/backlog#1 --to running
 
