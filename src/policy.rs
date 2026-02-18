@@ -159,11 +159,13 @@ pub fn assert_claimable(issue: &ApiIssue) -> Result<()> {
     if state != Some(WorkflowState::Ready) {
         match state {
             Some(other) => bail!(
-                "issue #{} is not ready (current state: {})",
+                "issue #{} is not ready (current state: {other}); run: forgejoctl issue transition --to ready <issue>",
                 issue.number,
-                other
             ),
-            None => bail!("issue #{} has no workflow state label", issue.number),
+            None => bail!(
+                "issue #{} has no workflow state label; run: forgejoctl issue transition --to ready <issue>",
+                issue.number
+            ),
         }
     }
     Ok(())
