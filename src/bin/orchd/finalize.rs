@@ -112,6 +112,10 @@ fn whoami_login(api: &ForgejoClient, cfg: &AgentConfig) -> Result<String> {
     Ok(login.to_string())
 }
 
+fn merge_endpoint_reports_try_again_later(http: &ApiHttpError) -> bool {
+    http.status == 405 && http.body.contains("Please try again later")
+}
+
 fn merge_ff_only_with_retry(
     api: &ForgejoClient,
     cfg: &AgentConfig,
@@ -138,13 +142,23 @@ fn merge_ff_only_with_retry(
                 let Some(http) = err.downcast_ref::<ApiHttpError>() else {
                     return Err(err);
                 };
-                if http.status >= 500 && attempt < MAX_ATTEMPTS {
-                    lines.push(format!(
-                        "pr_merge_retry: transient server error status={} attempt={}/{}",
-                        http.status, attempt, MAX_ATTEMPTS
-                    ));
-                    std::thread::sleep(Duration::from_secs(SLEEP_SEC));
-                    continue;
+                if attempt < MAX_ATTEMPTS {
+                    if http.status >= 500 {
+                        lines.push(format!(
+                            "pr_merge_retry: transient server error status={} attempt={}/{}",
+                            http.status, attempt, MAX_ATTEMPTS
+                        ));
+                        std::thread::sleep(Duration::from_secs(SLEEP_SEC));
+                        continue;
+                    }
+                    if merge_endpoint_reports_try_again_later(http) {
+                        lines.push(format!(
+                            "pr_merge_retry: mergeability not ready status={} attempt={}/{}",
+                            http.status, attempt, MAX_ATTEMPTS
+                        ));
+                        std::thread::sleep(Duration::from_secs(SLEEP_SEC));
+                        continue;
+                    }
                 }
                 return Err(err);
             }
@@ -383,9 +397,15 @@ fn evaluate_landing_target(
                     lines: vec![format!("{prefix}pr landing failed: {err:#}")],
                 };
             };
-            // Forgejo documents 409/423 here, but we have observed intermittent 5xx from the merge
-            // endpoint in cases that are still recoverable via "fetch+rebase+retry".
-            if !(matches!(http.status, 409 | 423) || http.status >= 500) {
+            // Forgejo/Gitea return 405 for "merge not currently allowed", including cases where the
+            // mergeability check is still in progress ("Please try again later"). We treat that
+            // transient form as recoverable, alongside 409/423 and intermittent 5xx from the merge
+            // endpoint, because a local fetch+rebase+retry can still land (or produce a concrete
+            // rebase-conflict punt back to the implementing role).
+            if !(matches!(http.status, 409 | 423)
+                || http.status >= 500
+                || merge_endpoint_reports_try_again_later(http))
+            {
                 return LandingOutcome::Failure {
                     reason_code: "landing_pr_merge_failed".to_string(),
                     lines: vec![format!("{prefix}pr landing failed: {http}")],
@@ -901,4 +921,55 @@ pub(super) fn finalize_dispatch_command(args: FinalizeDispatchArgs) -> Result<()
 
     info!("finalize dispatch completed");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::merge_endpoint_reports_try_again_later;
+    use forgejo_agent::api::ApiHttpError;
+
+    #[test]
+    fn merge_endpoint_transient_405_is_detected() {
+        let http = ApiHttpError {
+            status: 405,
+            method: "POST".to_string(),
+            path: "/api/v1/repos/o/r/pulls/1/merge".to_string(),
+            body: "{\"message\":\"Please try again later\"}".to_string(),
+        };
+        assert!(merge_endpoint_reports_try_again_later(&http));
+
+        let other_405 = ApiHttpError {
+            status: 405,
+            method: "POST".to_string(),
+            path: "/api/v1/repos/o/r/pulls/1/merge".to_string(),
+            body: "{\"message\":\"Pull request is work in progress\"}".to_string(),
+        };
+        assert!(!merge_endpoint_reports_try_again_later(&other_405));
+    }
+
+    #[test]
+    fn merge_blocked_template_renders_parseable_retry_directive() {
+        let template_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("templates")
+            .join("orchd-landing-pr-merge-blocked.md");
+        let rendered = super::template::render_prompt_file(
+            &template_path,
+            &[
+                ("pr_url", "http://127.0.0.1:3000/o/r/pulls/1"),
+                ("branch", "orchd/branch"),
+                ("base_branch", "main"),
+                ("retry_mention", "@codex-orch impl"),
+                ("error", "boom"),
+            ],
+            "test landing template",
+        )
+        .expect("template renders");
+
+        let parsed = super::super::webhook::parse_directive(&rendered)
+            .expect("rendered template includes a parseable directive line");
+        assert_eq!(parsed.role, "codex-orch");
+        assert_eq!(parsed.directive, "impl");
+    }
 }
