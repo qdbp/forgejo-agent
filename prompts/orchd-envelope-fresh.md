@@ -4,6 +4,8 @@
   - `forgejoctl whoami`
   - `forgejoctl issue show <owner/repo#N>`
 - Use `issue show` as the canonical issue-inspection verb.
+- When referencing issues/PRs, use plain text refs like #123 or owner/repo#123 (do not wrap refs in backticks/inline code).
+- Backlinks only appear if the target exists; create follow-up issues first, then mention them.
 
 ## Important: you are being dispatched via headless orchestrator (orchd)
 No user is reading your terminal output. If you need to communicate, do it as

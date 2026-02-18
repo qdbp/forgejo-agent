@@ -17,4 +17,6 @@
 - Keep issue comments terse and natural-language (no rigid field templates).
 
 When impl is complete, good etiquette is to scan for any recent tickets that might be related
-and to leave mentions where they provide value or context.
+and to leave mentions where they provide value or context, especially parent/meta issues. If your
+change clearly resolves the last remaining child/blocker for a parent issue, close or update the
+parent issue with a brief comment.

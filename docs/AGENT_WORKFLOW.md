@@ -17,6 +17,7 @@
 - Be terse by default.
 - Include concrete facts: what changed, what is blocked, and what decision/action is needed.
 - Avoid filler and repetitive boilerplate.
+- When referencing issues/PRs, write plain text refs (#123, owner/repo#123), not inline code/backticks. Create follow-up issues before mentioning them so backlinks are guaranteed.
 
 ## Canonical labels
 
