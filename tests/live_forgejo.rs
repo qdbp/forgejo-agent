@@ -1752,6 +1752,187 @@ fn live_orchd_local_backend_smoke() -> Result<()> {
 
 #[test]
 #[serial(live_forgejo)]
+fn live_orchd_heals_role_checkout_after_unrelated_history() -> Result<()> {
+    if !live_tests_enabled() {
+        eprintln!(
+            "skipping live orchd integration test; enable with {}=1",
+            LIVE_TESTS_ENV
+        );
+        return Ok(());
+    }
+
+    let harness = LiveHarness::bootstrap("live_orchd_heals_role_checkout_after_unrelated_history")?;
+
+    let issue_number = harness.create_issue("orchd checkout heal", "issue body", "ready")?;
+
+    let dispatch_cfg_path = harness
+        .fixture
+        .work_path
+        .join("orchd-dispatch-checkout-heal.toml");
+    let db_path = harness.fixture.work_path.join("orchd-checkout-heal.sqlite");
+    let orchd_stdout = harness
+        .fixture
+        .work_path
+        .join("orchd-checkout-heal-stdout.log");
+    let orchd_stderr = harness
+        .fixture
+        .work_path
+        .join("orchd-checkout-heal-stderr.log");
+
+    let fake_codex = ensure_fake_codex_bin()?;
+    let forgejoctl = forgejo_agent_bin()?;
+
+    write_orchd_dispatch_toml(
+        &dispatch_cfg_path,
+        OrchdDispatchTomlInputs {
+            actor: harness.fixture.owner.as_str(),
+            forgejo_login: harness.fixture.owner.as_str(),
+            repo_ref: harness.repo_ref.as_str(),
+            principal_workdir: &harness.principal_workdir,
+            sidecar_repo_ref: None,
+            sidecar_principal_workdir: None,
+            codex_bin: &fake_codex,
+            token_file: &harness.token_path,
+            forgejoctl: &forgejoctl,
+            directives: &[OrchdTestDirective::Reply],
+            timeout_sec: 10,
+        },
+    )?;
+
+    // Pre-create the role checkout on an unrelated history to ensure `ensure_repo_checkout`
+    // aggressively realigns it with `origin/main`.
+    let role_checkout = harness
+        .fixture
+        .work_path
+        .join("repos")
+        .join(harness.fixture.owner.as_str())
+        .join(harness.fixture.owner.as_str())
+        .join(harness.repo_name.as_str());
+    fs::create_dir_all(&role_checkout).with_context(|| {
+        format!(
+            "failed creating role checkout path {}",
+            role_checkout.display()
+        )
+    })?;
+
+    git_output_checked(&role_checkout, &["init"], "git init role checkout")?;
+    git_output_checked(
+        &role_checkout,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "http://example.invalid/nowhere.git",
+        ],
+        "git remote add origin dummy",
+    )?;
+    let unrelated_readme = role_checkout.join("README.md");
+    fs::write(&unrelated_readme, "unrelated history\n").with_context(|| {
+        format!(
+            "failed writing unrelated README {}",
+            unrelated_readme.display()
+        )
+    })?;
+    git_output_checked(
+        &role_checkout,
+        &["add", "--", "README.md"],
+        "git add README.md (unrelated)",
+    )?;
+    git_output_checked(
+        &role_checkout,
+        &[
+            "-c",
+            "user.name=itest",
+            "-c",
+            "user.email=itest@localhost",
+            "commit",
+            "-m",
+            "itest: unrelated history commit",
+        ],
+        "git commit unrelated history",
+    )?;
+    git_output_checked(
+        &role_checkout,
+        &["branch", "-M", "main"],
+        "git branch -M main (unrelated)",
+    )?;
+    let unrelated_head = stdout_trim(&git_output_checked(
+        &role_checkout,
+        &["rev-parse", "HEAD"],
+        "git rev-parse HEAD (unrelated)",
+    )?)?;
+
+    let port = pick_unused_port().ok_or_else(|| anyhow!("failed to pick unused port"))?;
+    let orchd = OrchdTestProcess::spawn(OrchdSpawnInputs {
+        listen_port: port,
+        db_path: &db_path,
+        repo_ref: &harness.repo_ref,
+        dispatch_cfg_path: &dispatch_cfg_path,
+        config_path: &harness.config_path,
+        token_path: &harness.token_path,
+        stdout_path: &orchd_stdout,
+        stderr_path: &orchd_stderr,
+        env: &[],
+    })?;
+
+    post_orchd_issue_comment_webhook(
+        &orchd.client,
+        &orchd.base_url,
+        &harness.repo_ref,
+        issue_number,
+        harness.fixture.owner.as_str(),
+        "@codex-orch poke",
+    )?;
+
+    let _ = wait_for_issue_label(
+        &harness,
+        issue_number,
+        "orchd/state/completed",
+        Duration::from_secs(30),
+    )?;
+
+    let role_main = stdout_trim(&git_output_checked(
+        &role_checkout,
+        &["rev-parse", "main"],
+        "git rev-parse main (role checkout)",
+    )?)?;
+    if role_main == unrelated_head {
+        bail!("expected role checkout main to move off unrelated history (still {role_main})");
+    }
+    let role_origin_main = stdout_trim(&git_output_checked(
+        &role_checkout,
+        &["rev-parse", "origin/main"],
+        "git rev-parse origin/main (role checkout)",
+    )?)?;
+    if role_main != role_origin_main {
+        bail!(
+            "expected role checkout to fast-align main with origin/main (main={role_main} origin/main={role_origin_main})"
+        );
+    }
+    let merge_base = stdout_trim(&git_output_checked(
+        &role_checkout,
+        &["merge-base", "main", "origin/main"],
+        "git merge-base main origin/main (role checkout)",
+    )?)?;
+    if merge_base != role_main {
+        bail!(
+            "expected merge-base(main,origin/main) to equal main after heal (merge_base={merge_base} main={role_main})"
+        );
+    }
+
+    let git = GitWorkspace::from_fixture(&harness.fixture, &harness.repo_name)?;
+    let expected = git.bare_head_main()?;
+    if role_main != expected {
+        bail!(
+            "expected healed role checkout to match remote main (role={role_main} remote={expected})"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+#[serial(live_forgejo)]
 fn live_orchd_reply_autodispatches_to_assignee() -> Result<()> {
     if !live_tests_enabled() {
         eprintln!(
