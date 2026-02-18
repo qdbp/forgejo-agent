@@ -731,6 +731,7 @@ async fn plan_dispatch(
         repo: repo_ref,
         number: intent.issue_number,
     };
+    let issue_ref_text = issue_ref.to_string();
     let issue = fetch_issue(state.clone(), issue_ref.clone()).await?;
 
     // Fresh sessions must be treated as amnesiac: we do not assume any prior role memory,
@@ -758,9 +759,19 @@ async fn plan_dispatch(
     )
     .map_err(|err| DispatchError::Db(err.to_string()))?;
     let issue_delta_md = if prompt_mode_fresh {
-        db::render_issue_history(&delta_rows, delta_limit)
+        db::render_issue_history(
+            &delta_rows,
+            delta_limit,
+            dispatch_config.max_issue_history_bytes,
+            &issue_ref_text,
+        )
     } else {
-        db::summarize_issue_delta(&delta_rows)
+        db::summarize_issue_delta(
+            &delta_rows,
+            delta_limit,
+            dispatch_config.max_issue_delta_bytes,
+            &issue_ref_text,
+        )
     };
 
     let now = Utc::now().to_rfc3339();

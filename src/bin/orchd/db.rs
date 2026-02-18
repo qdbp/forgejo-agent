@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
@@ -549,16 +550,20 @@ pub(super) fn issue_delta_rows(
     let mut stmt = conn.prepare(
         r"
         SELECT event_type, actor_login, event_text, received_at, source_created_at
-        FROM events
-        WHERE repo_full_name = ?1
-          AND issue_number = ?2
-          AND id > ?3
-          AND id <= ?4
-          AND event_type IN (?5, ?6)
-          AND event_text IS NOT NULL
-          AND event_text != ''
+        FROM (
+            SELECT id, event_type, actor_login, event_text, received_at, source_created_at
+            FROM events
+            WHERE repo_full_name = ?1
+              AND issue_number = ?2
+              AND id > ?3
+              AND id <= ?4
+              AND event_type IN (?5, ?6)
+              AND event_text IS NOT NULL
+              AND event_text != ''
+            ORDER BY id DESC
+            LIMIT ?7
+        ) recent
         ORDER BY id ASC
-        LIMIT ?7
         ",
     )?;
     let rows = stmt
@@ -586,16 +591,57 @@ pub(super) fn issue_delta_rows(
     Ok(rows)
 }
 
-pub(super) fn render_issue_history(rows: &[IssueEventDeltaRow], limit: usize) -> String {
-    let comments: Vec<&IssueEventDeltaRow> = rows
+const ISSUE_HISTORY_SEPARATOR: &str = "\n\n---\n\n";
+const ISSUE_DELTA_SEPARATOR: &str = "\n";
+
+fn keep_recent_segments(
+    segments: &[String],
+    separator: &str,
+    max_bytes: usize,
+) -> (Vec<String>, bool) {
+    let mut kept_rev = Vec::new();
+    let mut used_bytes = 0_usize;
+    for segment in segments.iter().rev() {
+        let separator_bytes = if kept_rev.is_empty() {
+            0
+        } else {
+            separator.len()
+        };
+        if used_bytes
+            .saturating_add(separator_bytes)
+            .saturating_add(segment.len())
+            > max_bytes
+        {
+            break;
+        }
+        used_bytes += separator_bytes + segment.len();
+        kept_rev.push(segment.clone());
+    }
+    kept_rev.reverse();
+    let truncated = kept_rev.len() < segments.len();
+    (kept_rev, truncated)
+}
+
+fn append_issue_truncation_note(rendered: &mut String, section_name: &str, issue_ref: &str) {
+    if !rendered.is_empty() {
+        rendered.push_str("\n\n");
+    }
+    write!(
+        rendered,
+        "(note: {section_name} may be truncated to recent entries; run forgejoctl issue show {issue_ref} for the full thread)"
+    )
+    .expect("writing to String should not fail");
+}
+
+pub(super) fn render_issue_history(
+    rows: &[IssueEventDeltaRow],
+    limit: usize,
+    max_bytes: usize,
+    issue_ref: &str,
+) -> String {
+    let comments: Vec<String> = rows
         .iter()
         .filter(|row| row.event_type == EVENT_ISSUE_COMMENT)
-        .collect();
-    if comments.is_empty() {
-        return "(no comments yet)".to_string();
-    }
-    let mut out = comments
-        .iter()
         .map(|row| {
             let timestamp = row
                 .source_created_at
@@ -610,22 +656,36 @@ pub(super) fn render_issue_history(rows: &[IssueEventDeltaRow], limit: usize) ->
             let text = row.event_text.as_deref().unwrap_or("").trim_end();
             format!("[{timestamp}] {actor}:\n{text}")
         })
-        .collect::<Vec<_>>()
-        .join("\n\n---\n\n");
-    if rows.len() >= limit {
-        out.push_str(
-            "\n\n(note: history may be truncated; run `forgejoctl issue show <issue>` for the full thread)",
-        );
+        .collect();
+    if comments.is_empty() {
+        return "(no comments yet)".to_string();
+    }
+
+    let (kept_comments, truncated_by_budget) =
+        keep_recent_segments(&comments, ISSUE_HISTORY_SEPARATOR, max_bytes);
+    let mut out = if kept_comments.is_empty() {
+        "(comments omitted: byte budget too small for the newest comment)".to_string()
+    } else {
+        kept_comments.join(ISSUE_HISTORY_SEPARATOR)
+    };
+    if rows.len() >= limit || truncated_by_budget {
+        append_issue_truncation_note(&mut out, "issue history", issue_ref);
     }
     out
 }
 
-pub(super) fn summarize_issue_delta(rows: &[IssueEventDeltaRow]) -> String {
+pub(super) fn summarize_issue_delta(
+    rows: &[IssueEventDeltaRow],
+    limit: usize,
+    max_bytes: usize,
+    issue_ref: &str,
+) -> String {
     if rows.is_empty() {
         return "(no new issue events since last handled dispatch)".to_string();
     }
 
-    rows.iter()
+    let summaries = rows
+        .iter()
         .map(|row| {
             let timestamp = row
                 .source_created_at
@@ -644,8 +704,18 @@ pub(super) fn summarize_issue_delta(rows: &[IssueEventDeltaRow]) -> String {
             }
             format!("- [{}] {} {}: {}", timestamp, actor, row.event_type, text)
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect::<Vec<_>>();
+    let (kept_summaries, truncated_by_budget) =
+        keep_recent_segments(&summaries, ISSUE_DELTA_SEPARATOR, max_bytes);
+    let mut out = if kept_summaries.is_empty() {
+        "(issue events omitted: byte budget too small for the newest event)".to_string()
+    } else {
+        kept_summaries.join(ISSUE_DELTA_SEPARATOR)
+    };
+    if rows.len() >= limit || truncated_by_budget {
+        append_issue_truncation_note(&mut out, "issue delta", issue_ref);
+    }
+    out
 }
 
 struct DispatchTransitionPlan {
@@ -1642,7 +1712,7 @@ mod tests {
     use rusqlite::params;
 
     use crate::orchd::lexicon::{
-        DECISION_ACCEPTED, DIRECTIVE_IMPL, DIRECTIVE_REPLY, EVENT_ISSUE_COMMENT,
+        DECISION_ACCEPTED, DIRECTIVE_IMPL, DIRECTIVE_REPLY, EVENT_ISSUE_COMMENT, EVENT_ISSUES,
     };
 
     fn temp_db_path(label: &str) -> PathBuf {
@@ -1766,6 +1836,98 @@ mod tests {
             .expect("query event rows")
             .collect::<rusqlite::Result<Vec<_>>>()
             .expect("collect event rows")
+    }
+
+    fn sample_delta_row(
+        event_type: &str,
+        actor_login: &str,
+        text: &str,
+    ) -> super::IssueEventDeltaRow {
+        super::IssueEventDeltaRow {
+            event_type: event_type.to_string(),
+            actor_login: Some(actor_login.to_string()),
+            event_text: Some(text.to_string()),
+            received_at: "2026-02-18T00:00:00Z".to_string(),
+            source_created_at: Some("2026-02-18T00:00:00Z".to_string()),
+        }
+    }
+
+    #[test]
+    fn issue_delta_rows_returns_last_n_rows_in_chronological_order() {
+        let db_path = temp_db_path("issue-delta-last-n");
+        super::init_db(&db_path).expect("db init");
+        for idx in 1..=3 {
+            let event = super::EventRecord {
+                delivery_id: format!("delivery-{idx}"),
+                event_type: EVENT_ISSUE_COMMENT.to_string(),
+                repo_full_name: "main/orchd-debug".to_string(),
+                issue_number: Some(7),
+                source_issue_id: None,
+                source_issue_anchor_at: None,
+                action: Some("created".to_string()),
+                actor_login: Some("main".to_string()),
+                event_text: Some(format!("comment-{idx}")),
+                source_comment_id: None,
+                source_created_at: Some(format!("2026-02-18T00:00:0{idx}Z")),
+                raw_json: "{}".to_string(),
+            };
+            super::insert_event(&db_path, &event).expect("insert event");
+        }
+        let latest = super::latest_event_id(&db_path).expect("latest event");
+        let rows = super::issue_delta_rows(&db_path, "main/orchd-debug", 7, None, latest, 2)
+            .expect("query issue delta rows");
+        let texts = rows
+            .iter()
+            .map(|row| row.event_text.clone().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            texts,
+            vec!["comment-2".to_string(), "comment-3".to_string()]
+        );
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn keep_recent_segments_respects_budget_and_keeps_newest_suffix() {
+        let segments = vec![
+            "first".to_string(),
+            "second".to_string(),
+            "third".to_string(),
+        ];
+        let budget = "second\nthird".len();
+        let (kept, truncated) = super::keep_recent_segments(&segments, "\n", budget);
+        assert!(truncated);
+        assert_eq!(kept, vec!["second".to_string(), "third".to_string()]);
+    }
+
+    #[test]
+    fn render_issue_history_emits_truncation_note_with_issue_pointer() {
+        let issue_ref = "main/forgejo-agent#113";
+        let rows = vec![
+            sample_delta_row(EVENT_ISSUE_COMMENT, "alice", "older comment text"),
+            sample_delta_row(EVENT_ISSUE_COMMENT, "bob", "newest comment text"),
+        ];
+        let newest_only = super::render_issue_history(&rows[1..], 3, usize::MAX, issue_ref);
+        let rendered = super::render_issue_history(&rows, 3, newest_only.len(), issue_ref);
+        assert!(!rendered.contains("older comment text"));
+        assert!(rendered.contains("newest comment text"));
+        assert!(rendered.contains("issue history may be truncated"));
+        assert!(rendered.contains("forgejoctl issue show main/forgejo-agent#113"));
+    }
+
+    #[test]
+    fn summarize_issue_delta_emits_truncation_note_with_issue_pointer() {
+        let issue_ref = "main/forgejo-agent#113";
+        let rows = vec![
+            sample_delta_row(EVENT_ISSUES, "alice", "older issue event"),
+            sample_delta_row(EVENT_ISSUE_COMMENT, "bob", "newest issue event"),
+        ];
+        let newest_only = super::summarize_issue_delta(&rows[1..], 3, usize::MAX, issue_ref);
+        let rendered = super::summarize_issue_delta(&rows, 3, newest_only.len(), issue_ref);
+        assert!(!rendered.contains("older issue event"));
+        assert!(rendered.contains("newest issue event"));
+        assert!(rendered.contains("issue delta may be truncated"));
+        assert!(rendered.contains("forgejoctl issue show main/forgejo-agent#113"));
     }
 
     #[test]

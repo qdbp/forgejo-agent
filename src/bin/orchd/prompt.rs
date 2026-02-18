@@ -85,10 +85,21 @@ fn render_preview_issue_activity(
         rows.truncate(args.preview_row_cap);
     }
 
+    let issue_ref_text = args.issue_ref.to_string();
     let rendered = if args.mode == PromptMode::Fresh {
-        db::render_issue_history(&rows, rows.len().saturating_add(1))
+        db::render_issue_history(
+            &rows,
+            rows.len().saturating_add(1),
+            usize::MAX,
+            &issue_ref_text,
+        )
     } else {
-        db::summarize_issue_delta(&rows)
+        db::summarize_issue_delta(
+            &rows,
+            rows.len().saturating_add(1),
+            usize::MAX,
+            &issue_ref_text,
+        )
     };
     Ok(apply_preview_caps(
         rendered,

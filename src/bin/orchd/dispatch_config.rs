@@ -21,6 +21,8 @@ use super::paths::expand_tilde_path;
 pub(super) struct DispatchConfig {
     pub(super) allowed_actors: Vec<String>,
     pub(super) prompt_envelopes: DispatchPromptEnvelopeConfig,
+    pub(super) max_issue_history_bytes: usize,
+    pub(super) max_issue_delta_bytes: usize,
     pub(super) reading_material: ReadingMaterialSpecSet,
     pub(super) notifications: DispatchNotificationsConfig,
     pub(super) rank_acl: DispatchRankAclConfig,
@@ -394,6 +396,10 @@ struct DispatchConfigFile {
     allowed_actors: Vec<String>,
     #[serde(default)]
     prompt_envelopes: DispatchPromptEnvelopeConfigFile,
+    #[serde(default = "default_max_issue_history_bytes")]
+    max_issue_history_bytes: usize,
+    #[serde(default = "default_max_issue_delta_bytes")]
+    max_issue_delta_bytes: usize,
     #[serde(default)]
     reading_material: ReadingMaterialSpecSet,
     #[serde(default)]
@@ -620,6 +626,14 @@ fn default_issue_fresh_file() -> String {
 
 fn default_issue_followup_file() -> String {
     "../prompts/orchd-issue-followup.md".to_string()
+}
+
+const fn default_max_issue_history_bytes() -> usize {
+    200_000
+}
+
+const fn default_max_issue_delta_bytes() -> usize {
+    200_000
 }
 
 fn default_git_remote() -> String {
@@ -1386,6 +1400,8 @@ pub(super) fn load_dispatch_config_from_str(path: &Path, raw_text: &str) -> Resu
     Ok(DispatchConfig {
         allowed_actors,
         prompt_envelopes,
+        max_issue_history_bytes: raw.max_issue_history_bytes.max(1),
+        max_issue_delta_bytes: raw.max_issue_delta_bytes.max(1),
         reading_material: raw.reading_material,
         notifications: DispatchNotificationsConfig {
             enabled: raw.notifications.enabled,
@@ -1800,6 +1816,8 @@ prompt_file = "{reply_prompt}"
 
         let config = load_dispatch_config(&config_path)?;
         assert!(config.roles.contains_key("codex-orch"));
+        assert_eq!(config.max_issue_history_bytes, 200_000);
+        assert_eq!(config.max_issue_delta_bytes, 200_000);
         assert!(
             config
                 .rank_acl
@@ -1807,6 +1825,58 @@ prompt_file = "{reply_prompt}"
                 .is_ok()
         );
         assert!(!config.triggers.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn load_dispatch_config_applies_issue_thread_byte_caps() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path();
+        let config_path = root.join("dispatch.toml");
+        let prompts_dir = root.join("prompts");
+        let roles_dir = prompts_dir.join("roles");
+        fs::create_dir_all(&roles_dir)?;
+        fs::write(
+            roles_dir.join("codex-orch.md"),
+            "# codex-orch role card\n\n- OF-8\n",
+        )?;
+        fs::write(roles_dir.join("main.md"), "# main role card\n\n- OF-10\n")?;
+
+        let config_toml = format!(
+            r#"version = 1
+allowed_actors = ["main"]
+forgejoctl_bin = "/home/main/.local/bin/forgejoctl"
+max_issue_history_bytes = 4096
+max_issue_delta_bytes = 2048
+
+[prompt_envelopes]
+preamble_file = "{preamble}"
+fresh_envelope = "{fresh}"
+followup_envelope = "{followup}"
+
+[roles.codex-orch]
+token_file = "{token}"
+
+[directives.design]
+role = "codex-orch"
+prompt_file = "{design_prompt}"
+
+[directives.reply]
+role = "codex-orch"
+prompt_file = "{reply_prompt}"
+"#,
+            preamble = prompts_dir.join("orchd-preamble.md").display(),
+            fresh = prompts_dir.join("orchd-envelope-fresh.md").display(),
+            followup = prompts_dir.join("orchd-envelope-followup.md").display(),
+            token = root.join("token.txt").display(),
+            design_prompt = prompts_dir.join("orders").join("orchd-design.md").display(),
+            reply_prompt = prompts_dir.join("orders").join("orchd-reply.md").display(),
+        );
+        fs::write(&config_path, config_toml)?;
+
+        let config = load_dispatch_config(&config_path)?;
+        assert_eq!(config.max_issue_history_bytes, 4096);
+        assert_eq!(config.max_issue_delta_bytes, 2048);
         Ok(())
     }
 
