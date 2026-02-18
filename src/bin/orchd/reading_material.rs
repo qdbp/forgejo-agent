@@ -575,12 +575,20 @@ pub(super) fn build_reading_material(
     }
 }
 
+#[derive(Debug, Clone)]
+struct DocBlurb {
+    title: String,
+    summary: Option<String>,
+}
+
 fn render_reading_material_markdown(
     docs: &[DocPlanDoc],
     repo_root: &Path,
     repo_bindings: &HashMap<String, DispatchRepoBindingConfig>,
     warnings: &mut Vec<String>,
 ) -> String {
+    use std::fmt::Write as _;
+
     let includes = docs
         .iter()
         .filter(|doc| doc.disposition == DocDisposition::Included && doc.resolved_path.is_some())
@@ -598,9 +606,6 @@ fn render_reading_material_markdown(
     out.push_str("## Reading material\n\n");
 
     if !includes.is_empty() {
-        use std::fmt::Write as _;
-
-        out.push_str("Included:\n");
         for doc in includes {
             let Some(path) = resolve_for_render(repo_root, repo_bindings, doc, warnings) else {
                 continue;
@@ -612,31 +617,284 @@ fn render_reading_material_markdown(
                     continue;
                 }
             };
-            let _ = writeln!(&mut out, "- `{}`\n", doc.doc_ref);
-            out.push_str("```text\n");
+
+            let blurb = doc_blurb(&doc.doc_ref, Some(&content));
+            let _ = writeln!(&mut out, "### {}", blurb.title);
+            let _ = writeln!(
+                &mut out,
+                "ref: {} (importance: {})",
+                doc.doc_ref,
+                doc_importance_str(doc.importance)
+            );
+            out.push('\n');
+
+            let _ = writeln!(&mut out, "BEGIN DOC");
+            let fence = backtick_fence(&content);
+            let _ = writeln!(&mut out, "{fence}md");
             out.push_str(&content);
             if !content.ends_with('\n') {
                 out.push('\n');
             }
-            out.push_str("```\n\n");
+            let _ = writeln!(&mut out, "{fence}");
+            let _ = writeln!(&mut out, "END DOC\n");
         }
         out.push('\n');
     }
 
     if !points.is_empty() {
-        use std::fmt::Write as _;
-
-        out.push_str("Pointers:\n");
+        out.push_str("### Pointers\n");
         for doc in points {
-            let Some(rendered) = doc_ref_pointer(doc) else {
-                continue;
-            };
-            let _ = writeln!(&mut out, "- {rendered}");
+            let content =
+                resolve_for_render(repo_root, repo_bindings, doc, warnings).and_then(|path| {
+                    match read_doc_utf8(&path) {
+                        Ok(v) => Some(v),
+                        Err(err) => {
+                            warnings.push(format!("{}: {err}", doc.doc_ref));
+                            None
+                        }
+                    }
+                });
+            let blurb = doc_blurb(&doc.doc_ref, content.as_deref());
+
+            match blurb.summary {
+                Some(summary) => {
+                    let _ = writeln!(
+                        &mut out,
+                        "- {} (ref: {}, importance: {}): {}",
+                        blurb.title,
+                        doc.doc_ref,
+                        doc_importance_str(doc.importance),
+                        summary
+                    );
+                }
+                None => {
+                    let _ = writeln!(
+                        &mut out,
+                        "- {} (ref: {}, importance: {})",
+                        blurb.title,
+                        doc.doc_ref,
+                        doc_importance_str(doc.importance)
+                    );
+                }
+            }
         }
         out.push('\n');
     }
 
     out
+}
+
+const fn doc_importance_str(importance: DocImportance) -> &'static str {
+    match importance {
+        DocImportance::Required => "required",
+        DocImportance::Recommended => "recommended",
+    }
+}
+
+fn doc_blurb(doc_ref: &str, content: Option<&str>) -> DocBlurb {
+    let fallback_title = fallback_title_from_ref(doc_ref);
+    let Some(content) = content else {
+        return DocBlurb {
+            title: fallback_title,
+            summary: None,
+        };
+    };
+
+    let (title_opt, summary_start_line) = markdown_first_h1(content);
+    let title = title_opt.unwrap_or(fallback_title);
+    let summary = markdown_first_paragraph(content, summary_start_line)
+        .and_then(|para| first_sentence(&para))
+        .map(|s| truncate_chars(&s, 160));
+
+    DocBlurb { title, summary }
+}
+
+fn fallback_title_from_ref(doc_ref: &str) -> String {
+    let parsed = DocRef::parse(doc_ref).ok();
+    let Some(parsed) = parsed else {
+        return doc_ref.to_string();
+    };
+    let path = match &parsed {
+        DocRef::Workdir { path } | DocRef::Repo { path, .. } => path.as_str(),
+    };
+    Path::new(path)
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or(path)
+        .to_string()
+}
+
+fn is_md_fence(line_trimmed: &str) -> bool {
+    line_trimmed.starts_with("```") || line_trimmed.starts_with("~~~")
+}
+
+fn markdown_first_h1(content: &str) -> (Option<String>, usize) {
+    let mut in_fence = false;
+    let mut lines = content.lines().enumerate().peekable();
+    while let Some((idx, raw_line)) = lines.next() {
+        let line = raw_line.trim_end_matches('\r');
+        let trimmed = line.trim_start();
+
+        if is_md_fence(trimmed) {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+
+        if let Some(title) = md_atx_h1(trimmed) {
+            return (Some(title), idx + 1);
+        }
+
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        // Setext H1: "Title\n====="
+        if let Some((_, next_raw)) = lines.peek() {
+            let next = next_raw.trim_end_matches('\r').trim_start();
+            if md_setext_h1_underline(next) {
+                // Consume underline.
+                let _ = lines.next();
+                return (Some(trimmed.to_string()), idx + 2);
+            }
+        }
+    }
+
+    (None, 0)
+}
+
+fn md_atx_h1(line_trimmed: &str) -> Option<String> {
+    let rest = if let Some(rest) = line_trimmed.strip_prefix("# ") {
+        rest
+    } else if let Some(rest) = line_trimmed.strip_prefix("#\t") {
+        rest
+    } else {
+        return None;
+    };
+
+    let title = rest.trim();
+    if title.is_empty() {
+        return None;
+    }
+    Some(title.to_string())
+}
+
+fn md_setext_h1_underline(line_trimmed: &str) -> bool {
+    let line = line_trimmed.trim();
+    !line.is_empty()
+        && line.bytes().all(|b| b == b'=' || b == b' ' || b == b'\t')
+        && line.bytes().any(|b| b == b'=')
+}
+
+fn markdown_first_paragraph(content: &str, start_line: usize) -> Option<String> {
+    let mut in_fence = false;
+    let mut found = Vec::new();
+    for (idx, raw_line) in content.lines().enumerate() {
+        if idx < start_line {
+            continue;
+        }
+
+        let line = raw_line.trim_end_matches('\r');
+        let trimmed = line.trim_start();
+
+        if is_md_fence(trimmed) {
+            in_fence = !in_fence;
+            if !found.is_empty() {
+                break;
+            }
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+
+        if trimmed.is_empty() {
+            if !found.is_empty() {
+                break;
+            }
+            continue;
+        }
+        if trimmed.starts_with('#') || md_setext_h1_underline(trimmed) {
+            if !found.is_empty() {
+                break;
+            }
+            continue;
+        }
+        if trimmed.starts_with("- ")
+            || trimmed.starts_with("* ")
+            || trimmed.starts_with("+ ")
+            || trimmed.starts_with("> ")
+        {
+            // Lists/quotes tend to be noisy as a one-line summary; keep optional summaries conservative.
+            if !found.is_empty() {
+                break;
+            }
+            continue;
+        }
+
+        found.push(trimmed.to_string());
+    }
+
+    if found.is_empty() {
+        return None;
+    }
+
+    Some(found.join(" "))
+}
+
+fn first_sentence(text: &str) -> Option<String> {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return None;
+    }
+
+    for (idx, ch) in normalized.char_indices() {
+        if matches!(ch, '.' | '!' | '?') {
+            return Some(normalized[..=idx].to_string());
+        }
+    }
+    Some(normalized)
+}
+
+fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(max + 3);
+    out.extend(text.chars().take(max.saturating_sub(3)));
+    out.push_str("...");
+    out
+}
+
+fn backtick_fence(content: &str) -> String {
+    let mut max_run = 0usize;
+    for line in content.lines() {
+        let mut bytes = line.as_bytes();
+        if bytes.last().copied() == Some(b'\r') {
+            bytes = &bytes[..bytes.len().saturating_sub(1)];
+        }
+
+        let mut i = 0usize;
+        while i < bytes.len() && i < 3 && bytes[i] == b' ' {
+            i += 1;
+        }
+        let mut j = i;
+        while j < bytes.len() && bytes[j] == b'`' {
+            j += 1;
+        }
+        let run = j.saturating_sub(i);
+        if run < 3 {
+            continue;
+        }
+        if bytes[j..].iter().all(|b| *b == b' ' || *b == b'\t') {
+            max_run = max_run.max(run);
+        }
+    }
+
+    let fence_len = max_run.saturating_add(1).max(3);
+    "`".repeat(fence_len)
 }
 
 fn resolve_for_render(
@@ -658,14 +916,6 @@ fn resolve_for_render(
             warnings.push(format!("{}: {err}", doc.doc_ref));
             None
         }
-    }
-}
-
-fn doc_ref_pointer(doc: &DocPlanDoc) -> Option<String> {
-    let doc_ref = DocRef::parse(&doc.doc_ref).ok()?;
-    match doc_ref {
-        DocRef::Workdir { path } => Some(format!("Read `{}` in this repo.", path.as_str())),
-        DocRef::Repo { repo, path } => Some(format!("Read `{}` in `{repo}`.", path.as_str())),
     }
 }
 
@@ -732,8 +982,21 @@ importance = "recommended"
         );
 
         assert!(outcome.markdown.contains("## Reading material"));
+        assert!(outcome.markdown.contains("### a.txt"));
+        assert!(
+            outcome
+                .markdown
+                .contains("ref: workdir:docs/a.txt (importance: required)")
+        );
+        assert!(outcome.markdown.contains("BEGIN DOC"));
         assert!(outcome.markdown.contains("alpha"));
-        assert!(outcome.markdown.contains("Read `docs/b.txt` in this repo."));
+        assert!(outcome.markdown.contains("END DOC"));
+        assert!(outcome.markdown.contains("### Pointers"));
+        assert!(
+            outcome
+                .markdown
+                .contains("b.txt (ref: workdir:docs/b.txt, importance: recommended)")
+        );
 
         let docs = &outcome.doc_plan.docs;
         assert_eq!(docs.len(), 2);
@@ -741,5 +1004,71 @@ importance = "recommended"
         assert_eq!(docs[1].disposition, DocDisposition::Pointed);
         assert!(docs[0].sha256.as_deref().unwrap_or_default().len() >= 64);
         assert!(docs[0].bytes.unwrap_or_default() > 0);
+    }
+
+    #[test]
+    fn reading_material_renders_titles_and_safe_code_fences() {
+        let tmp = TempDir::new().unwrap();
+        write_file(
+            &tmp,
+            "docs/included.md",
+            r"# Included Doc
+
+This doc includes fenced code blocks.
+
+```bash
+echo hi
+```
+",
+        );
+        write_file(
+            &tmp,
+            "docs/pointer.md",
+            r"# Pointer Doc
+
+First paragraph is used as a summary. Second sentence.
+",
+        );
+        write_file(
+            &tmp,
+            ".orchd/config.toml",
+            r#"
+[docs]
+
+[[docs.rule]]
+kind = "include"
+ref = "workdir:docs/included.md"
+roles = ["*"]
+directives = ["impl"]
+order = 10
+importance = "required"
+
+[[docs.rule]]
+kind = "point"
+ref = "workdir:docs/pointer.md"
+roles = ["*"]
+directives = ["impl"]
+order = 20
+importance = "recommended"
+"#,
+        );
+
+        let global = ReadingMaterialSpecSet::default();
+        let outcome = build_reading_material(
+            &global,
+            "codex-dev",
+            "impl",
+            "fresh",
+            tmp.path(),
+            &HashMap::new(),
+        );
+
+        assert!(outcome.markdown.contains("### Included Doc"));
+        assert!(outcome.markdown.contains("BEGIN DOC"));
+        // Nested ``` in markdown docs should not terminate the outer fence (````).
+        assert!(outcome.markdown.contains("````md"));
+        assert!(outcome.markdown.contains("END DOC"));
+        assert!(outcome.markdown.contains("### Pointers"));
+        assert!(outcome.markdown.contains("Pointer Doc (ref: workdir:docs/pointer.md, importance: recommended): First paragraph is used as a summary."));
     }
 }
