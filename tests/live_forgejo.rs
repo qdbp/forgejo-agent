@@ -2007,24 +2007,6 @@ fn live_orchd_reply_autodispatches_to_assignee() -> Result<()> {
         bail!("expected no dispatch for non-codex assignee");
     }
 
-    let self_comment = post_orchd_issue_comment_webhook_with_issue(
-        &orchd.client,
-        &orchd.base_url,
-        &harness.repo_ref,
-        serde_json::json!({
-            "number": issue_number,
-            "assignees": [{ "login": "codex-orch" }],
-        }),
-        "codex-orch",
-        "hello",
-    )?;
-    if json_str_field(&self_comment, "decision")? != "ignored" {
-        bail!("expected ignored decision for assignee self-comment: {self_comment}");
-    }
-    if orchd_dispatch_count(&db_path)? != 0 {
-        bail!("expected no dispatch for assignee self-comment");
-    }
-
     let multi = post_orchd_issue_comment_webhook_with_issue(
         &orchd.client,
         &orchd.base_url,
@@ -2041,6 +2023,24 @@ fn live_orchd_reply_autodispatches_to_assignee() -> Result<()> {
     }
     if orchd_dispatch_count(&db_path)? != 0 {
         bail!("expected no dispatch for multi-assignee");
+    }
+
+    let self_comment = post_orchd_issue_comment_webhook_with_issue(
+        &orchd.client,
+        &orchd.base_url,
+        &harness.repo_ref,
+        serde_json::json!({
+            "number": issue_number,
+            "assignees": [{ "login": "codex-orch" }],
+        }),
+        "codex-orch",
+        "hello",
+    )?;
+    if json_str_field(&self_comment, "decision")? != "ignored" {
+        bail!("expected ignored decision for assignee self-comment: {self_comment}");
+    }
+    if orchd_dispatch_count(&db_path)? != 0 {
+        bail!("expected no dispatch for assignee self-comment");
     }
 
     let reply = post_orchd_issue_comment_webhook_with_issue(
@@ -3253,6 +3253,11 @@ fn live_orchd_impl_sidecar_dirty_blocks_primary_landing() -> Result<()> {
         "orchd/state/blocked",
         Duration::from_secs(120),
     )?;
+
+    let final_issue = harness.get_issue(issue_number)?;
+    if issue_has_label(&final_issue, "state/blocked")? {
+        bail!("expected blocked impl dispatch to not force issue into state/blocked");
+    }
 
     let primary_after = primary_git.bare_head_main()?;
     let sidecar_after = sidecar_git.bare_head_main()?;
