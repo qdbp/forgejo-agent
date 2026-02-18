@@ -1,5 +1,7 @@
 # AGENTS Notes
 
+Repo-local agent guidance for working on `main/forgejo-agent`: quality gates, workflow policies, and guardrails. Read this first before making changes or running automation in this repo.
+
 ## Start Here
 
 - Read `README.md` first for the canonical operator/developer workflow and command patterns.

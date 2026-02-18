@@ -1,3 +1,4 @@
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -15,8 +16,9 @@ use forgejo_agent::config::AgentConfig;
 use forgejo_agent::types::RepoRef;
 
 use super::cli::{Cli, RoleAddArgs, RoleCheckArgs, RoleListArgs};
-use super::dispatch_config::{DispatchConfig, load_dispatch_config};
+use super::dispatch_config::{DispatchConfig, DispatchRepoBindingConfig, load_dispatch_config};
 use super::paths::{expand_tilde_path, resolve_dispatch_config_path};
+use super::reading_material::DocRef;
 
 const DEFAULT_CODEX_BIN: &str = "/home/main/forgejo-agent/bin/codex-role";
 const DEFAULT_ROLE_TEMPLATE: &str = "templates/role-card-template.md";
@@ -157,6 +159,19 @@ pub(super) fn role_check_command(cli: &Cli, args: RoleCheckArgs) -> Result<()> {
                 for warning in &role.warnings {
                     println!("  warning: {warning}");
                 }
+            }
+        }
+    }
+
+    let doc_warnings = lint_prompt_eligible_docs(&dispatch_config);
+    if !doc_warnings.is_empty() {
+        if args.json {
+            for warning in doc_warnings {
+                eprintln!("doc warning: {warning}");
+            }
+        } else {
+            for warning in doc_warnings {
+                println!("doc warning: {warning}");
             }
         }
     }
@@ -638,6 +653,117 @@ fn evaluate_roles_offline(config: &DispatchConfig, role_filter: Option<String>) 
 
     let ok = checks.iter().all(|check| check.errors.is_empty());
     RoleCheckReport { ok, roles: checks }
+}
+
+fn lint_prompt_eligible_docs(config: &DispatchConfig) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut warnings = Vec::new();
+
+    for rule in &config.reading_material.rule {
+        let raw_ref = rule.r#ref.trim();
+        if raw_ref.is_empty() || !seen.insert(raw_ref.to_string()) {
+            continue;
+        }
+
+        let doc_ref = match DocRef::parse(raw_ref) {
+            Ok(v) => v,
+            Err(err) => {
+                warnings.push(format!("invalid reading_material ref '{raw_ref}': {err}"));
+                continue;
+            }
+        };
+
+        let abs_path = match resolve_doc_ref_for_lint(&config.repo_bindings, &doc_ref) {
+            Ok(v) => v,
+            Err(err) => {
+                warnings.push(format!("{raw_ref}: {err}"));
+                continue;
+            }
+        };
+
+        let content = match fs::read_to_string(&abs_path) {
+            Ok(v) => v,
+            Err(err) => {
+                warnings.push(format!(
+                    "{raw_ref}: read failed for {}: {err}",
+                    abs_path.display()
+                ));
+                continue;
+            }
+        };
+
+        warnings.extend(
+            doc_contract_warnings(&content)
+                .into_iter()
+                .map(|msg| format!("{raw_ref}: {msg}")),
+        );
+    }
+
+    warnings
+}
+
+fn resolve_doc_ref_for_lint(
+    repo_bindings: &HashMap<String, DispatchRepoBindingConfig>,
+    doc_ref: &DocRef,
+) -> Result<PathBuf, String> {
+    match doc_ref {
+        DocRef::Workdir { .. } => Err("workdir: refs require a repo root; skipping".to_string()),
+        DocRef::Repo { repo, path } => {
+            let binding = repo_bindings.get(&repo.to_string()).ok_or_else(|| {
+                format!("repo ref requires existing repo_bindings entry for {repo}")
+            })?;
+            Ok(binding.local_path.join(path.as_str()))
+        }
+    }
+}
+
+fn doc_contract_warnings(doc_md: &str) -> Vec<String> {
+    let mut lines = doc_md.lines().enumerate();
+    let Some((_, title_line)) = lines.find(|(_, line)| !line.trim().is_empty()) else {
+        return vec!["doc is empty".to_string()];
+    };
+
+    let title_trim = title_line.trim_start();
+    if !title_trim.starts_with("# ") {
+        return vec!["missing top-level '# Title' as first content line".to_string()];
+    }
+
+    let Some((_, intro_line)) = lines.find(|(_, line)| !line.trim().is_empty()) else {
+        return vec!["missing 1-paragraph intro after H1".to_string()];
+    };
+
+    let intro_trim = intro_line.trim_start();
+    if intro_trim.starts_with('#')
+        || intro_trim.starts_with("```")
+        || intro_trim.starts_with('-')
+        || intro_trim.starts_with('*')
+        || intro_trim.starts_with('+')
+        || intro_trim.starts_with('>')
+        || intro_trim.starts_with('|')
+        || intro_trim.starts_with('<')
+        || starts_with_ordered_list_marker(intro_trim)
+    {
+        return vec!["missing 1-paragraph intro after H1".to_string()];
+    }
+
+    Vec::new()
+}
+
+fn starts_with_ordered_list_marker(line: &str) -> bool {
+    let mut chars = line.chars().peekable();
+    let mut saw_digit = false;
+    while let Some(ch) = chars.peek().copied() {
+        if ch.is_ascii_digit() {
+            saw_digit = true;
+            chars.next();
+            continue;
+        }
+        break;
+    }
+    if !saw_digit {
+        return false;
+    }
+    matches!(chars.peek().copied(), Some('.' | ')'))
 }
 
 fn expected_admin_for_role(role_name: &str) -> bool {
@@ -1232,7 +1358,8 @@ fn render_role_card(role: &str, rank: &str, role_card_file: &Path) -> Result<Str
 #[cfg(test)]
 mod tests {
     use super::{
-        assert_rank_defined, normalize_rank, parse_rank_from_role_card, render_role_added_config,
+        assert_rank_defined, doc_contract_warnings, normalize_rank, parse_rank_from_role_card,
+        render_role_added_config,
     };
     use std::path::Path;
 
@@ -1315,5 +1442,56 @@ token_file = "/tmp/orch.token"
             false,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn doc_contract_accepts_h1_then_intro() {
+        let md = "# Title\n\nThis doc explains X.\n\n## Section\n";
+        assert!(doc_contract_warnings(md).is_empty());
+    }
+
+    #[test]
+    fn doc_contract_requires_h1_first() {
+        let md = "Title\n\nThis doc explains X.\n";
+        assert_eq!(
+            doc_contract_warnings(md),
+            vec!["missing top-level '# Title' as first content line".to_string()]
+        );
+    }
+
+    #[test]
+    fn doc_contract_requires_intro_before_subheading() {
+        let md = "# Title\n\n## Section\n";
+        assert_eq!(
+            doc_contract_warnings(md),
+            vec!["missing 1-paragraph intro after H1".to_string()]
+        );
+    }
+
+    #[test]
+    fn doc_contract_requires_intro_before_list() {
+        let md = "# Title\n\n- item\n";
+        assert_eq!(
+            doc_contract_warnings(md),
+            vec!["missing 1-paragraph intro after H1".to_string()]
+        );
+    }
+
+    #[test]
+    fn doc_contract_requires_intro_before_code_fence() {
+        let md = "# Title\n\n```bash\necho hi\n```\n";
+        assert_eq!(
+            doc_contract_warnings(md),
+            vec!["missing 1-paragraph intro after H1".to_string()]
+        );
+    }
+
+    #[test]
+    fn doc_contract_requires_intro_before_ordered_list() {
+        let md = "# Title\n\n1. item\n";
+        assert_eq!(
+            doc_contract_warnings(md),
+            vec!["missing 1-paragraph intro after H1".to_string()]
+        );
     }
 }
