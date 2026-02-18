@@ -301,6 +301,7 @@ fn codex_sandbox_for_directive(directive: &str) -> CodexSandbox {
     match directive {
         lexicon::DIRECTIVE_DESIGN
         | lexicon::DIRECTIVE_INVESTIGATE
+        | lexicon::DIRECTIVE_TRIAGE
         | lexicon::DIRECTIVE_REPLY
         | lexicon::DIRECTIVE_AUDIT
         | lexicon::DIRECTIVE_AUDIT_FAILURE => CodexSandbox::ReadOnly,
@@ -1495,6 +1496,12 @@ mod tests {
     #[test]
     fn investigate_runs_read_only() {
         let sandbox = super::codex_sandbox_for_directive(super::lexicon::DIRECTIVE_INVESTIGATE);
+        assert!(matches!(sandbox, super::CodexSandbox::ReadOnly));
+    }
+
+    #[test]
+    fn triage_runs_read_only() {
+        let sandbox = super::codex_sandbox_for_directive(super::lexicon::DIRECTIVE_TRIAGE);
         assert!(matches!(sandbox, super::CodexSandbox::ReadOnly));
     }
 }

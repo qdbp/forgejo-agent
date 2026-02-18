@@ -13,7 +13,8 @@ use super::reading_material::ReadingMaterialSpecSet;
 
 use super::lexicon::{
     DIRECTIVE_AUDIT, DIRECTIVE_AUDIT_FAILURE, DIRECTIVE_DESIGN, DIRECTIVE_IMPL,
-    DIRECTIVE_INVESTIGATE, DIRECTIVE_REPLY, EVENT_ISSUE_COMMENT, EVENT_ISSUES, directive_is_known,
+    DIRECTIVE_INVESTIGATE, DIRECTIVE_REPLY, DIRECTIVE_TRIAGE, EVENT_ISSUE_COMMENT, EVENT_ISSUES,
+    directive_is_known,
 };
 use super::paths::expand_tilde_path;
 
@@ -319,9 +320,14 @@ pub(super) struct DispatchTriggerMatcher {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct DispatchTriggerGuards {
+    #[serde(default)]
     pub(super) directive: DispatchTriggerDirectiveGuard,
+    #[serde(default)]
     pub(super) assignee: DispatchTriggerAssigneeGuard,
+    #[serde(default)]
     pub(super) actor: DispatchTriggerActorGuard,
+    #[serde(default)]
+    pub(super) actors_none: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -716,6 +722,7 @@ fn default_rank_directives() -> BTreeMap<DispatchRank, DispatchRankAclRankPolicy
     let all_directives = [
         DIRECTIVE_DESIGN,
         DIRECTIVE_INVESTIGATE,
+        DIRECTIVE_TRIAGE,
         DIRECTIVE_IMPL,
         DIRECTIVE_REPLY,
         DIRECTIVE_AUDIT,
@@ -776,6 +783,37 @@ fn parse_acl_directive_set(
             Ok(directive)
         })
         .collect()
+}
+
+fn normalize_trigger_actor_denylist(
+    config_path: &Path,
+    trigger_id: &str,
+    actors_none: Vec<String>,
+) -> Result<Vec<String>> {
+    let mut normalized = Vec::new();
+    let mut seen = HashSet::new();
+    for raw_actor in actors_none {
+        let actor = raw_actor.trim().to_ascii_lowercase();
+        if actor.is_empty() {
+            return Err(anyhow!(
+                "dispatch config {} trigger '{}' guards.actors_none includes empty actor login",
+                config_path.display(),
+                trigger_id
+            ));
+        }
+        if actor.chars().any(char::is_whitespace) {
+            return Err(anyhow!(
+                "dispatch config {} trigger '{}' guards.actors_none includes invalid actor login '{}'",
+                config_path.display(),
+                trigger_id,
+                raw_actor
+            ));
+        }
+        if seen.insert(actor.clone()) {
+            normalized.push(actor);
+        }
+    }
+    Ok(normalized)
 }
 
 fn compile_acl_directive_surfaces(
@@ -1109,6 +1147,7 @@ pub(super) fn legacy_trigger_pack() -> Vec<DispatchTriggerConfig> {
                 directive: DispatchTriggerDirectiveGuard::RequireParsed,
                 assignee: DispatchTriggerAssigneeGuard::Any,
                 actor: DispatchTriggerActorGuard::Any,
+                actors_none: Vec::new(),
             },
             action: DispatchTriggerAction {
                 directive: DispatchTriggerDirectiveSource::ParsedDirective,
@@ -1130,6 +1169,7 @@ pub(super) fn legacy_trigger_pack() -> Vec<DispatchTriggerConfig> {
                 directive: DispatchTriggerDirectiveGuard::RequireParsed,
                 assignee: DispatchTriggerAssigneeGuard::Any,
                 actor: DispatchTriggerActorGuard::Any,
+                actors_none: Vec::new(),
             },
             action: DispatchTriggerAction {
                 directive: DispatchTriggerDirectiveSource::ParsedDirective,
@@ -1152,6 +1192,7 @@ pub(super) fn legacy_trigger_pack() -> Vec<DispatchTriggerConfig> {
                 directive: DispatchTriggerDirectiveGuard::RequireAbsent,
                 assignee: DispatchTriggerAssigneeGuard::Any,
                 actor: DispatchTriggerActorGuard::Any,
+                actors_none: Vec::new(),
             },
             action: DispatchTriggerAction {
                 directive: DispatchTriggerDirectiveSource::Literal(DIRECTIVE_REPLY.to_string()),
@@ -1173,6 +1214,7 @@ pub(super) fn legacy_trigger_pack() -> Vec<DispatchTriggerConfig> {
                 directive: DispatchTriggerDirectiveGuard::RequireAbsent,
                 assignee: DispatchTriggerAssigneeGuard::RequireSingleCodex,
                 actor: DispatchTriggerActorGuard::RequireNotAssignee,
+                actors_none: Vec::new(),
             },
             action: DispatchTriggerAction {
                 directive: DispatchTriggerDirectiveSource::Literal(DIRECTIVE_REPLY.to_string()),
@@ -1477,7 +1519,9 @@ fn compile_registered_trigger(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let guards = trigger.guards;
+    let mut guards = trigger.guards;
+    guards.actors_none =
+        normalize_trigger_actor_denylist(config_path, trigger_id.as_str(), guards.actors_none)?;
     if guards.actor == DispatchTriggerActorGuard::RequireNotAssignee
         && guards.assignee == DispatchTriggerAssigneeGuard::Any
     {
@@ -1929,6 +1973,124 @@ target_role = "codex-orch"
         assert!(
             err.to_string()
                 .contains("trigger 'bad' references unknown directive 'debrief'")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn load_dispatch_config_normalizes_trigger_actor_denylist() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path();
+        let config_path = root.join("dispatch.toml");
+        let prompts_dir = root.join("prompts");
+        let roles_dir = prompts_dir.join("roles");
+        fs::create_dir_all(&roles_dir)?;
+        fs::write(roles_dir.join("codex-orch.md"), "# role\n\n- OF-8\n")?;
+        fs::write(roles_dir.join("main.md"), "# main role\n\n- OF-10\n")?;
+
+        let config_toml = format!(
+            r#"version = 1
+allowed_actors = ["main"]
+legacy_triggers = false
+
+[prompt_envelopes]
+preamble_file = "{preamble}"
+fresh_envelope = "{fresh}"
+followup_envelope = "{followup}"
+
+[roles.codex-orch]
+token_file = "{token}"
+
+[directives.reply]
+role = "codex-orch"
+prompt_file = "{reply_prompt}"
+
+[[triggers]]
+id = "actor-filter"
+event = "issue_comment"
+actions = ["created"]
+
+[triggers.guards]
+directive = "require_absent"
+actors_none = [" MAIN ", "main", "orchd"]
+
+[triggers.action]
+directive = "reply"
+target_role = "codex-orch"
+principal = "codex-orch"
+"#,
+            preamble = prompts_dir.join("orchd-preamble.md").display(),
+            fresh = prompts_dir.join("orchd-envelope-fresh.md").display(),
+            followup = prompts_dir.join("orchd-envelope-followup.md").display(),
+            token = root.join("token.txt").display(),
+            reply_prompt = prompts_dir.join("orders").join("orchd-reply.md").display(),
+        );
+        fs::write(&config_path, config_toml)?;
+
+        let config = load_dispatch_config(&config_path)?;
+        let trigger = config
+            .triggers
+            .iter()
+            .find(|trigger| trigger.id == "actor-filter")
+            .expect("expected actor-filter trigger");
+        assert_eq!(trigger.guards.actors_none, vec!["main", "orchd"]);
+        Ok(())
+    }
+
+    #[test]
+    fn load_dispatch_config_rejects_trigger_with_blank_actor_denylist_entry() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path();
+        let config_path = root.join("dispatch.toml");
+        let prompts_dir = root.join("prompts");
+        let roles_dir = prompts_dir.join("roles");
+        fs::create_dir_all(&roles_dir)?;
+        fs::write(roles_dir.join("codex-orch.md"), "# role\n\n- OF-8\n")?;
+        fs::write(roles_dir.join("main.md"), "# main role\n\n- OF-10\n")?;
+
+        let config_toml = format!(
+            r#"version = 1
+allowed_actors = ["main"]
+legacy_triggers = false
+
+[prompt_envelopes]
+preamble_file = "{preamble}"
+fresh_envelope = "{fresh}"
+followup_envelope = "{followup}"
+
+[roles.codex-orch]
+token_file = "{token}"
+
+[directives.reply]
+role = "codex-orch"
+prompt_file = "{reply_prompt}"
+
+[[triggers]]
+id = "bad-actors-none"
+event = "issue_comment"
+actions = ["created"]
+
+[triggers.guards]
+actors_none = ["main", " "]
+
+[triggers.action]
+directive = "reply"
+target_role = "codex-orch"
+principal = "codex-orch"
+"#,
+            preamble = prompts_dir.join("orchd-preamble.md").display(),
+            fresh = prompts_dir.join("orchd-envelope-fresh.md").display(),
+            followup = prompts_dir.join("orchd-envelope-followup.md").display(),
+            token = root.join("token.txt").display(),
+            reply_prompt = prompts_dir.join("orders").join("orchd-reply.md").display(),
+        );
+        fs::write(&config_path, config_toml)?;
+
+        let err = load_dispatch_config(&config_path).expect_err("config should fail");
+        assert!(
+            err.to_string().contains(
+                "trigger 'bad-actors-none' guards.actors_none includes empty actor login"
+            )
         );
         Ok(())
     }

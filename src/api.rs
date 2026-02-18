@@ -472,11 +472,27 @@ impl ForgejoClient {
     }
 
     pub fn list_labels(&self, cfg: &AgentConfig, repo: &RepoRef) -> Result<Vec<ApiLabel>> {
-        let path = format!(
-            "/api/v1/repos/{}/{}/labels?limit=1000",
-            repo.owner, repo.repo
-        );
-        self.send_json(cfg, &Method::GET, &path, Option::<&()>::None)
+        const PAGE_LIMIT: u32 = 1000;
+        const MAX_PAGES: u32 = 200;
+
+        let mut labels = Vec::new();
+        for page in 1..=MAX_PAGES {
+            let path = format!(
+                "/api/v1/repos/{}/{}/labels?limit={PAGE_LIMIT}&page={page}",
+                repo.owner, repo.repo
+            );
+            let page_labels: Vec<ApiLabel> =
+                self.send_json(cfg, &Method::GET, &path, Option::<&()>::None)?;
+            if page_labels.is_empty() {
+                return Ok(labels);
+            }
+            labels.extend(page_labels);
+        }
+        bail!(
+            "label listing for {}/{} exceeded pagination safety cap ({MAX_PAGES} pages)",
+            repo.owner,
+            repo.repo
+        )
     }
 
     pub fn create_label(

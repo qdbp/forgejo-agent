@@ -10,6 +10,7 @@ pub(super) const DECISION_IGNORED: &str = "ignored";
 
 pub(super) const DIRECTIVE_DESIGN: &str = "design";
 pub(super) const DIRECTIVE_INVESTIGATE: &str = "investigate";
+pub(super) const DIRECTIVE_TRIAGE: &str = "triage";
 pub(super) const DIRECTIVE_IMPL: &str = "impl";
 pub(super) const DIRECTIVE_REPLY: &str = "reply";
 pub(super) const DIRECTIVE_AUDIT: &str = "audit";
@@ -20,6 +21,7 @@ pub(super) fn directive_is_known(directive: &str) -> bool {
         directive,
         DIRECTIVE_DESIGN
             | DIRECTIVE_INVESTIGATE
+            | DIRECTIVE_TRIAGE
             | DIRECTIVE_IMPL
             | DIRECTIVE_REPLY
             | DIRECTIVE_AUDIT
@@ -39,7 +41,8 @@ pub(super) fn directive_serializes_repo(directive: &str) -> bool {
 mod tests {
     use super::{
         DIRECTIVE_AUDIT, DIRECTIVE_AUDIT_FAILURE, DIRECTIVE_DESIGN, DIRECTIVE_IMPL,
-        DIRECTIVE_INVESTIGATE, DIRECTIVE_REPLY, directive_is_known, directive_uses_worktree,
+        DIRECTIVE_INVESTIGATE, DIRECTIVE_REPLY, DIRECTIVE_TRIAGE, directive_is_known,
+        directive_uses_worktree,
     };
 
     #[test]
@@ -53,6 +56,11 @@ mod tests {
     }
 
     #[test]
+    fn triage_is_a_known_directive() {
+        assert!(directive_is_known(DIRECTIVE_TRIAGE));
+    }
+
+    #[test]
     fn audit_failure_is_a_known_directive() {
         assert!(directive_is_known(DIRECTIVE_AUDIT_FAILURE));
     }
@@ -62,6 +70,7 @@ mod tests {
         assert!(directive_uses_worktree(DIRECTIVE_IMPL));
         assert!(!directive_uses_worktree(DIRECTIVE_DESIGN));
         assert!(!directive_uses_worktree(DIRECTIVE_INVESTIGATE));
+        assert!(!directive_uses_worktree(DIRECTIVE_TRIAGE));
         assert!(!directive_uses_worktree(DIRECTIVE_REPLY));
         assert!(!directive_uses_worktree(DIRECTIVE_AUDIT));
         assert!(!directive_uses_worktree(DIRECTIVE_AUDIT_FAILURE));

@@ -315,15 +315,18 @@ fn trigger_guards_hold(
     if guards.assignee == DispatchTriggerAssigneeGuard::RequireSingleCodex && assignee.is_none() {
         return false;
     }
+    let actor = context
+        .actor_login
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !actor.is_empty() && guards.actors_none.iter().any(|blocked| blocked == &actor) {
+        return false;
+    }
     if guards.actor == DispatchTriggerActorGuard::RequireNotAssignee {
         let Some(assignee) = assignee else {
             return false;
         };
-        let actor = context
-            .actor_login
-            .as_deref()
-            .unwrap_or_default()
-            .to_ascii_lowercase();
         if actor.is_empty() || actor == assignee {
             return false;
         }
@@ -802,6 +805,98 @@ mod tests {
 
         let decision_with_legacy = decide("issue_comment", Some("created"), Some(&context), None);
         assert_eq!(decision_with_legacy.reason_code, "explicit_directive");
+    }
+
+    #[test]
+    fn registered_trigger_actor_denylist_blocks_matching_actor() {
+        let trigger = DispatchTriggerConfig {
+            id: "custom.actor-filter".to_string(),
+            class: DispatchTriggerClass::Registered,
+            priority: 10,
+            matcher: DispatchTriggerMatcher {
+                event_type: "issue_comment".to_string(),
+                actions: vec!["created".to_string()],
+            },
+            guards: DispatchTriggerGuards {
+                actors_none: vec!["main".to_string()],
+                ..DispatchTriggerGuards::default()
+            },
+            action: DispatchTriggerAction {
+                directive: DispatchTriggerDirectiveSource::Literal("reply".to_string()),
+                target_role: DispatchTriggerRoleSource::Literal("codex-orch".to_string()),
+                principal: DispatchTriggerPrincipalSource::Literal("orchd".to_string()),
+                reason_code: "registered_trigger:custom.actor-filter".to_string(),
+            },
+            apply_guardrails: true,
+        };
+        let context = EventContext {
+            repo_full_name: "main/orchd-debug".to_string(),
+            issue_number: Some(4),
+            source_issue_id: Some(4),
+            source_issue_anchor_at: Some("2026-02-16T09:00:00Z".to_string()),
+            actor_login: Some("main".to_string()),
+            conversation_role: None,
+            text: Some("please handle this".to_string()),
+            source_comment_id: Some(501),
+            source_created_at: Some("2026-02-16T09:00:00Z".to_string()),
+            assignees: Vec::new(),
+        };
+        let decision = decide(
+            "issue_comment",
+            Some("created"),
+            Some(&context),
+            Some(&[trigger]),
+        );
+        assert_eq!(decision.decision, DECISION_IGNORED);
+        assert_eq!(decision.reason_code, "no_directive");
+    }
+
+    #[test]
+    fn registered_trigger_actor_denylist_allows_non_matching_actor() {
+        let trigger = DispatchTriggerConfig {
+            id: "custom.actor-filter".to_string(),
+            class: DispatchTriggerClass::Registered,
+            priority: 10,
+            matcher: DispatchTriggerMatcher {
+                event_type: "issue_comment".to_string(),
+                actions: vec!["created".to_string()],
+            },
+            guards: DispatchTriggerGuards {
+                actors_none: vec!["main".to_string()],
+                ..DispatchTriggerGuards::default()
+            },
+            action: DispatchTriggerAction {
+                directive: DispatchTriggerDirectiveSource::Literal("reply".to_string()),
+                target_role: DispatchTriggerRoleSource::Literal("codex-orch".to_string()),
+                principal: DispatchTriggerPrincipalSource::Literal("orchd".to_string()),
+                reason_code: "registered_trigger:custom.actor-filter".to_string(),
+            },
+            apply_guardrails: true,
+        };
+        let context = EventContext {
+            repo_full_name: "main/orchd-debug".to_string(),
+            issue_number: Some(5),
+            source_issue_id: Some(5),
+            source_issue_anchor_at: Some("2026-02-16T09:00:00Z".to_string()),
+            actor_login: Some("codex-audit".to_string()),
+            conversation_role: None,
+            text: Some("please handle this".to_string()),
+            source_comment_id: Some(502),
+            source_created_at: Some("2026-02-16T09:00:00Z".to_string()),
+            assignees: Vec::new(),
+        };
+        let decision = decide(
+            "issue_comment",
+            Some("created"),
+            Some(&context),
+            Some(&[trigger]),
+        );
+        assert_eq!(decision.decision, DECISION_ACCEPTED);
+        assert_eq!(
+            decision.reason_code,
+            "registered_trigger:custom.actor-filter"
+        );
+        assert_eq!(decision.directive.as_deref(), Some("reply"));
     }
 
     #[test]

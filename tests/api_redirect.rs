@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
 use axum::Json;
+use axum::extract::Query;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect};
 use axum::routing::{delete, get, post};
@@ -18,6 +19,11 @@ use url::Url;
 struct CreateIssue {
     title: String,
     body: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListLabelsQuery {
+    page: Option<u32>,
 }
 
 #[tokio::test]
@@ -205,5 +211,68 @@ async fn issue_label_delete_rejects_non_canonical_non_get_redirect() -> Result<(
 
     assert!(err.to_string().contains("unexpected redirect"));
     assert_eq!(redirected_hits.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_labels_paginates_until_empty_page() -> Result<()> {
+    let app = axum::Router::new().route(
+        "/api/v1/repos/main/forgejo-agent/labels",
+        get(|Query(query): Query<ListLabelsQuery>| async move {
+            let labels = match query.page.unwrap_or(1) {
+                1 => json!([
+                    {"id": 10, "name": "type/blocker"},
+                    {"id": 11, "name": "type/bug"},
+                ]),
+                2 => json!([
+                    {"id": 12, "name": "type/feature"},
+                    {"id": 13, "name": "type/epic"},
+                ]),
+                _ => json!([]),
+            };
+            Json(labels).into_response()
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+    let addr = listener.local_addr()?;
+    let base_url = Url::parse(&format!("http://{addr}"))?;
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let server_task = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    let cfg = AgentConfig {
+        base_url,
+        default_repo: RepoRef::new("main", "scratch"),
+        agent_name: "test".to_string(),
+        lease_minutes: 90,
+        token: "test-token".to_string(),
+    };
+
+    let labels = tokio::task::spawn_blocking(move || {
+        let api = ForgejoClient::new(&cfg)?;
+        api.list_labels(&cfg, &RepoRef::new("main", "forgejo-agent"))
+    })
+    .await??;
+
+    shutdown_tx.send(()).ok();
+    server_task.await.ok();
+
+    assert_eq!(labels.len(), 4);
+    let label_names = labels
+        .into_iter()
+        .map(|label| label.name)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        label_names,
+        vec!["type/blocker", "type/bug", "type/feature", "type/epic"]
+    );
     Ok(())
 }

@@ -27,7 +27,10 @@ pub const STATE_LABEL_COLOR: [(&str, &str, &str, bool); 7] = [
     ("state/blocked", "d73a4a", "blocked by dependency", true),
 ];
 
-pub const OTHER_LABELS: [(&str, &str, &str, bool); 4] = [
+pub const OTHER_LABELS: [(&str, &str, &str, bool); 7] = [
+    ("type/bug", "d73a4a", "bug report", false),
+    ("type/feature", "0e8a16", "feature request", false),
+    ("type/epic", "5319e7", "large multi-step effort", false),
     ("type/blocker", "6f42c1", "blocking dependency issue", false),
     ("pri/high", "b60205", "high priority", false),
     ("pri/med", "fbca04", "medium priority", false),
