@@ -131,6 +131,7 @@ pub enum WorkflowState {
     Ready,
     InProgress,
     Review,
+    Done,
     Blocked,
 }
 
@@ -143,6 +144,7 @@ impl WorkflowState {
             Self::Ready => "ready",
             Self::InProgress => "in-progress",
             Self::Review => "review",
+            Self::Done => "done",
             Self::Blocked => "blocked",
         }
     }
@@ -155,6 +157,7 @@ impl WorkflowState {
             Self::Ready => "state/ready",
             Self::InProgress => "state/in-progress",
             Self::Review => "state/review",
+            Self::Done => "state/done",
             Self::Blocked => "state/blocked",
         }
     }
@@ -167,7 +170,45 @@ impl WorkflowState {
             "state/ready" => Some(Self::Ready),
             "state/in-progress" => Some(Self::InProgress),
             "state/review" => Some(Self::Review),
+            "state/done" => Some(Self::Done),
             "state/blocked" => Some(Self::Blocked),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ClosureResolution {
+    Fixed,
+    Wontfix,
+    Dupe,
+}
+
+impl ClosureResolution {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fixed => "fixed",
+            Self::Wontfix => "wontfix",
+            Self::Dupe => "dupe",
+        }
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Fixed => "done/fixed",
+            Self::Wontfix => "done/wontfix",
+            Self::Dupe => "done/dupe",
+        }
+    }
+
+    #[must_use]
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "done/fixed" => Some(Self::Fixed),
+            "done/wontfix" => Some(Self::Wontfix),
+            "done/dupe" => Some(Self::Dupe),
             _ => None,
         }
     }
@@ -259,8 +300,30 @@ impl FromStr for WorkflowState {
             "ready" => Ok(Self::Ready),
             "in-progress" | "in_progress" => Ok(Self::InProgress),
             "review" => Ok(Self::Review),
+            "done" => Ok(Self::Done),
             "blocked" => Ok(Self::Blocked),
             _ => bail!("invalid workflow state: {s}"),
+        }
+    }
+}
+
+impl Display for ClosureResolution {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ClosureResolution {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        let s = s.trim();
+        let s = s.strip_prefix("done/").unwrap_or(s);
+        match s {
+            "fixed" => Ok(Self::Fixed),
+            "wontfix" | "wont_fix" | "wont-fix" => Ok(Self::Wontfix),
+            "dupe" | "duplicate" => Ok(Self::Dupe),
+            _ => bail!("invalid closure resolution: {s}"),
         }
     }
 }
@@ -355,7 +418,7 @@ impl ApiIssue {
 
 #[cfg(test)]
 mod tests {
-    use super::{OrchdRuntimeState, WorkflowState};
+    use super::{ClosureResolution, OrchdRuntimeState, WorkflowState};
     use anyhow::Result;
 
     #[test]
@@ -384,6 +447,19 @@ mod tests {
         assert_eq!(parsed, WorkflowState::InProgress);
         let parsed: WorkflowState = "state/ready".parse()?;
         assert_eq!(parsed, WorkflowState::Ready);
+        let parsed: WorkflowState = "state/done".parse()?;
+        assert_eq!(parsed, WorkflowState::Done);
+        Ok(())
+    }
+
+    #[test]
+    fn closure_resolution_parses_aliases() -> Result<()> {
+        let parsed: ClosureResolution = "done/fixed".parse()?;
+        assert_eq!(parsed, ClosureResolution::Fixed);
+        let parsed: ClosureResolution = "wont-fix".parse()?;
+        assert_eq!(parsed, ClosureResolution::Wontfix);
+        let parsed: ClosureResolution = "duplicate".parse()?;
+        assert_eq!(parsed, ClosureResolution::Dupe);
         Ok(())
     }
 }

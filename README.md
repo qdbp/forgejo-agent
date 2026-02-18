@@ -105,16 +105,22 @@ EOF
 
 # State transitions
 /home/main/.local/bin/forgejoctl issue transition main/backlog#1 --to in-progress
-/home/main/.local/bin/forgejoctl issue transition main/backlog#1 --to review
+/home/main/.local/bin/forgejoctl issue transition main/backlog#1 --to done
+/home/main/.local/bin/forgejoctl issue transition main/backlog#1 --to review  # only when explicit human review is needed
 
 # Workflow states accept either bare names or label names:
 # - `ready` / `state/ready`
 # - `in-progress` / `state/in-progress`
 # - `review` / `state/review`
+# - `done` / `state/done`
 #
 # Policy: new issues start in `triage`. If an issue has no `state/*` label yet (for example,
 # it was created in the Forgejo UI without labels), treat it as triage and transition it before
 # claiming work.
+
+# Close with explicit resolution labels (`done/fixed` default, or `done/wontfix`, `done/dupe`)
+/home/main/.local/bin/forgejoctl issue close main/backlog#1
+/home/main/.local/bin/forgejoctl issue close main/backlog#1 --resolution dupe
 
 # orchd runtime state projection (exclusive orchd/state/* label)
 /home/main/.local/bin/forgejoctl issue orchd-state main/backlog#1 --to running
@@ -158,7 +164,7 @@ Core behavior:
 - directive parse (`@codex-orch design|investigate|impl|reply`; `poke` is an alias for `reply`, and `@codex` aliases to `@codex-orch`)
 - sqlite event/decision/dispatch persistence
 - runtime dispatch status projected to `orchd/state/*` labels (`queued|running|blocked|failed|completed`)
-- successful `impl` completion transitions the issue workflow to `state/review` (dispatch failures do not force `state/blocked`)
+- successful `impl` completion transitions the issue workflow to `state/done` (dispatch failures do not force `state/blocked`)
 - one active dispatch per issue (duplicates blocked while running)
 - issue+role-scoped codex session reuse (`codex exec resume`) from latest `codex_session_id`
 - periodic heartbeat + reconcile scan logs

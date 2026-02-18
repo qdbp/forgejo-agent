@@ -676,7 +676,7 @@ fn work_state_transition_target(
     // Keep work-plane workflow semantics independent from dispatch runtime outcomes.
     // `state/blocked` is reserved for explicit dependency blockers, not generic dispatch failures.
     (directive_uses_worktree(directive) && state_literal == DispatchState::Completed)
-        .then_some("review")
+        .then_some("done")
 }
 
 fn maybe_post_landing_comment(
@@ -1040,7 +1040,7 @@ mod tests {
     fn work_state_transition_only_happens_on_completed_impl() {
         assert_eq!(
             work_state_transition_target(super::DIRECTIVE_IMPL, DispatchState::Completed),
-            Some("review")
+            Some("done")
         );
         assert_eq!(
             work_state_transition_target(super::DIRECTIVE_IMPL, DispatchState::Blocked),

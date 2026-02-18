@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 
 use crate::types::{ApiIssue, OpenState, WorkflowState};
 
-pub const STATE_LABEL_COLOR: [(&str, &str, &str, bool); 6] = [
+pub const STATE_LABEL_COLOR: [(&str, &str, &str, bool); 7] = [
     ("state/triage", "8a8a8a", "needs triage", true),
     ("state/spec", "1d76db", "spec/design in progress", true),
     ("state/ready", "0e8a16", "ready for pickup", true),
@@ -15,7 +15,13 @@ pub const STATE_LABEL_COLOR: [(&str, &str, &str, bool); 6] = [
     (
         "state/review",
         "5319e7",
-        "awaiting review/verification",
+        "explicit human review/verification requested",
+        true,
+    ),
+    (
+        "state/done",
+        "1f883d",
+        "implementation complete; ready to close",
         true,
     ),
     ("state/blocked", "d73a4a", "blocked by dependency", true),
@@ -26,6 +32,13 @@ pub const OTHER_LABELS: [(&str, &str, &str, bool); 4] = [
     ("pri/high", "b60205", "high priority", false),
     ("pri/med", "fbca04", "medium priority", false),
     ("pri/low", "c2e0c6", "low priority", false),
+];
+
+pub const DONE_REASON_LABEL_PREFIX: &str = "done/";
+pub const DONE_REASON_LABELS: [(&str, &str, &str, bool); 3] = [
+    ("done/fixed", "1f883d", "closed as fixed", false),
+    ("done/wontfix", "d93f0b", "closed as wontfix", false),
+    ("done/dupe", "5319e7", "closed as duplicate", false),
 ];
 
 pub const ORCHD_STATE_LABELS: [(&str, &str, &str, bool); 5] = [
@@ -85,6 +98,11 @@ pub fn is_orchd_reason_label(name: &str) -> bool {
 }
 
 #[must_use]
+pub fn is_done_resolution_label(name: &str) -> bool {
+    name.starts_with(DONE_REASON_LABEL_PREFIX)
+}
+
+#[must_use]
 pub fn orchd_failure_label(reason_code: &str) -> Option<String> {
     let normalized = normalize_reason_code_label_segment(reason_code);
     if normalized.is_empty() {
@@ -128,13 +146,22 @@ pub const fn can_transition(from: Option<WorkflowState>, to: WorkflowState) -> b
     use WorkflowState as S;
     match from {
         None => matches!(to, S::Triage | S::Spec | S::Ready),
-        Some(S::Triage) => matches!(to, S::Spec | S::Ready | S::Blocked),
-        Some(S::Spec) => matches!(to, S::Triage | S::Ready | S::Blocked),
-        Some(S::Ready) => matches!(to, S::InProgress | S::Blocked | S::Triage),
-        Some(S::InProgress) => matches!(to, S::Review | S::Blocked | S::Ready),
-        Some(S::Review) => matches!(to, S::InProgress | S::Blocked | S::Ready),
-        Some(S::Blocked) => matches!(to, S::Triage | S::Spec | S::Ready),
+        Some(S::Triage) => matches!(to, S::Spec | S::Ready | S::Done | S::Blocked),
+        Some(S::Spec) => matches!(to, S::Triage | S::Ready | S::Done | S::Blocked),
+        Some(S::Ready) => matches!(to, S::InProgress | S::Triage | S::Done | S::Blocked),
+        Some(S::InProgress) => matches!(to, S::Review | S::Ready | S::Done | S::Blocked),
+        Some(S::Review) => matches!(to, S::InProgress | S::Ready | S::Done | S::Blocked),
+        Some(S::Done) => matches!(
+            to,
+            S::Triage | S::Spec | S::Ready | S::InProgress | S::Blocked
+        ),
+        Some(S::Blocked) => matches!(to, S::Triage | S::Spec | S::Ready | S::Done),
     }
+}
+
+#[must_use]
+pub const fn is_closable_workflow_state(state: WorkflowState) -> bool {
+    matches!(state, WorkflowState::Done | WorkflowState::Review)
 }
 
 pub fn assert_transition(
@@ -195,17 +222,20 @@ pub fn assert_closable(issue: &ApiIssue, force: bool) -> Result<()> {
     if force {
         return Ok(());
     }
-    if state != Some(WorkflowState::Review) {
-        match state {
-            Some(other) => bail!(
-                "refusing to close issue #{} from state {}; expected review (use --force)",
+    match state {
+        Some(current) if is_closable_workflow_state(current) => {}
+        Some(other) => {
+            bail!(
+                "refusing to close issue #{} from state {}; expected done (legacy review accepted) (use --force)",
                 issue.number,
                 other
-            ),
-            None => bail!(
+            );
+        }
+        None => {
+            bail!(
                 "refusing to close issue #{} without workflow state label (use --force)",
                 issue.number
-            ),
+            );
         }
     }
     Ok(())
@@ -214,7 +244,30 @@ pub fn assert_closable(issue: &ApiIssue, force: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ApiLabel;
     use pretty_assertions::assert_eq;
+
+    fn issue_with_workflow(workflow: Option<WorkflowState>) -> ApiIssue {
+        let labels = workflow
+            .map(|state| {
+                vec![ApiLabel {
+                    id: 1,
+                    name: state.label().to_string(),
+                }]
+            })
+            .unwrap_or_default();
+        ApiIssue {
+            number: 7,
+            state: OpenState::Open,
+            title: "closable".to_string(),
+            body: None,
+            html_url: "http://localhost/issue/7".to_string(),
+            labels,
+            assignees: Vec::new(),
+            pull_request: None,
+            repository: None,
+        }
+    }
 
     #[test]
     fn transition_matrix_smoke() {
@@ -231,8 +284,28 @@ mod tests {
             WorkflowState::Review
         ));
         assert!(can_transition(
+            Some(WorkflowState::InProgress),
+            WorkflowState::Done
+        ));
+        assert!(can_transition(
             Some(WorkflowState::Review),
             WorkflowState::Ready
+        ));
+        assert!(can_transition(
+            Some(WorkflowState::Review),
+            WorkflowState::Done
+        ));
+        assert!(can_transition(
+            Some(WorkflowState::Triage),
+            WorkflowState::Done
+        ));
+        assert!(can_transition(
+            Some(WorkflowState::Done),
+            WorkflowState::InProgress
+        ));
+        assert!(!can_transition(
+            Some(WorkflowState::Done),
+            WorkflowState::Review
         ));
         assert!(!can_transition(
             Some(WorkflowState::Blocked),
@@ -240,6 +313,13 @@ mod tests {
         ));
         assert_eq!(can_transition(None, WorkflowState::Triage), true);
         assert_eq!(can_transition(None, WorkflowState::Blocked), false);
+    }
+
+    #[test]
+    fn assert_closable_accepts_done_and_legacy_review() {
+        assert!(assert_closable(&issue_with_workflow(Some(WorkflowState::Done)), false).is_ok());
+        assert!(assert_closable(&issue_with_workflow(Some(WorkflowState::Review)), false).is_ok());
+        assert!(assert_closable(&issue_with_workflow(Some(WorkflowState::Ready)), false).is_err());
     }
 
     #[test]

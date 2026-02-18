@@ -1558,11 +1558,11 @@ fn live_issue_claim_release_and_transition_round_trip() -> Result<()> {
     )?;
     ensure_contains(&to_in_progress, "transitioned:", "transition output")?;
 
-    let to_review = harness.run_plain_timed(
-        "issue.transition_review",
-        &["issue", "transition", &issue_ref, "--to", "review"],
+    let to_done = harness.run_plain_timed(
+        "issue.transition_done",
+        &["issue", "transition", &issue_ref, "--to", "done"],
     )?;
-    ensure_contains(&to_review, "transitioned:", "transition output")?;
+    ensure_contains(&to_done, "transitioned:", "transition output")?;
 
     let close_output = harness.run_plain_timed("issue.close", &["issue", "close", &issue_ref])?;
     ensure_contains(&close_output, "closed:", "close output")?;
@@ -1571,6 +1571,12 @@ fn live_issue_claim_release_and_transition_round_trip() -> Result<()> {
     let closed_state = json_str_field(&closed_issue, "state")?;
     if closed_state != "closed" {
         bail!("expected closed issue state, got {closed_state}");
+    }
+    if !issue_has_label(&closed_issue, "state/done")? {
+        bail!("expected state/done on closed issue");
+    }
+    if !issue_has_label(&closed_issue, "done/fixed")? {
+        bail!("expected default close resolution label done/fixed");
     }
 
     let reopen_output = harness.run_plain_timed(
@@ -1586,6 +1592,9 @@ fn live_issue_claim_release_and_transition_round_trip() -> Result<()> {
     }
     if !issue_has_label(&reopened, "state/triage")? {
         bail!("expected state/triage after reopen");
+    }
+    if issue_has_label(&reopened, "done/fixed")? {
+        bail!("expected reopen to clear done/* close-resolution labels");
     }
 
     Ok(())
@@ -2356,8 +2365,8 @@ fn live_orchd_impl_pr_landing_updates_remote_main() -> Result<()> {
     }
 
     let final_issue = harness.get_issue(issue_number)?;
-    if !issue_has_label(&final_issue, "state/review")? {
-        bail!("expected impl success to transition issue to state/review");
+    if !issue_has_label(&final_issue, "state/done")? {
+        bail!("expected impl success to transition issue to state/done");
     }
     if issue_label_prefix_count(&final_issue, "orchd/state/")? != 1 {
         bail!("expected exactly one orchd/state/* label after impl completion");
@@ -2601,8 +2610,8 @@ fn live_orchd_impl_pr_landing_rebases_and_force_leases_branch() -> Result<()> {
     }
 
     let final_issue = harness.get_issue(issue_number)?;
-    if !issue_has_label(&final_issue, "state/review")? {
-        bail!("expected impl success to transition issue to state/review");
+    if !issue_has_label(&final_issue, "state/done")? {
+        bail!("expected impl success to transition issue to state/done");
     }
     if issue_label_prefix_count(&final_issue, "orchd/state/")? != 1 {
         bail!("expected exactly one orchd/state/* label after impl completion");
@@ -2707,8 +2716,8 @@ fn live_orchd_impl_dirty_principal_blocks_push() -> Result<()> {
         "orchd/state/completed",
         Duration::from_secs(60),
     )?;
-    if !issue_has_label(&final_issue, "state/review")? {
-        bail!("expected dirty principal to not block remote merge; wanted state/review");
+    if !issue_has_label(&final_issue, "state/done")? {
+        bail!("expected dirty principal to not block remote merge; wanted state/done");
     }
 
     let status_reason =
@@ -2857,8 +2866,8 @@ fn live_orchd_impl_principal_ahead_is_autohealed() -> Result<()> {
         "orchd/state/completed",
         Duration::from_secs(60),
     )?;
-    if !issue_has_label(&final_issue, "state/review")? {
-        bail!("expected principal-ahead autoheal flow to transition issue to state/review");
+    if !issue_has_label(&final_issue, "state/done")? {
+        bail!("expected principal-ahead autoheal flow to transition issue to state/done");
     }
 
     let status_reason =

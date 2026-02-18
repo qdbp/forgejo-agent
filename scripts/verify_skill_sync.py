@@ -34,6 +34,7 @@ WORKFLOW_STATES = (
     "ready",
     "in-progress",
     "review",
+    "done",
     "blocked",
 )
 

@@ -15,11 +15,13 @@ use forgejo_agent::api::ForgejoClient;
 use forgejo_agent::config::AgentConfig;
 use forgejo_agent::policy;
 use forgejo_agent::policy::{
-    ORCHD_CONTROL_LABELS, ORCHD_STATE_LABELS, OTHER_LABELS, STATE_LABEL_COLOR,
-    is_orchd_failure_label, is_orchd_reason_label, orchd_failure_label, orchd_reason_label,
+    DONE_REASON_LABELS, ORCHD_CONTROL_LABELS, ORCHD_STATE_LABELS, OTHER_LABELS, STATE_LABEL_COLOR,
+    is_done_resolution_label, is_orchd_failure_label, is_orchd_reason_label, orchd_failure_label,
+    orchd_reason_label,
 };
 use forgejo_agent::types::{
-    ApiIssue, IssueRef, ListState, OpenState, OrchdRuntimeState, RepoRef, WorkflowState,
+    ApiIssue, ClosureResolution, IssueRef, ListState, OpenState, OrchdRuntimeState, RepoRef,
+    WorkflowState,
 };
 
 #[derive(Parser, Debug)]
@@ -206,6 +208,8 @@ struct IssueBlockerArgs {
 #[derive(Args, Debug)]
 struct IssueCloseArgs {
     issue: IssueRef,
+    #[arg(long, default_value = "fixed")]
+    resolution: ClosureResolution,
     #[arg(long)]
     force: bool,
 }
@@ -307,6 +311,9 @@ fn ensure_policy_labels(api: &ForgejoClient, cfg: &AgentConfig, repo: &RepoRef) 
     for (name, color, description, exclusive) in OTHER_LABELS {
         api.ensure_label(cfg, repo, name, color, description, exclusive)?;
     }
+    for (name, color, description, exclusive) in DONE_REASON_LABELS {
+        api.ensure_label(cfg, repo, name, color, description, exclusive)?;
+    }
     for (name, color, description, exclusive) in ORCHD_STATE_LABELS {
         api.ensure_label(cfg, repo, name, color, description, exclusive)?;
     }
@@ -368,6 +375,53 @@ fn ensure_issue_state(
 
     if !has_target {
         api.add_issue_label_ids(cfg, issue_ref, vec![target_id])?;
+    }
+    Ok(())
+}
+
+fn ensure_issue_close_resolution(
+    api: &ForgejoClient,
+    cfg: &AgentConfig,
+    issue_ref: &IssueRef,
+    resolution: ClosureResolution,
+) -> Result<()> {
+    let issue = api.get_issue(cfg, issue_ref)?;
+    let labels = api.list_labels(cfg, &issue_ref.repo)?;
+    let target_name = resolution.label();
+    let target_id = labels
+        .iter()
+        .find(|label| label.name == target_name)
+        .map(|label| label.id)
+        .ok_or_else(|| anyhow!("missing required close-resolution label: {target_name}"))?;
+
+    let mut has_target = false;
+    for label in issue.labels {
+        if is_done_resolution_label(&label.name) {
+            if label.name == target_name {
+                has_target = true;
+            } else {
+                api.remove_issue_label(cfg, issue_ref, label.id)?;
+            }
+        }
+    }
+
+    if !has_target {
+        api.add_issue_label_ids(cfg, issue_ref, vec![target_id])?;
+    }
+
+    Ok(())
+}
+
+fn clear_issue_close_resolution_labels(
+    api: &ForgejoClient,
+    cfg: &AgentConfig,
+    issue_ref: &IssueRef,
+) -> Result<()> {
+    let issue = api.get_issue(cfg, issue_ref)?;
+    for label in issue.labels {
+        if is_done_resolution_label(&label.name) {
+            api.remove_issue_label(cfg, issue_ref, label.id)?;
+        }
     }
     Ok(())
 }
@@ -948,7 +1002,15 @@ fn cmd_issue_blocker(api: &ForgejoClient, cfg: &AgentConfig, args: IssueBlockerA
 
 fn cmd_issue_close(api: &ForgejoClient, cfg: &AgentConfig, args: IssueCloseArgs) -> Result<()> {
     let issue = api.get_issue(cfg, &args.issue)?;
+    let workflow = issue.workflow_state()?;
     policy::assert_closable(&issue, args.force)?;
+
+    ensure_policy_labels(api, cfg, &args.issue.repo)?;
+    if workflow != Some(WorkflowState::Done) {
+        ensure_issue_state(api, cfg, &args.issue, WorkflowState::Done)?;
+    }
+    ensure_issue_close_resolution(api, cfg, &args.issue, args.resolution)?;
+
     api.set_issue_open_state(cfg, &args.issue, OpenState::Closed)?;
     println!("closed: {}", args.issue);
     Ok(())
@@ -956,6 +1018,7 @@ fn cmd_issue_close(api: &ForgejoClient, cfg: &AgentConfig, args: IssueCloseArgs)
 
 fn cmd_issue_reopen(api: &ForgejoClient, cfg: &AgentConfig, args: IssueReopenArgs) -> Result<()> {
     api.set_issue_open_state(cfg, &args.issue, OpenState::Open)?;
+    clear_issue_close_resolution_labels(api, cfg, &args.issue)?;
     ensure_issue_state(api, cfg, &args.issue, args.workflow)?;
     println!("reopened: {} -> {}", args.issue, args.workflow);
     Ok(())
@@ -1069,12 +1132,15 @@ fn cmd_worker_run(api: &ForgejoClient, cfg: &AgentConfig, args: WorkerRunArgs) -
             )?;
             if args.close_on_success {
                 let issue_now = api.get_issue(cfg, &issue_ref)?;
-                let force = issue_now.workflow_state()? != Some(WorkflowState::Review);
+                let force = !issue_now
+                    .workflow_state()?
+                    .is_some_and(policy::is_closable_workflow_state);
                 cmd_issue_close(
                     api,
                     cfg,
                     IssueCloseArgs {
                         issue: issue_ref.clone(),
+                        resolution: ClosureResolution::Fixed,
                         force,
                     },
                 )?;
