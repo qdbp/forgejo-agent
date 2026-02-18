@@ -12,7 +12,11 @@ need_cmd jq
 FORGEJOCTL_BIN="${FORGEJOCTL_BIN:-$HOME/.local/bin/forgejoctl}"
 ORCHD_BIN="${ORCHD_BIN:-$HOME/.local/bin/orchd}"
 ORCHD_TOKEN_FILE="${ORCHD_TOKEN_FILE:-$HOME/.config/forgejo-agent/creds/orchd.token}"
-DISPATCH_CONFIG_DEFAULT="${SWARM_HOME:-$HOME/swarm}/config/orchd-dispatch.toml"
+# The canonical orchd dispatch config is in ~/swarm. Avoid defaulting to
+# $SWARM_HOME here: in orchd-dispatched runs $SWARM_HOME points at a sidecar
+# worktree, which would silently update the wrong file (and leave the service
+# still reading the stale principal config).
+DISPATCH_CONFIG_DEFAULT="$HOME/swarm/config/orchd-dispatch.toml"
 AGENTS_SNIPPET_TEMPLATE="$SCRIPT_DIR/../templates/repo-agents-assimilation-snippet.md"
 
 usage() {
