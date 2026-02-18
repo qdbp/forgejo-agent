@@ -112,6 +112,60 @@ fn git_append_and_commit() -> Result<()> {
     Ok(())
 }
 
+fn git_append_and_commit_in(repo_root: &PathBuf, file: &str, message: &str) -> Result<()> {
+    optional_sleep()?;
+
+    let stamp = now_unix_millis()?;
+    let line = format!("fake-codex stamp={stamp}\n");
+    let full_path = repo_root.join(file);
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&full_path)
+        .with_context(|| format!("failed opening {} for append", full_path.display()))?
+        .write_all(line.as_bytes())
+        .with_context(|| format!("failed appending to {}", full_path.display()))?;
+
+    let add_status = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["add", "--"])
+        .arg(file)
+        .status()
+        .context("failed spawning git add (sidecar)")?;
+    if !add_status.success() {
+        anyhow::bail!("git add failed (status={add_status})");
+    }
+
+    let commit_status = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args([
+            "-c",
+            "user.name=fake-codex",
+            "-c",
+            "user.email=fake-codex@localhost",
+            "commit",
+            "-m",
+            message,
+        ])
+        .status()
+        .context("failed spawning git commit (sidecar)")?;
+    if !commit_status.success() {
+        anyhow::bail!("git commit failed (status={commit_status})");
+    }
+
+    Ok(())
+}
+
+fn sidecar_root() -> Result<PathBuf> {
+    let value = env::var("SWARM_HOME").context("missing SWARM_HOME for sidecar mode")?;
+    if value.trim().is_empty() {
+        anyhow::bail!("SWARM_HOME must be non-empty for sidecar mode");
+    }
+    Ok(PathBuf::from(value))
+}
+
 fn run() -> Result<i32> {
     let args: Vec<String> = env::args().collect();
     let output_path = parse_output_path(&args);
@@ -137,6 +191,64 @@ fn run() -> Result<i32> {
                 fs::write(
                     path,
                     "Status: fake-codex committed changes.\nNext action: orchd should land them.\n",
+                )
+                .context("failed writing fake codex output file")?;
+            }
+            Ok(0)
+        }
+        "dual_commit" => {
+            git_append_and_commit()?;
+
+            let sidecar = sidecar_root()?;
+            git_append_and_commit_in(
+                &sidecar,
+                "fake-codex-sidecar.txt",
+                &format!(
+                    "fake-codex: sidecar commit {}",
+                    now_unix_millis().unwrap_or_default()
+                ),
+            )?;
+
+            if let Some(path) = output_path {
+                fs::write(
+                    path,
+                    "Status: fake-codex committed changes (primary + sidecar).\nNext action: orchd should land them.\n",
+                )
+                .context("failed writing fake codex output file")?;
+            }
+            Ok(0)
+        }
+        "sidecar_dirty" => {
+            git_append_and_commit()?;
+
+            let sidecar = sidecar_root()?;
+            let dirty_rel = "fake-codex-sidecar-dirty.txt";
+            let dirty_file = sidecar.join(dirty_rel);
+            fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&dirty_file)
+                .with_context(|| format!("failed opening {} for append", dirty_file.display()))?
+                .write_all(b"fake-codex dirty\n")
+                .with_context(|| format!("failed appending to {}", dirty_file.display()))?;
+
+            // `orchd` checks `git status --porcelain --untracked-files=no`, so stage the file to
+            // ensure it registers as dirty even though it started untracked.
+            let add_status = Command::new("git")
+                .arg("-C")
+                .arg(&sidecar)
+                .args(["add", "--"])
+                .arg(dirty_rel)
+                .status()
+                .context("failed spawning git add (sidecar dirty)")?;
+            if !add_status.success() {
+                anyhow::bail!("git add failed (status={add_status})");
+            }
+
+            if let Some(path) = output_path {
+                fs::write(
+                    path,
+                    "Status: fake-codex committed changes (primary) and left sidecar dirty.\nNext action: orchd should block landing.\n",
                 )
                 .context("failed writing fake codex output file")?;
             }

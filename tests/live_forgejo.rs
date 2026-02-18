@@ -830,6 +830,36 @@ fn orchd_latest_dispatch_status_reason(
     })
 }
 
+fn orchd_latest_dispatch_run_dir(
+    db_path: &Path,
+    repo_full_name: &str,
+    issue_number: u64,
+) -> Result<Option<PathBuf>> {
+    let conn = Connection::open(db_path)
+        .with_context(|| format!("failed opening orchd db: {}", db_path.display()))?;
+    let issue_number = i64::try_from(issue_number)
+        .with_context(|| format!("issue_number overflowed i64: {issue_number}"))?;
+    conn.query_row(
+        "SELECT run_dir \
+         FROM dispatches \
+         WHERE repo_full_name = ?1 AND issue_number = ?2 \
+         ORDER BY id DESC LIMIT 1",
+        params![repo_full_name, issue_number],
+        |row| {
+            let value: Option<String> = row.get(0)?;
+            Ok(value.map(PathBuf::from))
+        },
+    )
+    .optional()
+    .map(Option::flatten)
+    .with_context(|| {
+        format!(
+            "failed selecting latest dispatch run_dir from {}",
+            db_path.display()
+        )
+    })
+}
+
 fn orchd_issue_dispatch_statuses(
     db_path: &Path,
     repo_full_name: &str,
@@ -1012,6 +1042,8 @@ struct OrchdDispatchTomlInputs<'a> {
     forgejo_login: &'a str,
     repo_ref: &'a str,
     principal_workdir: &'a Path,
+    sidecar_repo_ref: Option<&'a str>,
+    sidecar_principal_workdir: Option<&'a Path>,
     codex_bin: &'a Path,
     token_file: &'a Path,
     forgejoctl: &'a Path,
@@ -1049,22 +1081,45 @@ fn ensure_test_prompt_bundle(config_path: &Path, actor: &str) -> Result<PathBuf>
         "orders/orchd-reply.md",
         "orders/orchd-investigate.md",
     ];
-    for file in prompt_files {
-        let src = source_prompts_dir.join(file);
-        let dst = bundle_dir.join(file);
-        if let Some(parent) = dst.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed creating {}", parent.display()))?;
+    if source_prompts_dir.exists() {
+        for file in prompt_files {
+            let src = source_prompts_dir.join(file);
+            let dst = bundle_dir.join(file);
+            if let Some(parent) = dst.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("failed creating {}", parent.display()))?;
+            }
+            fs::copy(&src, &dst).with_context(|| {
+                format!("failed copying {} -> {}", src.display(), dst.display())
+            })?;
         }
-        fs::copy(&src, &dst)
-            .with_context(|| format!("failed copying {} -> {}", src.display(), dst.display()))?;
-    }
 
-    for role in ["main", "codex-orch"] {
-        let src = source_prompts_dir.join("roles").join(format!("{role}.md"));
-        let dst = roles_dir.join(format!("{role}.md"));
-        fs::copy(&src, &dst)
-            .with_context(|| format!("failed copying {} -> {}", src.display(), dst.display()))?;
+        for role in ["main", "codex-orch"] {
+            let src = source_prompts_dir.join("roles").join(format!("{role}.md"));
+            let dst = roles_dir.join(format!("{role}.md"));
+            fs::copy(&src, &dst).with_context(|| {
+                format!("failed copying {} -> {}", src.display(), dst.display())
+            })?;
+        }
+    } else {
+        // Keep live tests self-contained: if the repo doesn't ship prompt templates (e.g. they
+        // live in a sidecar repo), generate a minimal bundle that still exercises dispatch and
+        // landing logic.
+        for file in prompt_files {
+            let dst = bundle_dir.join(file);
+            if let Some(parent) = dst.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("failed creating {}", parent.display()))?;
+            }
+            fs::write(&dst, format!("itest prompt: {file}\n"))
+                .with_context(|| format!("failed writing {}", dst.display()))?;
+        }
+        let main_role_path = roles_dir.join("main.md");
+        fs::write(&main_role_path, "# main role card\n\n- OF-10\n")
+            .with_context(|| format!("failed writing {}", main_role_path.display()))?;
+        let orch_role_path = roles_dir.join("codex-orch.md");
+        fs::write(&orch_role_path, "# codex-orch role card\n\n- OF-8\n")
+            .with_context(|| format!("failed writing {}", orch_role_path.display()))?;
     }
 
     let actor_role_path = roles_dir.join(format!("{actor}.md"));
@@ -1148,7 +1203,22 @@ fn write_orchd_dispatch_toml(path: &Path, inputs: OrchdDispatchTomlInputs<'_>) -
     )?;
     writeln!(&mut out, "git_remote = \"origin\"")?;
     writeln!(&mut out, "git_base = \"main\"")?;
+    if let Some(sidecar_repo_ref) = inputs.sidecar_repo_ref {
+        writeln!(&mut out, "sidecar_repo = \"{sidecar_repo_ref}\"")?;
+    }
     writeln!(&mut out)?;
+
+    if let Some(sidecar_repo_ref) = inputs.sidecar_repo_ref {
+        let sidecar_principal = inputs
+            .sidecar_principal_workdir
+            .ok_or_else(|| anyhow!("sidecar_principal_workdir missing for {sidecar_repo_ref}"))?;
+        writeln!(&mut out, "[[repo_bindings]]")?;
+        writeln!(&mut out, "repo = \"{sidecar_repo_ref}\"")?;
+        writeln!(&mut out, "local_path = \"{}\"", sidecar_principal.display())?;
+        writeln!(&mut out, "git_remote = \"origin\"")?;
+        writeln!(&mut out, "git_base = \"main\"")?;
+        writeln!(&mut out)?;
+    }
 
     for directive in inputs.directives {
         let prompt = prompts_dir.join(directive.prompt_file());
@@ -1638,6 +1708,8 @@ fn live_orchd_local_backend_smoke() -> Result<()> {
             forgejo_login: harness.fixture.owner.as_str(),
             repo_ref: harness.repo_ref.as_str(),
             principal_workdir: &harness.principal_workdir,
+            sidecar_repo_ref: None,
+            sidecar_principal_workdir: None,
             codex_bin: &fake_codex,
             token_file: &harness.token_path,
             forgejoctl: &forgejoctl,
@@ -1709,6 +1781,8 @@ fn live_orchd_reply_autodispatches_to_assignee() -> Result<()> {
             forgejo_login: harness.fixture.owner.as_str(),
             repo_ref: harness.repo_ref.as_str(),
             principal_workdir: &harness.principal_workdir,
+            sidecar_repo_ref: None,
+            sidecar_principal_workdir: None,
             codex_bin: &fake_codex,
             token_file: &harness.token_path,
             forgejoctl: &forgejoctl,
@@ -1861,6 +1935,8 @@ fn live_orchd_prompt_template_failure_marks_failed_start() -> Result<()> {
             forgejo_login: harness.fixture.owner.as_str(),
             repo_ref: harness.repo_ref.as_str(),
             principal_workdir: &harness.principal_workdir,
+            sidecar_repo_ref: None,
+            sidecar_principal_workdir: None,
             codex_bin: &fake_codex,
             token_file: &harness.token_path,
             forgejoctl: &forgejoctl,
@@ -2023,6 +2099,8 @@ fn live_orchd_impl_pr_landing_updates_remote_main() -> Result<()> {
             forgejo_login: harness.fixture.owner.as_str(),
             repo_ref: harness.repo_ref.as_str(),
             principal_workdir: &harness.principal_workdir,
+            sidecar_repo_ref: None,
+            sidecar_principal_workdir: None,
             codex_bin: &fake_codex,
             token_file: &harness.token_path,
             forgejoctl: &forgejoctl,
@@ -2171,6 +2249,8 @@ fn live_orchd_impl_pr_landing_rebases_and_force_leases_branch() -> Result<()> {
             forgejo_login: harness.fixture.owner.as_str(),
             repo_ref: harness.repo_ref.as_str(),
             principal_workdir: &harness.principal_workdir,
+            sidecar_repo_ref: None,
+            sidecar_principal_workdir: None,
             codex_bin: &fake_codex,
             token_file: &harness.token_path,
             forgejoctl: &forgejoctl,
@@ -2392,6 +2472,8 @@ fn live_orchd_impl_dirty_principal_blocks_push() -> Result<()> {
             forgejo_login: harness.fixture.owner.as_str(),
             repo_ref: harness.repo_ref.as_str(),
             principal_workdir: &harness.principal_workdir,
+            sidecar_repo_ref: None,
+            sidecar_principal_workdir: None,
             codex_bin: &fake_codex,
             token_file: &harness.token_path,
             forgejoctl: &forgejoctl,
@@ -2540,6 +2622,8 @@ fn live_orchd_impl_principal_ahead_is_autohealed() -> Result<()> {
             forgejo_login: harness.fixture.owner.as_str(),
             repo_ref: harness.repo_ref.as_str(),
             principal_workdir: &harness.principal_workdir,
+            sidecar_repo_ref: None,
+            sidecar_principal_workdir: None,
             codex_bin: &fake_codex,
             token_file: &harness.token_path,
             forgejoctl: &forgejoctl,
@@ -2663,6 +2747,8 @@ fn live_orchd_impl_allows_parallel_dispatches_per_repo() -> Result<()> {
             forgejo_login: harness.fixture.owner.as_str(),
             repo_ref: harness.repo_ref.as_str(),
             principal_workdir: &harness.principal_workdir,
+            sidecar_repo_ref: None,
+            sidecar_principal_workdir: None,
             codex_bin: &fake_codex,
             token_file: &harness.token_path,
             forgejoctl: &forgejoctl,
@@ -2763,6 +2849,251 @@ fn live_orchd_impl_allows_parallel_dispatches_per_repo() -> Result<()> {
         bail!(
             "principal workspace diverged from remote main count (principal_count={principal_count} remote_count={after_count})"
         );
+    }
+
+    Ok(())
+}
+
+#[test]
+#[serial(live_forgejo)]
+fn live_orchd_impl_sidecar_lands_both_repos_in_order() -> Result<()> {
+    if !live_tests_enabled() {
+        eprintln!(
+            "skipping live orchd integration test; enable with {}=1",
+            LIVE_TESTS_ENV
+        );
+        return Ok(());
+    }
+
+    let harness = LiveHarness::bootstrap("live_orchd_impl_sidecar_lands_both_repos_in_order")?;
+
+    let sidecar_name = format!("itest-sidecar-{}", unique_suffix()?);
+    let sidecar_ref = format!("{}/{}", harness.fixture.owner, sidecar_name);
+    let _ = harness.run_plain_timed("repo.ensure.sidecar", &["repo", "ensure", &sidecar_ref])?;
+    let sidecar_principal = harness.fixture.create_principal_checkout(&sidecar_name)?;
+
+    let primary_git = GitWorkspace::from_fixture(&harness.fixture, &harness.repo_name)?;
+    let sidecar_git = GitWorkspace::from_fixture(&harness.fixture, &sidecar_name)?;
+    let primary_before = primary_git.bare_head_main()?;
+    let sidecar_before = sidecar_git.bare_head_main()?;
+
+    let issue_number = harness.create_issue("orchd sidecar", "issue body", "ready")?;
+
+    let dispatch_cfg_path = harness
+        .fixture
+        .work_path
+        .join("orchd-dispatch-sidecar.toml");
+    let db_path = harness.fixture.work_path.join("orchd-sidecar.sqlite");
+    let orchd_stdout = harness.fixture.work_path.join("orchd-sidecar-stdout.log");
+    let orchd_stderr = harness.fixture.work_path.join("orchd-sidecar-stderr.log");
+
+    let fake_codex = ensure_fake_codex_bin()?;
+    let forgejoctl = forgejo_agent_bin()?;
+
+    write_orchd_dispatch_toml(
+        &dispatch_cfg_path,
+        OrchdDispatchTomlInputs {
+            actor: harness.fixture.owner.as_str(),
+            forgejo_login: harness.fixture.owner.as_str(),
+            repo_ref: harness.repo_ref.as_str(),
+            principal_workdir: &harness.principal_workdir,
+            sidecar_repo_ref: Some(&sidecar_ref),
+            sidecar_principal_workdir: Some(&sidecar_principal),
+            codex_bin: &fake_codex,
+            token_file: &harness.token_path,
+            forgejoctl: &forgejoctl,
+            directives: &[OrchdTestDirective::Impl],
+            timeout_sec: 60,
+        },
+    )?;
+
+    let port = pick_unused_port().ok_or_else(|| anyhow!("failed to pick unused port"))?;
+    let orchd = OrchdTestProcess::spawn(OrchdSpawnInputs {
+        listen_port: port,
+        db_path: &db_path,
+        repo_ref: &harness.repo_ref,
+        dispatch_cfg_path: &dispatch_cfg_path,
+        config_path: &harness.config_path,
+        token_path: &harness.token_path,
+        stdout_path: &orchd_stdout,
+        stderr_path: &orchd_stderr,
+        env: &[("FAKE_CODEX_MODE", "dual_commit")],
+    })?;
+
+    post_orchd_issue_comment_webhook(
+        &orchd.client,
+        &orchd.base_url,
+        &harness.repo_ref,
+        issue_number,
+        harness.fixture.owner.as_str(),
+        "@codex-orch impl",
+    )?;
+
+    let _ = wait_for_issue_label(
+        &harness,
+        issue_number,
+        "orchd/state/completed",
+        Duration::from_secs(120),
+    )?;
+
+    let primary_after = primary_git.bare_head_main()?;
+    let sidecar_after = sidecar_git.bare_head_main()?;
+    if primary_after == primary_before {
+        bail!("expected primary repo main to advance after sidecar impl landing");
+    }
+    if sidecar_after == sidecar_before {
+        bail!("expected sidecar repo main to advance after sidecar impl landing");
+    }
+
+    let primary_file = harness.principal_workdir.join("fake-codex.txt");
+    let primary_contents = fs::read_to_string(&primary_file)
+        .with_context(|| format!("missing primary file {}", primary_file.display()))?;
+    ensure_contains(
+        &primary_contents,
+        "fake-codex stamp=",
+        "primary fake codex file",
+    )?;
+
+    let sidecar_file = sidecar_principal.join("fake-codex-sidecar.txt");
+    let sidecar_contents = fs::read_to_string(&sidecar_file)
+        .with_context(|| format!("missing sidecar file {}", sidecar_file.display()))?;
+    ensure_contains(
+        &sidecar_contents,
+        "fake-codex stamp=",
+        "sidecar fake codex file",
+    )?;
+
+    let Some(run_dir) = orchd_latest_dispatch_run_dir(&db_path, &harness.repo_ref, issue_number)?
+    else {
+        bail!("expected dispatch run_dir to be recorded for completed dispatch");
+    };
+    let completion = fs::read_to_string(run_dir.join("completion.md"))
+        .context("failed reading completion.md for sidecar dispatch")?;
+
+    let sidecar_marker = format!("Landing ({sidecar_ref}):");
+    let primary_marker = format!("Landing ({}):", harness.repo_ref);
+    let sidecar_idx = completion
+        .find(&sidecar_marker)
+        .ok_or_else(|| anyhow!("completion missing sidecar landing marker"))?;
+    let primary_idx = completion
+        .find(&primary_marker)
+        .ok_or_else(|| anyhow!("completion missing primary landing marker"))?;
+    if sidecar_idx >= primary_idx {
+        bail!("expected sidecar landing section to appear before primary landing section");
+    }
+
+    Ok(())
+}
+
+#[test]
+#[serial(live_forgejo)]
+fn live_orchd_impl_sidecar_dirty_blocks_primary_landing() -> Result<()> {
+    if !live_tests_enabled() {
+        eprintln!(
+            "skipping live orchd integration test; enable with {}=1",
+            LIVE_TESTS_ENV
+        );
+        return Ok(());
+    }
+
+    let harness = LiveHarness::bootstrap("live_orchd_impl_sidecar_dirty_blocks_primary_landing")?;
+
+    let sidecar_name = format!("itest-sidecar-{}", unique_suffix()?);
+    let sidecar_ref = format!("{}/{}", harness.fixture.owner, sidecar_name);
+    let _ = harness.run_plain_timed("repo.ensure.sidecar", &["repo", "ensure", &sidecar_ref])?;
+    let sidecar_principal = harness.fixture.create_principal_checkout(&sidecar_name)?;
+
+    let primary_git = GitWorkspace::from_fixture(&harness.fixture, &harness.repo_name)?;
+    let sidecar_git = GitWorkspace::from_fixture(&harness.fixture, &sidecar_name)?;
+    let primary_before = primary_git.bare_head_main()?;
+    let sidecar_before = sidecar_git.bare_head_main()?;
+
+    let issue_number = harness.create_issue("orchd sidecar dirty", "issue body", "ready")?;
+
+    let dispatch_cfg_path = harness
+        .fixture
+        .work_path
+        .join("orchd-dispatch-sidecar-dirty.toml");
+    let db_path = harness.fixture.work_path.join("orchd-sidecar-dirty.sqlite");
+    let orchd_stdout = harness
+        .fixture
+        .work_path
+        .join("orchd-sidecar-dirty-stdout.log");
+    let orchd_stderr = harness
+        .fixture
+        .work_path
+        .join("orchd-sidecar-dirty-stderr.log");
+
+    let fake_codex = ensure_fake_codex_bin()?;
+    let forgejoctl = forgejo_agent_bin()?;
+
+    write_orchd_dispatch_toml(
+        &dispatch_cfg_path,
+        OrchdDispatchTomlInputs {
+            actor: harness.fixture.owner.as_str(),
+            forgejo_login: harness.fixture.owner.as_str(),
+            repo_ref: harness.repo_ref.as_str(),
+            principal_workdir: &harness.principal_workdir,
+            sidecar_repo_ref: Some(&sidecar_ref),
+            sidecar_principal_workdir: Some(&sidecar_principal),
+            codex_bin: &fake_codex,
+            token_file: &harness.token_path,
+            forgejoctl: &forgejoctl,
+            directives: &[OrchdTestDirective::Impl],
+            timeout_sec: 60,
+        },
+    )?;
+
+    let port = pick_unused_port().ok_or_else(|| anyhow!("failed to pick unused port"))?;
+    let orchd = OrchdTestProcess::spawn(OrchdSpawnInputs {
+        listen_port: port,
+        db_path: &db_path,
+        repo_ref: &harness.repo_ref,
+        dispatch_cfg_path: &dispatch_cfg_path,
+        config_path: &harness.config_path,
+        token_path: &harness.token_path,
+        stdout_path: &orchd_stdout,
+        stderr_path: &orchd_stderr,
+        env: &[("FAKE_CODEX_MODE", "sidecar_dirty")],
+    })?;
+
+    post_orchd_issue_comment_webhook(
+        &orchd.client,
+        &orchd.base_url,
+        &harness.repo_ref,
+        issue_number,
+        harness.fixture.owner.as_str(),
+        "@codex-orch impl",
+    )?;
+
+    let _ = wait_for_issue_label(
+        &harness,
+        issue_number,
+        "orchd/state/blocked",
+        Duration::from_secs(120),
+    )?;
+
+    let primary_after = primary_git.bare_head_main()?;
+    let sidecar_after = sidecar_git.bare_head_main()?;
+    if primary_after != primary_before {
+        bail!("expected primary repo main to remain unchanged when sidecar landing blocks");
+    }
+    if sidecar_after != sidecar_before {
+        bail!("expected sidecar repo main to remain unchanged when sidecar worktree is dirty");
+    }
+
+    let Some(run_dir) = orchd_latest_dispatch_run_dir(&db_path, &harness.repo_ref, issue_number)?
+    else {
+        bail!("expected dispatch run_dir to be recorded for blocked dispatch");
+    };
+    let completion = fs::read_to_string(run_dir.join("completion.md"))
+        .context("failed reading completion.md for sidecar dirty dispatch")?;
+
+    let sidecar_marker = format!("Landing ({sidecar_ref}):");
+    let primary_marker = format!("Landing ({}):", harness.repo_ref);
+    ensure_contains(&completion, &sidecar_marker, "sidecar completion marker")?;
+    if completion.contains(&primary_marker) {
+        bail!("expected primary landing section to be absent when sidecar landing blocks");
     }
 
     Ok(())
