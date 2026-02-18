@@ -59,6 +59,17 @@ struct LandingCommentSpec {
     body: String,
 }
 
+#[derive(Debug, Clone)]
+struct LandingTarget<'a> {
+    kind: &'static str,
+    repo_ref: RepoRef,
+    git_workdir: &'a Path,
+    principal_workdir: Option<&'a Path>,
+    git_remote: &'a str,
+    git_base: &'a str,
+    git_branch: &'a str,
+}
+
 fn parse_reported_status(status: &str) -> Result<ReportedStatus> {
     match status {
         "completed" => Ok(ReportedStatus::Completed),
@@ -140,17 +151,85 @@ fn merge_ff_only_with_retry(
     Ok(())
 }
 
-fn evaluate_landing(args: &FinalizeDispatchArgs) -> LandingOutcome {
+fn evaluate_landing_target(
+    args: &FinalizeDispatchArgs,
+    target: LandingTarget<'_>,
+) -> LandingOutcome {
     if args.directive != DIRECTIVE_IMPL {
         return LandingOutcome::NotRequired;
     }
 
-    let branch = args.git_branch.trim();
+    let prefix = format!("[{}] ", target.repo_ref);
+    let branch = target.git_branch.trim();
     if branch.is_empty() {
         return LandingOutcome::Failure {
             reason_code: "landing_missing_branch".to_string(),
-            lines: vec!["pr landing failed: missing git branch name".to_string()],
+            lines: vec![format!(
+                "{prefix}pr landing failed: missing git branch name"
+            )],
         };
+    }
+
+    let status_out = match repo::git_checked(
+        target.git_workdir,
+        &["status", "--porcelain", "--untracked-files=no"],
+    ) {
+        Ok(out) => repo::git_stdout_trim(&out),
+        Err(err) => {
+            return LandingOutcome::Failure {
+                reason_code: "landing_git_status_failed".to_string(),
+                lines: vec![format!("{prefix}pr landing failed: {err:#}")],
+            };
+        }
+    };
+    if !status_out.is_empty() {
+        let retry_mention = if args.role_name.starts_with("codex") {
+            format!("@{} impl", args.role_name)
+        } else {
+            String::new()
+        };
+        let body = format!(
+            "PR landing blocked: worktree has uncommitted changes.\n- repo: `{}`\n- branch: `{}`\n\nretry: {}\n\nhint: commit your changes (or discard them) and re-run.\n",
+            target.repo_ref, branch, retry_mention,
+        );
+        return LandingOutcome::Blocked {
+            reason_code: "worktree_dirty".to_string(),
+            lines: vec![format!(
+                "{prefix}pr landing blocked: uncommitted changes in worktree"
+            )],
+            comment: Some(LandingCommentSpec {
+                delivery_kind: "worktree_dirty",
+                dedupe_key: format!(
+                    "dispatch:{}:{}:worktree_dirty",
+                    args.dispatch_id, target.kind
+                ),
+                body,
+            }),
+        };
+    }
+
+    let head_sha = match repo::git_checked(target.git_workdir, &["rev-parse", "HEAD"])
+        .map(|out| repo::git_stdout_trim(&out))
+    {
+        Ok(value) if !value.trim().is_empty() => value,
+        Ok(_) => {
+            return LandingOutcome::Failure {
+                reason_code: "landing_git_head_failed".to_string(),
+                lines: vec![format!("{prefix}pr landing failed: head sha was empty")],
+            };
+        }
+        Err(err) => {
+            return LandingOutcome::Failure {
+                reason_code: "landing_git_head_failed".to_string(),
+                lines: vec![format!("{prefix}pr landing failed: {err:#}")],
+            };
+        }
+    };
+    let base_ref = format!("{}/{}", target.git_remote, target.git_base);
+    if let Ok(base_out) = repo::git_checked(target.git_workdir, &["rev-parse", base_ref.as_str()])
+        && repo::git_stdout_trim(&base_out) == head_sha
+    {
+        return LandingOutcome::Success(vec![format!("{prefix}pr landing: skipped (no changes)")]);
     }
 
     let cfg = match AgentConfig::load(args.forgejo_config.clone(), Some(args.token_file.clone())) {
@@ -158,7 +237,7 @@ fn evaluate_landing(args: &FinalizeDispatchArgs) -> LandingOutcome {
         Err(err) => {
             return LandingOutcome::Failure {
                 reason_code: "landing_config_error".to_string(),
-                lines: vec![format!("pr landing failed: {err:#}")],
+                lines: vec![format!("{prefix}pr landing failed: {err:#}")],
             };
         }
     };
@@ -167,12 +246,12 @@ fn evaluate_landing(args: &FinalizeDispatchArgs) -> LandingOutcome {
         Err(err) => {
             return LandingOutcome::Failure {
                 reason_code: "landing_api_client_error".to_string(),
-                lines: vec![format!("pr landing failed: {err:#}")],
+                lines: vec![format!("{prefix}pr landing failed: {err:#}")],
             };
         }
     };
 
-    let repo_ref = args.issue_ref.repo.clone();
+    let repo_ref = target.repo_ref.clone();
     let repo_full_name = repo_ref.to_string();
 
     let prs = match api.list_pull_requests(&cfg, &repo_ref, "all", 200) {
@@ -180,7 +259,7 @@ fn evaluate_landing(args: &FinalizeDispatchArgs) -> LandingOutcome {
         Err(err) => {
             return LandingOutcome::Failure {
                 reason_code: "landing_pr_list_failed".to_string(),
-                lines: vec![format!("pr landing failed: {err:#}")],
+                lines: vec![format!("{prefix}pr landing failed: {err:#}")],
             };
         }
     };
@@ -194,7 +273,7 @@ fn evaluate_landing(args: &FinalizeDispatchArgs) -> LandingOutcome {
         Err(err) => {
             return LandingOutcome::Failure {
                 reason_code: "landing_whoami_failed".to_string(),
-                lines: vec![format!("pr landing failed: {err:#}")],
+                lines: vec![format!("{prefix}pr landing failed: {err:#}")],
             };
         }
     };
@@ -203,7 +282,7 @@ fn evaluate_landing(args: &FinalizeDispatchArgs) -> LandingOutcome {
         Err(err) => {
             return LandingOutcome::Failure {
                 reason_code: "landing_git_url_failed".to_string(),
-                lines: vec![format!("pr landing failed: {err}")],
+                lines: vec![format!("{prefix}pr landing failed: {err}")],
             };
         }
     };
@@ -211,33 +290,22 @@ fn evaluate_landing(args: &FinalizeDispatchArgs) -> LandingOutcome {
     let mut lines = Vec::new();
     if let Some(pr) = existing_merged_pr {
         lines.push(format!(
-            "pr landing: already merged #{} ({})",
+            "{prefix}pr landing: already merged #{} ({})",
             pr.number, pr.html_url
         ));
-        if let Some(principal_workdir) = args.principal_workdir.as_deref() {
+        if let Some(principal_workdir) = target.principal_workdir {
             lines.extend(repo::best_effort_sync_principal(
                 &args.db_path,
                 &args.token_file,
                 principal_workdir,
-                &args.git_base,
+                target.git_base,
                 &git_url,
             ));
         }
         return LandingOutcome::Success(lines);
     }
 
-    let head_sha = match repo::git_checked(&args.git_workdir, &["rev-parse", "HEAD"])
-        .map(|out| repo::git_stdout_trim(&out))
-    {
-        Ok(value) => value,
-        Err(err) => {
-            return LandingOutcome::Failure {
-                reason_code: "landing_git_head_failed".to_string(),
-                lines: vec![format!("pr landing failed: {err:#}")],
-            };
-        }
-    };
-    let head_short = match repo::git_checked(&args.git_workdir, &["rev-parse", "--short", "HEAD"])
+    let head_short = match repo::git_checked(target.git_workdir, &["rev-parse", "--short", "HEAD"])
         .map(|out| repo::git_stdout_trim(&out))
     {
         Ok(value) => value,
@@ -246,22 +314,24 @@ fn evaluate_landing(args: &FinalizeDispatchArgs) -> LandingOutcome {
     if let Err(err) = repo::git_checked_with_token(
         &args.db_path,
         &args.token_file,
-        Some(&args.git_workdir),
+        Some(target.git_workdir),
         &["push", &git_url, &format!("HEAD:{branch}")],
     ) {
         return LandingOutcome::Failure {
             reason_code: "landing_git_push_failed".to_string(),
-            lines: vec![format!("pr landing failed: {err}")],
+            lines: vec![format!("{prefix}pr landing failed: {err}")],
         };
     }
-    lines.push(format!("git_push: {head_short} -> {branch} ({git_url})"));
+    lines.push(format!(
+        "{prefix}git_push: {head_short} -> {branch} ({git_url})"
+    ));
 
     let prs = match api.list_pull_requests(&cfg, &repo_ref, "all", 200) {
         Ok(prs) => prs,
         Err(err) => {
             return LandingOutcome::Failure {
                 reason_code: "landing_pr_list_failed".to_string(),
-                lines: vec![format!("pr landing failed: {err:#}")],
+                lines: vec![format!("{prefix}pr landing failed: {err:#}")],
             };
         }
     };
@@ -270,15 +340,18 @@ fn evaluate_landing(args: &FinalizeDispatchArgs) -> LandingOutcome {
     } else {
         let title = format!("{}: {}", args.issue_ref, args.issue_title);
         let body = format!("Automated PR for {}.", args.issue_ref);
-        match api.create_pull_request(&cfg, &repo_ref, &title, branch, &args.git_base, &body) {
+        match api.create_pull_request(&cfg, &repo_ref, &title, branch, target.git_base, &body) {
             Ok(pr) => {
-                lines.push(format!("pr_create: #{} ({})", pr.number, pr.html_url));
+                lines.push(format!(
+                    "{prefix}pr_create: #{} ({})",
+                    pr.number, pr.html_url
+                ));
                 pr
             }
             Err(err) => {
                 return LandingOutcome::Failure {
                     reason_code: "landing_pr_create_failed".to_string(),
-                    lines: vec![format!("pr landing failed: {err:#}")],
+                    lines: vec![format!("{prefix}pr landing failed: {err:#}")],
                 };
             }
         }
@@ -287,15 +360,15 @@ fn evaluate_landing(args: &FinalizeDispatchArgs) -> LandingOutcome {
     match merge_ff_only_with_retry(&api, &cfg, &repo_ref, pr.number, &head_sha, &mut lines) {
         Ok(()) => {
             lines.push(format!(
-                "pr_merge: ff-only #{} ({})",
+                "{prefix}pr_merge: ff-only #{} ({})",
                 pr.number, pr.html_url
             ));
-            if let Some(principal_workdir) = args.principal_workdir.as_deref() {
+            if let Some(principal_workdir) = target.principal_workdir {
                 lines.extend(repo::best_effort_sync_principal(
                     &args.db_path,
                     &args.token_file,
                     principal_workdir,
-                    &args.git_base,
+                    target.git_base,
                     &git_url,
                 ));
             }
@@ -305,7 +378,7 @@ fn evaluate_landing(args: &FinalizeDispatchArgs) -> LandingOutcome {
             let Some(http) = err.downcast_ref::<ApiHttpError>() else {
                 return LandingOutcome::Failure {
                     reason_code: "landing_pr_merge_failed".to_string(),
-                    lines: vec![format!("pr landing failed: {err:#}")],
+                    lines: vec![format!("{prefix}pr landing failed: {err:#}")],
                 };
             };
             // Forgejo documents 409/423 here, but we have observed intermittent 5xx from the merge
@@ -313,30 +386,30 @@ fn evaluate_landing(args: &FinalizeDispatchArgs) -> LandingOutcome {
             if !(matches!(http.status, 409 | 423) || http.status >= 500) {
                 return LandingOutcome::Failure {
                     reason_code: "landing_pr_merge_failed".to_string(),
-                    lines: vec![format!("pr landing failed: {http}")],
+                    lines: vec![format!("{prefix}pr landing failed: {http}")],
                 };
             }
 
             lines.push(format!(
-                "pr_merge_retry: status={} attempting rebase",
+                "{prefix}pr_merge_retry: status={} attempting rebase",
                 http.status
             ));
             let fetch_result = repo::git_checked_with_token(
                 &args.db_path,
                 &args.token_file,
-                Some(&args.git_workdir),
-                &["fetch", &git_url, &args.git_base],
+                Some(target.git_workdir),
+                &["fetch", &git_url, target.git_base],
             );
             if let Err(err) = fetch_result {
                 return LandingOutcome::Failure {
                     reason_code: "landing_git_fetch_failed".to_string(),
-                    lines: vec![format!("pr landing failed: {err}")],
+                    lines: vec![format!("{prefix}pr landing failed: {err}")],
                 };
             }
 
-            let rebase_result = repo::git_checked(&args.git_workdir, &["rebase", "FETCH_HEAD"]);
+            let rebase_result = repo::git_checked(target.git_workdir, &["rebase", "FETCH_HEAD"]);
             if let Err(err) = rebase_result {
-                let _ = repo::git_checked(&args.git_workdir, &["rebase", "--abort"]);
+                let _ = repo::git_checked(target.git_workdir, &["rebase", "--abort"]);
                 let retry_mention = if args.role_name.starts_with("codex") {
                     format!("@{} impl", args.role_name)
                 } else {
@@ -350,7 +423,7 @@ fn evaluate_landing(args: &FinalizeDispatchArgs) -> LandingOutcome {
                     &[
                         ("pr_url", pr.html_url.as_str()),
                         ("branch", branch),
-                        ("base_branch", args.git_base.as_str()),
+                        ("base_branch", target.git_base),
                         ("retry_mention", retry_mention.as_str()),
                         ("error", &format!("{err:#}")),
                     ],
@@ -359,40 +432,47 @@ fn evaluate_landing(args: &FinalizeDispatchArgs) -> LandingOutcome {
                 .unwrap_or_else(|tpl_err| {
                     format!(
                         "PR landing blocked (rebase conflicts).\n- PR: {}\n- branch: `{}` (base `{}`)\n\nretry: {}\n\nerror: {err:#}\n(template error: {tpl_err})\n",
-                        pr.html_url, branch, args.git_base, retry_mention
+                        pr.html_url, branch, target.git_base, retry_mention
                     )
                 });
 
                 return LandingOutcome::Blocked {
                     reason_code: "pr_rebase_conflict".to_string(),
-                    lines: vec![format!("pr landing blocked: rebase conflict: {err:#}")],
+                    lines: vec![format!(
+                        "{prefix}pr landing blocked: rebase conflict: {err:#}"
+                    )],
                     comment: Some(LandingCommentSpec {
                         delivery_kind: "pr_rebase_conflict",
-                        dedupe_key: format!("dispatch:{}:pr_rebase_conflict", args.dispatch_id),
+                        dedupe_key: format!(
+                            "dispatch:{}:{}:pr_rebase_conflict",
+                            args.dispatch_id, target.kind
+                        ),
                         body: rendered,
                     }),
                 };
             }
 
-            let rebased_sha = match repo::git_checked(&args.git_workdir, &["rev-parse", "HEAD"])
+            let rebased_sha = match repo::git_checked(target.git_workdir, &["rev-parse", "HEAD"])
                 .map(|out| repo::git_stdout_trim(&out))
             {
                 Ok(value) if !value.trim().is_empty() => value,
                 Ok(_) => {
                     return LandingOutcome::Failure {
                         reason_code: "landing_git_head_failed".to_string(),
-                        lines: vec!["pr landing failed: rebased head sha was empty".to_string()],
+                        lines: vec![format!(
+                            "{prefix}pr landing failed: rebased head sha was empty"
+                        )],
                     };
                 }
                 Err(err) => {
                     return LandingOutcome::Failure {
                         reason_code: "landing_git_head_failed".to_string(),
-                        lines: vec![format!("pr landing failed: {err:#}")],
+                        lines: vec![format!("{prefix}pr landing failed: {err:#}")],
                     };
                 }
             };
             let rebased_short =
-                repo::git_checked(&args.git_workdir, &["rev-parse", "--short", "HEAD"])
+                repo::git_checked(target.git_workdir, &["rev-parse", "--short", "HEAD"])
                     .map(|out| repo::git_stdout_trim(&out))
                     .unwrap_or_else(|_| rebased_sha.chars().take(12).collect::<String>());
 
@@ -406,7 +486,7 @@ fn evaluate_landing(args: &FinalizeDispatchArgs) -> LandingOutcome {
             let push_result = repo::git_checked_with_token(
                 &args.db_path,
                 &args.token_file,
-                Some(&args.git_workdir),
+                Some(target.git_workdir),
                 &[
                     "push",
                     lease_flag.as_str(),
@@ -417,10 +497,10 @@ fn evaluate_landing(args: &FinalizeDispatchArgs) -> LandingOutcome {
             if let Err(err) = push_result {
                 return LandingOutcome::Failure {
                     reason_code: "landing_git_push_failed".to_string(),
-                    lines: vec![format!("pr landing failed: {err}")],
+                    lines: vec![format!("{prefix}pr landing failed: {err}")],
                 };
             }
-            lines.push(format!("git_rebase: now at {rebased_short}"));
+            lines.push(format!("{prefix}git_rebase: now at {rebased_short}"));
             let merge_retry = api.merge_pull_request(
                 &cfg,
                 &repo_ref,
@@ -432,15 +512,15 @@ fn evaluate_landing(args: &FinalizeDispatchArgs) -> LandingOutcome {
             match merge_retry {
                 Ok(()) => {
                     lines.push(format!(
-                        "pr_merge: ff-only #{} ({})",
+                        "{prefix}pr_merge: ff-only #{} ({})",
                         pr.number, pr.html_url
                     ));
-                    if let Some(principal_workdir) = args.principal_workdir.as_deref() {
+                    if let Some(principal_workdir) = target.principal_workdir {
                         lines.extend(repo::best_effort_sync_principal(
                             &args.db_path,
                             &args.token_file,
                             principal_workdir,
-                            &args.git_base,
+                            target.git_base,
                             &git_url,
                         ));
                     }
@@ -460,7 +540,7 @@ fn evaluate_landing(args: &FinalizeDispatchArgs) -> LandingOutcome {
                         &[
                             ("pr_url", pr.html_url.as_str()),
                             ("branch", branch),
-                            ("base_branch", args.git_base.as_str()),
+                            ("base_branch", target.git_base),
                             ("retry_mention", retry_mention.as_str()),
                             ("error", &format!("{err:#}")),
                         ],
@@ -469,15 +549,18 @@ fn evaluate_landing(args: &FinalizeDispatchArgs) -> LandingOutcome {
                     .unwrap_or_else(|tpl_err| {
                         format!(
                             "PR landing blocked: merge still not possible after rebase.\n- PR: {}\n- branch: `{}` (base `{}`)\n\nretry: {}\n\nerror: {err:#}\n(template error: {tpl_err})\n",
-                            pr.html_url, branch, args.git_base, retry_mention
+                            pr.html_url, branch, target.git_base, retry_mention
                         )
                     });
                     LandingOutcome::Blocked {
                         reason_code: "pr_merge_blocked".to_string(),
-                        lines: vec![format!("pr landing blocked: merge failed: {err:#}")],
+                        lines: vec![format!("{prefix}pr landing blocked: merge failed: {err:#}")],
                         comment: Some(LandingCommentSpec {
                             delivery_kind: "pr_merge_blocked",
-                            dedupe_key: format!("dispatch:{}:pr_merge_blocked", args.dispatch_id),
+                            dedupe_key: format!(
+                                "dispatch:{}:{}:pr_merge_blocked",
+                                args.dispatch_id, target.kind
+                            ),
                             body,
                         }),
                     }
@@ -567,11 +650,71 @@ pub(super) fn finalize_dispatch_command(args: FinalizeDispatchArgs) -> Result<()
     let _entered = span.enter();
 
     let reported_status = parse_reported_status(&args.status)?;
-    let landing_outcome = if matches!(reported_status, ReportedStatus::Completed) {
-        evaluate_landing(&args)
-    } else {
-        LandingOutcome::NotRequired
-    };
+    let (sidecar_outcome, primary_outcome, landing_outcome) =
+        if matches!(reported_status, ReportedStatus::Completed) {
+            let primary_target = LandingTarget {
+                kind: "primary",
+                repo_ref: args.issue_ref.repo.clone(),
+                git_workdir: &args.git_workdir,
+                principal_workdir: args.principal_workdir.as_deref(),
+                git_remote: args.git_remote.as_str(),
+                git_base: args.git_base.as_str(),
+                git_branch: args.git_branch.as_str(),
+            };
+
+            let sidecar_target = if let Some(repo_ref) = args.sidecar_repo.clone() {
+                let git_workdir = args
+                    .sidecar_git_workdir
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("sidecar_git_workdir missing for {repo_ref}"))?;
+                let git_remote = args
+                    .sidecar_git_remote
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("sidecar_git_remote missing for {repo_ref}"))?;
+                let git_base = args
+                    .sidecar_git_base
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("sidecar_git_base missing for {repo_ref}"))?;
+                let git_branch = args
+                    .sidecar_git_branch
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("sidecar_git_branch missing for {repo_ref}"))?;
+                Some(LandingTarget {
+                    kind: "sidecar",
+                    repo_ref,
+                    git_workdir,
+                    principal_workdir: args.sidecar_principal_workdir.as_deref(),
+                    git_remote,
+                    git_base,
+                    git_branch,
+                })
+            } else {
+                None
+            };
+
+            let sidecar_outcome =
+                sidecar_target.map(|target| evaluate_landing_target(&args, target));
+            if let Some(LandingOutcome::Blocked { .. } | LandingOutcome::Failure { .. }) =
+                sidecar_outcome.as_ref()
+            {
+                (
+                    sidecar_outcome.clone(),
+                    LandingOutcome::NotRequired,
+                    sidecar_outcome
+                        .clone()
+                        .unwrap_or(LandingOutcome::NotRequired),
+                )
+            } else {
+                let primary_outcome = evaluate_landing_target(&args, primary_target);
+                (sidecar_outcome, primary_outcome.clone(), primary_outcome)
+            }
+        } else {
+            (
+                None,
+                LandingOutcome::NotRequired,
+                LandingOutcome::NotRequired,
+            )
+        };
     let status_spec =
         terminal_spec_from_outcome(reported_status, &args.reason_code, &landing_outcome);
 
@@ -594,13 +737,35 @@ pub(super) fn finalize_dispatch_command(args: FinalizeDispatchArgs) -> Result<()
         return Ok(());
     }
 
-    let landing_lines = match &landing_outcome {
+    if let Some(outcome) = sidecar_outcome.as_ref() {
+        let header = match args.sidecar_repo.as_ref() {
+            Some(repo) => format!("Landing ({repo})"),
+            None => "Landing (sidecar)".to_string(),
+        };
+        let landing_lines = match outcome {
+            LandingOutcome::Success(lines)
+            | LandingOutcome::Blocked { lines, .. }
+            | LandingOutcome::Failure { lines, .. } => lines.as_slice(),
+            LandingOutcome::NotRequired => &[],
+        };
+        if let Err(err) =
+            append_completion_section(&args.completion_file, header.as_str(), landing_lines)
+        {
+            eprintln!("finalize-dispatch: failed appending landing info: {err}");
+        }
+    }
+    let primary_header = format!("Landing ({})", args.issue_ref.repo);
+    let primary_lines = match &primary_outcome {
         LandingOutcome::Success(lines)
         | LandingOutcome::Blocked { lines, .. }
         | LandingOutcome::Failure { lines, .. } => lines.as_slice(),
         LandingOutcome::NotRequired => &[],
     };
-    if let Err(err) = append_completion_section(&args.completion_file, "Landing", landing_lines) {
+    if let Err(err) = append_completion_section(
+        &args.completion_file,
+        primary_header.as_str(),
+        primary_lines,
+    ) {
         eprintln!("finalize-dispatch: failed appending landing info: {err}");
     }
 

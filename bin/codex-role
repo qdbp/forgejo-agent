@@ -47,12 +47,16 @@ for d in "$HOME/bin" "$HOME/.local/bin"; do
   fi
 done
 
+swarm_home="${SWARM_HOME:-$HOME/swarm}"
+
 exec env \
   PATH="$new_path" \
   FORGEJO_PROFILE="$role" \
   FORGEJO_TOKEN_FILE="$token_file" \
+  SWARM_HOME="$swarm_home" \
   /usr/bin/codex \
   -c "shell_environment_policy.set.PATH=\"$new_path\"" \
   -c "shell_environment_policy.set.FORGEJO_PROFILE=\"$role\"" \
   -c "shell_environment_policy.set.FORGEJO_TOKEN_FILE=\"$token_file\"" \
+  -c "shell_environment_policy.set.SWARM_HOME=\"$swarm_home\"" \
   "$@"

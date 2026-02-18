@@ -185,6 +185,21 @@ pub(super) struct FinalizeDispatchArgs {
     pub(super) token_file: PathBuf,
     #[arg(long = "principal-workdir")]
     pub(super) principal_workdir: Option<PathBuf>,
+
+    // Optional sidecar checkout that must land before the primary repo (used for paired
+    // forgejo-agent + swarm updates). When present, all fields should be populated.
+    #[arg(long = "sidecar-repo")]
+    pub(super) sidecar_repo: Option<RepoRef>,
+    #[arg(long = "sidecar-git-workdir")]
+    pub(super) sidecar_git_workdir: Option<PathBuf>,
+    #[arg(long = "sidecar-git-remote")]
+    pub(super) sidecar_git_remote: Option<String>,
+    #[arg(long = "sidecar-git-base")]
+    pub(super) sidecar_git_base: Option<String>,
+    #[arg(long = "sidecar-git-branch")]
+    pub(super) sidecar_git_branch: Option<String>,
+    #[arg(long = "sidecar-principal-workdir")]
+    pub(super) sidecar_principal_workdir: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]

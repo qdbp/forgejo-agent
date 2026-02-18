@@ -28,7 +28,9 @@ use super::forgejoctl_cmd;
 use super::lexicon;
 use super::reading_material;
 use super::repo;
-use super::run_dispatch::{CodexSandbox, CodexSessionId, DispatchExecSpecV1};
+use super::run_dispatch::{
+    CodexSandbox, CodexSessionId, DispatchExecSidecarV1, DispatchExecSpecV1,
+};
 use super::state::{AppState, DecisionRecord, EventRecord};
 use super::telemetry::{log_line, record_phase_latency_ms};
 use super::template;
@@ -100,6 +102,7 @@ struct DispatchPlan {
     role: DispatchRoleConfig,
     workdir: PathBuf,
     principal_workdir: Option<PathBuf>,
+    sidecar: Option<DispatchSidecarPlan>,
     git_remote: String,
     git_base: String,
     git_branch: String,
@@ -113,6 +116,16 @@ struct DispatchPlan {
     dispatch_id: i64,
     lock_path: PathBuf,
     run_dir: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct DispatchSidecarPlan {
+    repo_full_name: String,
+    workdir: PathBuf,
+    principal_workdir: Option<PathBuf>,
+    git_remote: String,
+    git_base: String,
+    git_branch: String,
 }
 
 #[derive(Debug, Clone)]
@@ -816,6 +829,68 @@ async fn plan_dispatch(
         } else {
             None
         };
+        let sidecar = if lexicon::directive_uses_worktree(&intent.directive) {
+            if let Some(sidecar_repo) = repo_binding.and_then(|binding| binding.sidecar_repo.as_ref())
+            {
+                let sidecar_full_name = sidecar_repo.to_string();
+                let sidecar_binding = dispatch_config
+                    .repo_bindings
+                    .get(&sidecar_full_name)
+                    .ok_or_else(|| {
+                        DispatchError::Io(format!(
+                            "repo binding for {} references sidecar repo {sidecar_full_name} but it is missing from dispatch config",
+                            intent.repo_full_name
+                        ))
+                    })?;
+                let sidecar_checkout =
+                    repo::ensure_repo_checkout(state, &role, sidecar_full_name.as_str())?;
+
+                let sidecar_git_branch = repo::dispatch_worktree_branch(
+                    sidecar_full_name.as_str(),
+                    intent.issue_number,
+                    dispatch_id,
+                    directive_name,
+                );
+                let sidecar_dir = run_dir.join("sidecar").join(format!(
+                    "{}__{}",
+                    sidecar_repo.owner, sidecar_repo.repo
+                ));
+                if let Some(parent) = sidecar_dir.parent() {
+                    fs::create_dir_all(parent).map_err(|err| {
+                        DispatchError::Io(format!(
+                            "failed creating sidecar worktree parent {}: {err}",
+                            parent.display()
+                        ))
+                    })?;
+                }
+                repo::create_dispatch_worktree(
+                    &state.db_path,
+                    &role.token_file,
+                    &sidecar_checkout,
+                    &sidecar_dir,
+                    &sidecar_git_branch,
+                    &sidecar_binding.git_remote,
+                    &sidecar_binding.git_base,
+                )?;
+                let sidecar_principal_workdir = if intent.directive == lexicon::DIRECTIVE_IMPL {
+                    Some(sidecar_binding.local_path.clone())
+                } else {
+                    None
+                };
+                Some(DispatchSidecarPlan {
+                    repo_full_name: sidecar_full_name,
+                    workdir: sidecar_dir,
+                    principal_workdir: sidecar_principal_workdir,
+                    git_remote: sidecar_binding.git_remote.clone(),
+                    git_base: sidecar_binding.git_base.clone(),
+                    git_branch: sidecar_git_branch,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         Ok(DispatchPlan {
             actor,
@@ -824,6 +899,7 @@ async fn plan_dispatch(
             role,
             workdir,
             principal_workdir,
+            sidecar,
             git_remote,
             git_base,
             git_branch,
@@ -965,6 +1041,14 @@ fn materialize_run_artifacts(
             .map(|control| control.token_file.clone()),
         workdir: plan.workdir.clone(),
         principal_workdir: plan.principal_workdir.clone(),
+        sidecar: plan.sidecar.as_ref().map(|sidecar| DispatchExecSidecarV1 {
+            repo_full_name: sidecar.repo_full_name.clone(),
+            workdir: sidecar.workdir.clone(),
+            principal_workdir: sidecar.principal_workdir.clone(),
+            git_remote: sidecar.git_remote.clone(),
+            git_base: sidecar.git_base.clone(),
+            git_branch: sidecar.git_branch.clone(),
+        }),
         codex_sandbox: codex_sandbox_for_directive(&plan.intent.directive),
         git_remote: plan.git_remote.clone(),
         git_base: plan.git_base.clone(),

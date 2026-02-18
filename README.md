@@ -6,16 +6,18 @@ Rust-first, policy-enforcing issue gateway for local multi-agent workflows.
 
 Agents should use one executable for Forgejo operations:
 
-- `/home/main/.local/bin/forgejoctl`
+- `$HOME/.local/bin/forgejoctl`
 
 Direct raw API poking is discouraged for agents.
 
 ## Swarm Home
 
 Swarm doctrine and configuration are owned by the private `main/swarm` repo,
-checked out at:
+checked out at `SWARM_HOME` (default: `$HOME/swarm`).
 
-- `/home/main/swarm`
+Example:
+
+- `SWARM_HOME=$HOME/swarm`
 
 This is the canonical home for:
 
@@ -38,7 +40,7 @@ Automation policy:
 ## Install
 
 ```bash
-/home/main/forgejo-agent/scripts/install.sh
+./scripts/install.sh
 ```
 
 This builds release and installs `forgejoctl` to `~/.local/bin/forgejoctl`.
@@ -51,7 +53,7 @@ as execution mirror.
 Use:
 
 ```bash
-/home/main/forgejo-agent/scripts/push-both.sh
+./scripts/push-both.sh
 ```
 
 That pushes the current ref to both remotes using `--force-with-lease`

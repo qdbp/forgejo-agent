@@ -8,13 +8,24 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
-use forgejo_agent::types::IssueRef;
+use forgejo_agent::types::{IssueRef, RepoRef};
 
 use super::cli::{FinalizeDispatchArgs, RunDispatchArgs};
 use super::finalize;
 
 const SPEC_VERSION_V1: u8 = 1;
 const SUMMARY_LINE_LIMIT: usize = 120;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct DispatchExecSidecarV1 {
+    pub(super) repo_full_name: String,
+    pub(super) workdir: PathBuf,
+    pub(super) principal_workdir: Option<PathBuf>,
+    pub(super) git_remote: String,
+    pub(super) git_base: String,
+    pub(super) git_branch: String,
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -89,6 +100,7 @@ pub(super) struct DispatchExecSpecV1 {
     pub(super) control_token_file: Option<PathBuf>,
     pub(super) workdir: PathBuf,
     pub(super) principal_workdir: Option<PathBuf>,
+    pub(super) sidecar: Option<DispatchExecSidecarV1>,
     pub(super) codex_sandbox: CodexSandbox,
     pub(super) git_remote: String,
     pub(super) git_base: String,
@@ -116,6 +128,16 @@ impl DispatchExecSpecV1 {
             bail!("role name must be non-empty");
         }
         let _ = IssueRef::parse(&self.issue_ref)?;
+        if let Some(sidecar) = self.sidecar.as_ref() {
+            let repo_full_name = sidecar.repo_full_name.trim();
+            if repo_full_name.is_empty() {
+                bail!("sidecar repo_full_name must be non-empty");
+            }
+            let _ = RepoRef::parse(repo_full_name)?;
+            if sidecar.git_branch.trim().is_empty() {
+                bail!("sidecar git_branch must be non-empty");
+            }
+        }
         Ok(())
     }
 
@@ -261,6 +283,9 @@ fn run_codex_once(spec: &DispatchExecSpecV1, mode: CodexRunMode<'_>) -> Result<i
         .stdin(Stdio::piped())
         .stdout(Stdio::from(log_out))
         .stderr(Stdio::from(log_err));
+    if let Some(sidecar) = spec.sidecar.as_ref() {
+        cmd.env("SWARM_HOME", &sidecar.workdir);
+    }
 
     let mut child = cmd.spawn().context("failed spawning codex via timeout")?;
 
@@ -432,6 +457,13 @@ fn finalize_with_retries(
         .unwrap_or(&spec.token_file)
         .clone();
 
+    let sidecar_repo = spec
+        .sidecar
+        .as_ref()
+        .map(|sidecar| RepoRef::parse(sidecar.repo_full_name.as_str()))
+        .transpose()
+        .context("invalid sidecar repo ref in dispatch spec")?;
+
     let max_attempts = 8u32;
     for attempt in 1..=max_attempts {
         let args = FinalizeDispatchArgs {
@@ -457,6 +489,24 @@ fn finalize_with_retries(
             forgejo_config: spec.forgejo_config_file.clone(),
             token_file: finalize_token.clone(),
             principal_workdir: spec.principal_workdir.clone(),
+            sidecar_repo: sidecar_repo.clone(),
+            sidecar_git_workdir: spec.sidecar.as_ref().map(|sidecar| sidecar.workdir.clone()),
+            sidecar_git_remote: spec
+                .sidecar
+                .as_ref()
+                .map(|sidecar| sidecar.git_remote.clone()),
+            sidecar_git_base: spec
+                .sidecar
+                .as_ref()
+                .map(|sidecar| sidecar.git_base.clone()),
+            sidecar_git_branch: spec
+                .sidecar
+                .as_ref()
+                .map(|sidecar| sidecar.git_branch.clone()),
+            sidecar_principal_workdir: spec
+                .sidecar
+                .as_ref()
+                .and_then(|sidecar| sidecar.principal_workdir.clone()),
         };
         match finalize::finalize_dispatch_command(args) {
             Ok(()) => return Ok(()),

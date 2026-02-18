@@ -87,6 +87,7 @@ pub(super) struct DispatchRepoBindingConfig {
     pub(super) local_path: PathBuf,
     pub(super) git_remote: String,
     pub(super) git_base: String,
+    pub(super) sidecar_repo: Option<RepoRef>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -499,6 +500,7 @@ struct DispatchRepoBindingConfigFile {
     git_remote: String,
     #[serde(default = "default_git_base")]
     git_base: String,
+    sidecar_repo: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1264,14 +1266,45 @@ pub(super) fn load_dispatch_config(path: &Path) -> Result<DispatchConfig> {
                 path.display()
             ));
         }
+        let sidecar_repo = binding
+            .sidecar_repo
+            .as_deref()
+            .map(|raw| {
+                RepoRef::parse(raw).with_context(|| {
+                    format!(
+                        "repo binding for {repo_full_name} has invalid sidecar_repo '{raw}' in {}",
+                        path.display()
+                    )
+                })
+            })
+            .transpose()?;
         repo_bindings.insert(
             repo_full_name,
             DispatchRepoBindingConfig {
                 local_path: resolve_config_path(&base_dir, &binding.local_path)?,
                 git_remote,
                 git_base,
+                sidecar_repo,
             },
         );
+    }
+    for (repo_full_name, binding) in &repo_bindings {
+        let Some(sidecar_repo) = binding.sidecar_repo.as_ref() else {
+            continue;
+        };
+        let sidecar_full_name = sidecar_repo.to_string();
+        if sidecar_full_name == *repo_full_name {
+            return Err(anyhow!(
+                "repo binding for {repo_full_name} has sidecar_repo set to itself in {}",
+                path.display()
+            ));
+        }
+        if !repo_bindings.contains_key(&sidecar_full_name) {
+            return Err(anyhow!(
+                "repo binding for {repo_full_name} references sidecar_repo {sidecar_full_name} but no such repo binding exists in {}",
+                path.display()
+            ));
+        }
     }
 
     let mut notification_phases = raw.notifications.phases;
