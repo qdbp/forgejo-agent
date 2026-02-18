@@ -26,6 +26,12 @@ pub struct ApiHttpError {
     pub body: String,
 }
 
+#[derive(Debug)]
+struct ApiSuccess {
+    path: String,
+    body: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct CreateRepoBody<'a> {
     name: &'a str,
@@ -203,75 +209,15 @@ impl ForgejoClient {
         T: DeserializeOwned,
         B: Serialize + ?Sized,
     {
-        const MAX_REDIRECTS: u8 = 10;
-
-        let mut url = self.endpoint(path)?;
-
-        for _ in 0..MAX_REDIRECTS {
-            let req = self.request(cfg, method, url.clone());
-            let req = if let Some(body) = body {
-                req.header("Content-Type", "application/json").json(body)
-            } else {
-                req
-            };
-
-            let resp = req
-                .send()
-                .with_context(|| format!("request failed: {method} {}", url.as_str()))?;
-            let status = resp.status();
-            if status.is_redirection() {
-                let location = resp
-                    .headers()
-                    .get(LOCATION)
-                    .and_then(|value| value.to_str().ok())
-                    .map(str::to_owned)
-                    .context("redirect response missing Location header")?;
-                let next = url
-                    .join(&location)
-                    .with_context(|| format!("invalid redirect Location header: {location}"))?;
-                if !Self::same_origin(&self.base_url, &next) {
-                    bail!("refusing cross-origin redirect to {}", next.as_str());
-                }
-                if !next.path().starts_with("/api/v1/") {
-                    bail!("refusing non-API redirect to {}", next.as_str());
-                }
-                if method != Method::GET && !Self::is_repo_canonicalization_redirect(&url, &next) {
-                    bail!(
-                        "unexpected redirect for {} {} -> {}",
-                        method,
-                        Self::api_path_with_query(&url),
-                        Self::api_path_with_query(&next)
-                    );
-                }
-                url = next;
-                continue;
-            }
-
-            let text = resp.text().with_context(|| {
-                format!("failed reading response body for {method} {}", url.as_str())
-            })?;
-
-            if !status.is_success() {
-                return Err(ApiHttpError {
-                    status: status.as_u16(),
-                    method: method.to_string(),
-                    path: Self::api_path_with_query(&url),
-                    body: text,
-                }
-                .into());
-            }
-
-            return serde_json::from_str(&text).with_context(|| {
-                format!(
-                    "failed parsing JSON response for {} {}: {}",
-                    method,
-                    Self::api_path_with_query(&url),
-                    text.chars().take(200).collect::<String>()
-                )
-            });
-        }
-
-        bail!("too many redirects for {method} {}", url.as_str());
+        let ApiSuccess { path, body } = self.send_success(cfg, method, path, body)?;
+        serde_json::from_str(&body).with_context(|| {
+            format!(
+                "failed parsing JSON response for {} {}: {}",
+                method,
+                path,
+                body.chars().take(200).collect::<String>()
+            )
+        })
     }
 
     fn send_empty<B>(
@@ -281,6 +227,19 @@ impl ForgejoClient {
         path: &str,
         body: Option<&B>,
     ) -> Result<()>
+    where
+        B: Serialize + ?Sized,
+    {
+        self.send_success(cfg, method, path, body).map(|_| ())
+    }
+
+    fn send_success<B>(
+        &self,
+        cfg: &AgentConfig,
+        method: &Method,
+        path: &str,
+        body: Option<&B>,
+    ) -> Result<ApiSuccess>
     where
         B: Serialize + ?Sized,
     {
@@ -327,7 +286,7 @@ impl ForgejoClient {
                 continue;
             }
 
-            let text = resp.text().with_context(|| {
+            let body = resp.text().with_context(|| {
                 format!("failed reading response body for {method} {}", url.as_str())
             })?;
             if !status.is_success() {
@@ -335,11 +294,14 @@ impl ForgejoClient {
                     status: status.as_u16(),
                     method: method.to_string(),
                     path: Self::api_path_with_query(&url),
-                    body: text,
+                    body,
                 }
                 .into());
             }
-            return Ok(());
+            return Ok(ApiSuccess {
+                path: Self::api_path_with_query(&url),
+                body,
+            });
         }
 
         bail!("too many redirects for {method} {}", url.as_str());
