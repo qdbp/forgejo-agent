@@ -17,7 +17,9 @@ use super::cli::FinalizeDispatchArgs;
 use super::db;
 use super::forgejoctl_cmd;
 use super::inquisition::{InquisitionSpec, maybe_spawn_inquisition};
-use super::lexicon::{DIRECTIVE_AUDIT, DIRECTIVE_IMPL, directive_uses_worktree};
+use super::lexicon::{
+    DIRECTIVE_AUDIT, DIRECTIVE_AUDIT_FAILURE, DIRECTIVE_IMPL, directive_uses_worktree,
+};
 use super::repo;
 use super::telemetry::record_phase_latency_ms;
 use super::template;
@@ -867,6 +869,7 @@ pub(super) fn finalize_dispatch_command(args: FinalizeDispatchArgs) -> Result<()
     if status_spec.runtime_state == OrchdRuntimeState::Failed
         && args.role_name != "codex-audit"
         && args.directive != DIRECTIVE_AUDIT
+        && args.directive != DIRECTIVE_AUDIT_FAILURE
     {
         let default_owner =
             AgentConfig::load(args.forgejo_config.clone(), Some(args.token_file.clone()))

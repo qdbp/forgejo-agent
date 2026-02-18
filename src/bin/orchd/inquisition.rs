@@ -40,7 +40,7 @@ impl InquisitionSpec {
     }
 
     fn title(&self) -> String {
-        let mut title = format!("audit: {}", self.source_issue);
+        let mut title = format!("audit-failure: {}", self.source_issue);
         if let Some(dispatch_id) = self.dispatch_id {
             let _ = write!(&mut title, " dispatch {dispatch_id}");
         }
@@ -52,7 +52,7 @@ impl InquisitionSpec {
 
     fn body(&self) -> Result<String> {
         let mut out = String::new();
-        writeln!(&mut out, "@codex-audit audit")?;
+        writeln!(&mut out, "@codex-audit audit-failure")?;
         writeln!(&mut out)?;
         writeln!(
             &mut out,

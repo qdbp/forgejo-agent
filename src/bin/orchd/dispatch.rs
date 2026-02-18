@@ -299,7 +299,8 @@ fn codex_sandbox_for_directive(directive: &str) -> CodexSandbox {
         lexicon::DIRECTIVE_DESIGN
         | lexicon::DIRECTIVE_INVESTIGATE
         | lexicon::DIRECTIVE_REPLY
-        | lexicon::DIRECTIVE_AUDIT => CodexSandbox::ReadOnly,
+        | lexicon::DIRECTIVE_AUDIT
+        | lexicon::DIRECTIVE_AUDIT_FAILURE => CodexSandbox::ReadOnly,
         _ => CodexSandbox::WorkspaceWrite,
     }
 }

@@ -24,7 +24,9 @@ use super::dispatch;
 use super::dispatch_config::{DispatchTriggerGuardrailsConfig, load_dispatch_config};
 use super::errors::runtime_state_for_dispatch_error;
 use super::inquisition::{InquisitionSpec, maybe_spawn_inquisition};
-use super::lexicon::{DIRECTIVE_IMPL, EVENT_ISSUE_COMMENT, EVENT_ISSUES};
+use super::lexicon::{
+    DIRECTIVE_AUDIT, DIRECTIVE_AUDIT_FAILURE, DIRECTIVE_IMPL, EVENT_ISSUE_COMMENT, EVENT_ISSUES,
+};
 use super::notifier;
 use super::paths::{expand_tilde_path, resolve_dispatch_config_path};
 use super::projection;
@@ -632,7 +634,9 @@ async fn process_webhook(
 
                                 if runtime_state == OrchdRuntimeState::Failed
                                     && decision.target_role.as_deref() != Some("codex-audit")
-                                    && decision.directive.as_deref() != Some("audit")
+                                    && decision.directive.as_deref() != Some(DIRECTIVE_AUDIT)
+                                    && decision.directive.as_deref()
+                                        != Some(DIRECTIVE_AUDIT_FAILURE)
                                     && let Some(identity) = dispatch_identity.clone()
                                 {
                                     let db_path = state.db_path.clone();
