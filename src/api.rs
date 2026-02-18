@@ -501,8 +501,11 @@ impl ForgejoClient {
             auto_init: true,
         };
 
-        let _: serde_json::Value =
-            self.send_json(cfg, &Method::POST, "/api/v1/user/repos", Some(&body))?;
+        // We intentionally create repos under the configured default owner (usually `main`), not
+        // under whatever principal token happens to be executing forgejoctl/orchd. Doing so via
+        // the admin endpoint keeps "repo ensure" deterministic for swarm automation.
+        let path = format!("/api/v1/admin/users/{}/repos", repo.owner);
+        let _: serde_json::Value = self.send_json(cfg, &Method::POST, &path, Some(&body))?;
         Ok(())
     }
 
