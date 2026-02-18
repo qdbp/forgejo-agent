@@ -31,6 +31,8 @@ pub(super) struct Cli {
     pub(super) dispatch_backend: DispatchBackend,
     #[arg(long, default_value = "config/orchd-dispatch.toml")]
     pub(super) dispatch_config: String,
+    #[arg(long, default_value_t = 5)]
+    pub(super) dispatch_config_reload_sec: u64,
     #[arg(long, default_value_t = false)]
     pub(super) skip_startup_role_check: bool,
     #[command(subcommand)]

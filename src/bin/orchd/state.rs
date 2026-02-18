@@ -6,7 +6,7 @@ use forgejo_agent::config::AgentConfig;
 use forgejo_agent::types::RepoRef;
 
 use super::cli::{DispatchBackend, DispatchMode};
-use super::dispatch_config::DispatchConfig;
+use super::dispatch_config_live::DispatchConfigHandle;
 use super::lexicon::DECISION_IGNORED;
 
 #[derive(Clone)]
@@ -19,7 +19,7 @@ pub(super) struct AppState {
     pub(super) reconcile_repo: RepoRef,
     pub(super) dispatch_mode: DispatchMode,
     pub(super) dispatch_backend: DispatchBackend,
-    pub(super) dispatch_config: Option<DispatchConfig>,
+    pub(super) dispatch_config: DispatchConfigHandle,
 }
 
 #[derive(Debug, Deserialize)]

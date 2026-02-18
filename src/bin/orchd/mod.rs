@@ -16,6 +16,9 @@ mod paths;
 // orchd dispatch configuration parsing/types. Read when changing prompt templates, roles, or directives.
 mod dispatch_config;
 
+// Live dispatch-config snapshot + hot-reload. Read when removing restart requirements or hardening durability.
+mod dispatch_config_live;
+
 // Reading material (DocPlan) config + render. Read when changing doc inclusion policy or prompt bloat controls.
 mod reading_material;
 

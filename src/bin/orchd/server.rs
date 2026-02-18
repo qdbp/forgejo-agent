@@ -21,7 +21,8 @@ use forgejo_agent::types::{IssueRef, OrchdRuntimeState, RepoRef, WorkflowState};
 use super::cli::{Cli, DispatchMode};
 use super::db;
 use super::dispatch;
-use super::dispatch_config::{DispatchTriggerGuardrailsConfig, load_dispatch_config};
+use super::dispatch_config::DispatchTriggerGuardrailsConfig;
+use super::dispatch_config_live::{DispatchConfigHandle, run_dispatch_config_reload_loop};
 use super::errors::runtime_state_for_dispatch_error;
 use super::inquisition::{InquisitionSpec, maybe_spawn_inquisition};
 use super::lexicon::{
@@ -62,8 +63,8 @@ pub(super) async fn run_server(cli: Cli) -> Result<()> {
         .context("startup identity guard task failed")??;
     let dispatch_config_path = resolve_dispatch_config_path(&cli.dispatch_config)?;
     let dispatch_config = match cli.dispatch_mode {
-        DispatchMode::DryRun => None,
-        DispatchMode::Exec => Some(load_dispatch_config(&dispatch_config_path)?),
+        DispatchMode::DryRun => DispatchConfigHandle::Disabled,
+        DispatchMode::Exec => DispatchConfigHandle::load(dispatch_config_path.clone())?,
     };
     if matches!(cli.dispatch_mode, DispatchMode::Exec) {
         if cli.skip_startup_role_check {
@@ -76,17 +77,18 @@ pub(super) async fn run_server(cli: Cli) -> Result<()> {
         } else {
             let startup_cfg = cfg.clone();
             let startup_dispatch = dispatch_config
-                .clone()
+                .snapshot()
                 .ok_or_else(|| anyhow!("dispatch config missing in exec mode"))?;
+            let roles_checked = startup_dispatch.roles.len();
             tokio::task::spawn_blocking(move || {
-                role::enforce_startup_role_check(&startup_dispatch, &startup_cfg)
+                role::enforce_startup_role_check(startup_dispatch.as_ref(), &startup_cfg)
             })
             .await
             .context("startup role check task failed")??;
             log_line(
                 "startup_role_check_passed",
                 json!({
-                    "roles_checked": dispatch_config.as_ref().map_or(0, |cfg| cfg.roles.len()),
+                    "roles_checked": roles_checked,
                 }),
             );
         }
@@ -137,6 +139,13 @@ pub(super) async fn run_server(cli: Cli) -> Result<()> {
         run_heartbeat_loop(heartbeat_state, cli.heartbeat_sec).await;
     });
 
+    if matches!(state.dispatch_mode, DispatchMode::Exec) {
+        let reload_handle = state.dispatch_config.clone();
+        tokio::spawn(async move {
+            run_dispatch_config_reload_loop(reload_handle, cli.dispatch_config_reload_sec).await;
+        });
+    }
+
     let reconcile_state = state.clone();
     tokio::spawn(async move {
         run_reconcile_loop(reconcile_state, cli.reconcile_sec).await;
@@ -149,7 +158,7 @@ pub(super) async fn run_server(cli: Cli) -> Result<()> {
 
     if let Some(notifications) = state
         .dispatch_config
-        .as_ref()
+        .snapshot()
         .map(|cfg| cfg.notifications.clone())
         && notifications.enabled
     {
@@ -386,7 +395,7 @@ fn apply_trigger_guardrails(
 
     let guardrails = state
         .dispatch_config
-        .as_ref()
+        .snapshot()
         .map(|config| config.trigger_guardrails.clone())
         .unwrap_or_else(default_trigger_guardrails);
     let lookback = TimeDelta::seconds(i64::try_from(guardrails.window_sec).unwrap_or(i64::MAX));
@@ -482,12 +491,12 @@ async fn process_webhook(
     };
     let _ = db::upsert_repo_seen(&state.db_path, &record.repo_full_name);
 
+    let dispatch_config = state.dispatch_config.snapshot();
     let mut decision = decide(
         &event_type,
         record.action.as_deref(),
         context.as_ref(),
-        state
-            .dispatch_config
+        dispatch_config
             .as_ref()
             .map(|config| config.triggers.as_slice()),
     );

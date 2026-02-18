@@ -24,7 +24,7 @@ pub(super) fn dispatch_comment_identity(
     state: &AppState,
     decision: &DecisionRecord,
 ) -> Option<CommentIdentity> {
-    let dispatch_config = state.dispatch_config.as_ref()?;
+    let dispatch_config = state.dispatch_config.snapshot()?;
     let token_file = if let Some(control_plane) = dispatch_config.control_plane.as_ref() {
         control_plane.token_file.clone()
     } else {

@@ -1160,12 +1160,12 @@ pub(super) async fn dispatch_issue(
     let _entered = span.enter();
     let dispatch_config = state
         .dispatch_config
-        .as_ref()
+        .snapshot()
         .ok_or(DispatchError::ConfigNotLoaded)?;
     let phase_plan_start = Instant::now();
     let plan = match plan_dispatch(
         &state,
-        dispatch_config,
+        dispatch_config.as_ref(),
         decision_id,
         current_event_id,
         record,
@@ -1192,7 +1192,7 @@ pub(super) async fn dispatch_issue(
     };
 
     let phase_materialize_start = Instant::now();
-    let artifacts = match materialize_run_artifacts(&state, dispatch_config, &plan) {
+    let artifacts = match materialize_run_artifacts(&state, dispatch_config.as_ref(), &plan) {
         Ok(artifacts) => {
             record_phase_latency_ms(
                 "materialize",
@@ -1213,7 +1213,8 @@ pub(super) async fn dispatch_issue(
     };
 
     let phase_launch_start = Instant::now();
-    let launch_result = launch_dispatch_backend(&state, dispatch_config, &plan, &artifacts);
+    let launch_result =
+        launch_dispatch_backend(&state, dispatch_config.as_ref(), &plan, &artifacts);
     let run_handle = match launch_result {
         Ok(handle) => handle,
         Err(err) => {

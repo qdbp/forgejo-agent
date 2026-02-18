@@ -1148,10 +1148,18 @@ pub(super) fn legacy_trigger_pack() -> Vec<DispatchTriggerConfig> {
 }
 
 pub(super) fn load_dispatch_config(path: &Path) -> Result<DispatchConfig> {
-    let raw_text = fs::read_to_string(path)
-        .with_context(|| format!("failed to read dispatch config: {}", path.display()))?;
+    let raw_text = read_dispatch_config_text(path)?;
+    load_dispatch_config_from_str(path, raw_text.as_str())
+}
+
+pub(super) fn read_dispatch_config_text(path: &Path) -> Result<String> {
+    fs::read_to_string(path)
+        .with_context(|| format!("failed to read dispatch config: {}", path.display()))
+}
+
+pub(super) fn load_dispatch_config_from_str(path: &Path, raw_text: &str) -> Result<DispatchConfig> {
     let raw: DispatchConfigFile =
-        toml::from_str(&raw_text).with_context(|| format!("invalid TOML: {}", path.display()))?;
+        toml::from_str(raw_text).with_context(|| format!("invalid TOML: {}", path.display()))?;
 
     if raw.version != 1 {
         return Err(anyhow!(

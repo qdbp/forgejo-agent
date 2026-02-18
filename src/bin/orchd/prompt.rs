@@ -8,6 +8,7 @@ use forgejo_agent::config::AgentConfig;
 use super::cli::{Cli, PromptMode, PromptPreviewArgs};
 use super::dispatch::render_fresh_preamble;
 use super::dispatch_config::load_dispatch_config;
+use super::dispatch_config_live::DispatchConfigHandle;
 use super::paths::{expand_tilde_path, resolve_dispatch_config_path};
 use super::reading_material;
 use super::repo;
@@ -46,7 +47,7 @@ pub(super) fn prompt_preview_command(cli: &Cli, args: PromptPreviewArgs) -> Resu
         reconcile_repo,
         dispatch_mode: cli.dispatch_mode,
         dispatch_backend: cli.dispatch_backend,
-        dispatch_config: None,
+        dispatch_config: DispatchConfigHandle::Disabled,
     };
 
     let repo_full_name = args.issue_ref.repo.to_string();
