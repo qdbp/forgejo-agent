@@ -104,6 +104,7 @@ pub(super) struct EventContext {
 pub(super) struct ParsedDirective {
     pub(super) role: String,
     pub(super) directive: String,
+    pub(super) profile: Option<String>,
 }
 
 #[derive(Debug, Clone)]

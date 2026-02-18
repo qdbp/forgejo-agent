@@ -107,6 +107,7 @@ pub(super) struct DispatchExecSpecV1 {
     pub(super) git_branch: String,
     pub(super) codex_bin: PathBuf,
     pub(super) codex_role_arg: String,
+    pub(super) codex_profile: Option<String>,
     pub(super) issue_session_id: Option<CodexSessionId>,
     pub(super) directive: String,
     pub(super) role_name: String,
@@ -257,6 +258,13 @@ fn run_codex_once(spec: &DispatchExecSpecV1, mode: CodexRunMode<'_>) -> Result<i
     cmd.arg(spec.timeout_sec.to_string())
         .arg(&spec.codex_bin)
         .arg(&spec.codex_role_arg)
+        .args(
+            spec.codex_profile
+                .as_deref()
+                .map(|profile| ["--profile", profile])
+                .into_iter()
+                .flatten(),
+        )
         .arg("--sandbox")
         .arg(spec.codex_sandbox.as_str())
         .arg("--cd")

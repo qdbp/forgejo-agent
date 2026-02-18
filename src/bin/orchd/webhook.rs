@@ -365,7 +365,8 @@ pub(super) fn parse_directive(text: &str) -> Option<ParsedDirective> {
 fn parse_directive_line(line: &str) -> Option<ParsedDirective> {
     // Commands must start at the beginning of a line (no leading whitespace). We support two
     // syntaxes:
-    // 1) `@codex-<role> <directive>` optionally followed by `,.;:` and then additional text.
+    // 1) `@codex-<role> [/<codex_profile>] <directive>` optionally followed by `,.;:` and then
+    //    additional text.
     //    If additional text is present, the directive token must be suffixed with one of `,.;:`
     //    to avoid accidental parsing of normal prose.
     // 2) `cc @codex-<role>` as an alias for `reply` (optionally followed by more text).
@@ -405,6 +406,7 @@ fn parse_directive_line(line: &str) -> Option<ParsedDirective> {
         return Some(ParsedDirective {
             role,
             directive: "reply".to_string(),
+            profile: None,
         });
     }
 
@@ -414,10 +416,26 @@ fn parse_directive_line(line: &str) -> Option<ParsedDirective> {
 
     let mut parts = line.split_whitespace();
     let role_token = parts.next()?;
-    let directive_token = parts.next()?;
+    let token2 = parts.next()?;
+    let (profile, directive_token) = if let Some(raw_profile) = token2.strip_prefix('/') {
+        let profile = (!raw_profile.is_empty()
+            && raw_profile
+                .bytes()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, b'_' | b'-')))
+        .then(|| raw_profile.to_string());
+        let directive_token = parts.next()?;
+        (profile, directive_token)
+    } else {
+        (None, token2)
+    };
     let has_tail = parts.next().is_some();
 
-    if role_token.contains(['\'', '"']) || directive_token.contains(['\'', '"']) {
+    if role_token.contains(['\'', '"'])
+        || directive_token.contains(['\'', '"'])
+        || profile
+            .as_deref()
+            .is_some_and(|value| value.contains(['\'', '"']))
+    {
         return None;
     }
 
@@ -456,7 +474,11 @@ fn parse_directive_line(line: &str) -> Option<ParsedDirective> {
         return None;
     }
 
-    Some(ParsedDirective { role, directive })
+    Some(ParsedDirective {
+        role,
+        directive,
+        profile,
+    })
 }
 
 pub(super) fn extract_header(headers: &HeaderMap, names: &[&str]) -> Option<String> {
@@ -546,6 +568,7 @@ mod tests {
         let parsed = parse_directive("@codex poke").expect("directive should parse");
         assert_eq!(parsed.role, "codex-orch");
         assert_eq!(parsed.directive, DIRECTIVE_REPLY);
+        assert_eq!(parsed.profile.as_deref(), None);
     }
 
     #[test]
@@ -554,6 +577,7 @@ mod tests {
             .expect("directive with punctuation should parse");
         assert_eq!(parsed.role, "codex-orch");
         assert_eq!(parsed.directive, DIRECTIVE_REPLY);
+        assert_eq!(parsed.profile.as_deref(), None);
     }
 
     #[test]
@@ -562,11 +586,34 @@ mod tests {
     }
 
     #[test]
+    fn directive_with_profile_parses() {
+        let parsed = parse_directive("@codex-orch /opus45 impl").expect("profile directive parses");
+        assert_eq!(parsed.role, "codex-orch");
+        assert_eq!(parsed.directive, "impl");
+        assert_eq!(parsed.profile.as_deref(), Some("opus45"));
+    }
+
+    #[test]
+    fn directive_with_profile_and_tail_requires_punct() {
+        assert!(parse_directive("@codex-orch /opus45 impl please").is_none());
+    }
+
+    #[test]
+    fn directive_with_profile_and_tail_allows_punct() {
+        let parsed = parse_directive("@codex-orch /opus45 impl: please")
+            .expect("profile directive parses with punctuation");
+        assert_eq!(parsed.role, "codex-orch");
+        assert_eq!(parsed.directive, "impl");
+        assert_eq!(parsed.profile.as_deref(), Some("opus45"));
+    }
+
+    #[test]
     fn cc_alias_maps_to_reply() {
         let parsed =
             parse_directive("cc @codex-orch please review").expect("cc alias should parse");
         assert_eq!(parsed.role, "codex-orch");
         assert_eq!(parsed.directive, DIRECTIVE_REPLY);
+        assert_eq!(parsed.profile.as_deref(), None);
     }
 
     #[test]

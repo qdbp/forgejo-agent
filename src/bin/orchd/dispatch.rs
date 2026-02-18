@@ -26,6 +26,7 @@ use super::dispatch_config::{
 use super::errors::DispatchError;
 use super::forgejoctl_cmd;
 use super::lexicon;
+use super::paths::expand_tilde_path;
 use super::reading_material;
 use super::repo;
 use super::run_dispatch::{
@@ -34,6 +35,7 @@ use super::run_dispatch::{
 use super::state::{AppState, DecisionRecord, EventRecord};
 use super::telemetry::{log_line, record_phase_latency_ms};
 use super::template;
+use super::webhook;
 
 pub(super) const STARTING_DISPATCH_STALE_AFTER_SEC: i64 = 120;
 
@@ -100,6 +102,7 @@ struct DispatchPlan {
     event_type: String,
     directive: DispatchDirectiveConfig,
     role: DispatchRoleConfig,
+    codex_profile: Option<String>,
     workdir: PathBuf,
     principal_workdir: Option<PathBuf>,
     sidecar: Option<DispatchSidecarPlan>,
@@ -559,6 +562,47 @@ pub(super) fn heal_stale_inflight_dispatches(db_path: &Path) -> Result<usize, Di
     Ok(healed)
 }
 
+fn codex_config_has_profile(profile: &str) -> bool {
+    let profile = profile.trim();
+    if profile.is_empty() {
+        return false;
+    }
+    let Ok(config_path) = expand_tilde_path("~/.codex/config.toml") else {
+        return false;
+    };
+    let Ok(raw) = fs::read_to_string(config_path) else {
+        return false;
+    };
+    let Ok(doc) = toml::from_str::<toml::Value>(&raw) else {
+        return false;
+    };
+    doc.get("profiles")
+        .and_then(|value| value.as_table())
+        .is_some_and(|profiles| profiles.contains_key(profile))
+}
+
+fn resolve_codex_profile_override(
+    actor: &str,
+    decision: &DecisionRecord,
+    record: &EventRecord,
+) -> Option<String> {
+    // Alternate model profiles are charged to the owner; only `main` may opt into them.
+    if actor != "main" {
+        return None;
+    }
+    // Only explicit directives may request profiles; registered/implicit triggers should remain
+    // profile-neutral to avoid surprising policy coupling.
+    if decision.reason_code != "explicit_directive" {
+        return None;
+    }
+    let requested = record
+        .event_text
+        .as_deref()
+        .and_then(webhook::parse_directive)
+        .and_then(|directive| directive.profile);
+    requested.filter(|profile| codex_config_has_profile(profile))
+}
+
 async fn plan_dispatch(
     state: &AppState,
     dispatch_config: &DispatchConfig,
@@ -624,6 +668,8 @@ async fn plan_dispatch(
             .assert_actor_can_dispatch(&actor, &role_name, directive_name)
             .map_err(|err| DispatchError::RankAclDenied(err.to_string()))?;
     }
+
+    let codex_profile = resolve_codex_profile_override(&actor, decision, record);
 
     let issue_number = record
         .issue_number
@@ -897,6 +943,7 @@ async fn plan_dispatch(
             event_type: record.event_type.clone(),
             directive,
             role,
+            codex_profile,
             workdir,
             principal_workdir,
             sidecar,
@@ -1055,6 +1102,7 @@ fn materialize_run_artifacts(
         git_branch: plan.git_branch.clone(),
         codex_bin: plan.role.codex_bin.clone(),
         codex_role_arg: plan.role.codex_role_arg.clone(),
+        codex_profile: plan.codex_profile.clone(),
         issue_session_id,
         directive: plan.intent.directive.clone(),
         role_name: plan.intent.role.clone(),
