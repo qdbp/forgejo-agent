@@ -15,8 +15,11 @@ use serde_json::json;
 
 use forgejo_agent::api::{ApiHttpError, ForgejoClient, MergePullMethod};
 use forgejo_agent::config::AgentConfig;
-use forgejo_agent::policy::STATE_LABEL_COLOR;
-use forgejo_agent::types::{ApiPullRequest, IssueRef, OrchdRuntimeState, RepoRef, WorkflowState};
+use forgejo_agent::policy::{DONE_REASON_LABELS, STATE_LABEL_COLOR, is_done_resolution_label};
+use forgejo_agent::types::{
+    ApiIssue, ApiLabel, ApiPullRequest, IssueRef, OpenState, OrchdRuntimeState, RepoRef,
+    WorkflowState,
+};
 
 use super::cli::{Cli, DispatchMode};
 use super::db;
@@ -42,6 +45,8 @@ use super::webhook::{
 const AUTOMERGE_BRANCH_PREFIXES: [&str; 2] = ["orchd/", "i/"];
 const AUTOMERGE_MAX_ATTEMPTS: u32 = 3;
 const AUTOMERGE_RETRY_SLEEP_SEC: u64 = 3;
+const ORCHD_CONTROL_HOLD_LABEL: &str = "orchd/control/hold";
+const DONE_FIXED_LABEL: &str = "done/fixed";
 
 #[derive(Debug, Default, Clone, Copy)]
 struct AutomergeSweepStats {
@@ -53,6 +58,17 @@ struct AutomergeSweepStats {
     skipped_not_mergeable: usize,
     skipped_transient: usize,
     errors: usize,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct ReconcileStats {
+    scanned_open: usize,
+    normalized_triage: usize,
+    workflow_parse_errors: usize,
+    auto_close_candidates: usize,
+    auto_close_skipped: usize,
+    auto_closed: usize,
+    auto_close_errors: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +93,67 @@ fn is_automerge_candidate_pr(pr: &ApiPullRequest) -> bool {
         return false;
     }
     is_automerge_candidate_branch(pr.head.ref_name.as_str())
+}
+
+fn issue_has_runtime_state(labels: &[ApiLabel], target: OrchdRuntimeState) -> bool {
+    labels
+        .iter()
+        .any(|label| OrchdRuntimeState::from_label(&label.name) == Some(target))
+}
+
+fn is_reconcile_autoclose_candidate(workflow: Option<WorkflowState>, labels: &[ApiLabel]) -> bool {
+    workflow == Some(WorkflowState::Done)
+        && issue_has_runtime_state(labels, OrchdRuntimeState::Completed)
+        && !labels
+            .iter()
+            .any(|label| label.name == ORCHD_CONTROL_HOLD_LABEL)
+}
+
+fn ensure_done_fixed_label_id(
+    api: &ForgejoClient,
+    cfg: &AgentConfig,
+    repo: &RepoRef,
+    cached_id: &mut Option<u64>,
+) -> Result<u64> {
+    if let Some(id) = *cached_id {
+        return Ok(id);
+    }
+    let (name, color, description, exclusive) = DONE_REASON_LABELS
+        .iter()
+        .find(|(name, ..)| *name == DONE_FIXED_LABEL)
+        .copied()
+        .unwrap_or((DONE_FIXED_LABEL, "1f883d", "closed as fixed", false));
+    let id = api
+        .ensure_label(cfg, repo, name, color, description, exclusive)?
+        .id;
+    *cached_id = Some(id);
+    Ok(id)
+}
+
+fn ensure_done_fixed_resolution(
+    api: &ForgejoClient,
+    cfg: &AgentConfig,
+    repo: &RepoRef,
+    issue: &ApiIssue,
+    issue_ref: &IssueRef,
+    done_fixed_label_id: &mut Option<u64>,
+) -> Result<()> {
+    let target_id = ensure_done_fixed_label_id(api, cfg, repo, done_fixed_label_id)?;
+    let mut has_target = false;
+    for label in &issue.labels {
+        if !is_done_resolution_label(&label.name) {
+            continue;
+        }
+        if label.name == DONE_FIXED_LABEL {
+            has_target = true;
+        } else {
+            api.remove_issue_label(cfg, issue_ref, label.id)?;
+        }
+    }
+    if !has_target {
+        api.add_issue_label_ids(cfg, issue_ref, vec![target_id])?;
+    }
+    Ok(())
 }
 
 fn refresh_open_pr_mergeable_state(
@@ -1194,24 +1271,43 @@ async fn reconcile_once(state: &AppState) -> Result<()> {
     let cfg = state.cfg.clone();
     let repo = state.reconcile_repo.clone();
 
-    let (scanned_open, normalized_triage) =
-        tokio::task::spawn_blocking(move || -> Result<(usize, usize)> {
-            let api = ForgejoClient::new(&cfg)?;
-            let issues = api.list_issues(&cfg, &repo, "open", 100)?;
-            let scanned_open = issues.len();
+    let reconcile_stats = tokio::task::spawn_blocking(move || -> Result<ReconcileStats> {
+        let api = ForgejoClient::new(&cfg)?;
+        let issues = api.list_issues(&cfg, &repo, "open", 100)?;
+        let mut loop_stats = ReconcileStats {
+            scanned_open: issues.len(),
+            ..ReconcileStats::default()
+        };
 
-            // Keep open issues from being "stateless" for workflow operations:
-            // missing workflow label => default to triage.
-            let mut triage_id = None;
-            let mut normalized_triage = 0usize;
-            for issue in issues {
-                if issue.pull_request.is_some() {
+        // Keep open issues from being "stateless" for workflow operations:
+        // missing workflow label => default to triage.
+        let mut triage_id = None;
+        let mut done_fixed_label_id = None;
+        for issue in issues {
+            if issue.pull_request.is_some() {
+                continue;
+            }
+            let workflow = match issue.workflow_state() {
+                Ok(workflow) => workflow,
+                Err(err) => {
+                    loop_stats.workflow_parse_errors += 1;
+                    log_line(
+                        "reconcile_issue_workflow_parse_error",
+                        json!({
+                            "repo": repo.to_string(),
+                            "issue_number": issue.number,
+                            "error": err.to_string(),
+                        }),
+                    );
                     continue;
                 }
-                let Ok(None) = issue.workflow_state() else {
-                    continue;
-                };
+            };
 
+            let issue_ref = IssueRef {
+                repo: repo.clone(),
+                number: issue.number,
+            };
+            if workflow.is_none() {
                 let id = if let Some(id) = triage_id {
                     id
                 } else {
@@ -1225,19 +1321,56 @@ async fn reconcile_once(state: &AppState) -> Result<()> {
                     triage_id = Some(ensured.id);
                     ensured.id
                 };
-
-                let issue_ref = IssueRef {
-                    repo: repo.clone(),
-                    number: issue.number,
-                };
                 let _ = api.add_issue_label_ids(&cfg, &issue_ref, vec![id]);
-                normalized_triage += 1;
+                loop_stats.normalized_triage += 1;
+                continue;
             }
 
-            Ok((scanned_open, normalized_triage))
-        })
-        .await
-        .context("reconcile join failure")??;
+            if workflow != Some(WorkflowState::Done) {
+                continue;
+            }
+            loop_stats.auto_close_candidates += 1;
+            if !is_reconcile_autoclose_candidate(workflow, &issue.labels) {
+                loop_stats.auto_close_skipped += 1;
+                continue;
+            }
+
+            if let Err(err) = ensure_done_fixed_resolution(
+                &api,
+                &cfg,
+                &repo,
+                &issue,
+                &issue_ref,
+                &mut done_fixed_label_id,
+            )
+            .and_then(|()| api.set_issue_open_state(&cfg, &issue_ref, OpenState::Closed))
+            {
+                loop_stats.auto_close_errors += 1;
+                log_line(
+                    "reconcile_issue_auto_close_error",
+                    json!({
+                        "repo": repo.to_string(),
+                        "issue_number": issue.number,
+                        "error": err.to_string(),
+                    }),
+                );
+                continue;
+            }
+
+            loop_stats.auto_closed += 1;
+            log_line(
+                "reconcile_issue_auto_closed",
+                json!({
+                    "repo": repo.to_string(),
+                    "issue_number": issue.number,
+                }),
+            );
+        }
+
+        Ok(loop_stats)
+    })
+    .await
+    .context("reconcile join failure")??;
 
     let conn = db::open_db(&state.db_path)?;
     let now = Utc::now().to_rfc3339();
@@ -1249,7 +1382,7 @@ async fn reconcile_once(state: &AppState) -> Result<()> {
         params![
             now,
             state.reconcile_repo.to_string(),
-            i64::try_from(scanned_open)?
+            i64::try_from(reconcile_stats.scanned_open)?
         ],
     )?;
 
@@ -1257,8 +1390,13 @@ async fn reconcile_once(state: &AppState) -> Result<()> {
         "reconcile",
         json!({
             "repo": state.reconcile_repo.to_string(),
-            "scanned_open": scanned_open,
-            "normalized_triage": normalized_triage,
+            "scanned_open": reconcile_stats.scanned_open,
+            "normalized_triage": reconcile_stats.normalized_triage,
+            "workflow_parse_errors": reconcile_stats.workflow_parse_errors,
+            "auto_close_candidates": reconcile_stats.auto_close_candidates,
+            "auto_close_skipped": reconcile_stats.auto_close_skipped,
+            "auto_closed": reconcile_stats.auto_closed,
+            "auto_close_errors": reconcile_stats.auto_close_errors,
             "status": "ok",
         }),
     );
@@ -1267,8 +1405,11 @@ async fn reconcile_once(state: &AppState) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_automerge_candidate_branch, is_automerge_candidate_pr};
-    use forgejo_agent::types::{ApiPrBranchInfo, ApiPullRequest};
+    use super::{
+        ORCHD_CONTROL_HOLD_LABEL, is_automerge_candidate_branch, is_automerge_candidate_pr,
+        is_reconcile_autoclose_candidate,
+    };
+    use forgejo_agent::types::{ApiIssue, ApiLabel, ApiPrBranchInfo, ApiPullRequest, OpenState};
 
     fn sample_pr(branch: &str, state: &str, merged: bool) -> ApiPullRequest {
         ApiPullRequest {
@@ -1286,6 +1427,27 @@ mod tests {
                 ref_name: "main".to_string(),
                 sha: "def456".to_string(),
             },
+        }
+    }
+
+    fn issue_with_labels(label_names: &[&str]) -> ApiIssue {
+        ApiIssue {
+            number: 7,
+            state: OpenState::Open,
+            title: "issue".to_string(),
+            body: None,
+            html_url: "http://127.0.0.1:3000/main/r/issues/7".to_string(),
+            labels: label_names
+                .iter()
+                .enumerate()
+                .map(|(idx, label_name)| ApiLabel {
+                    id: u64::try_from(idx + 1).expect("label index should fit into u64"),
+                    name: (*label_name).to_string(),
+                })
+                .collect(),
+            assignees: Vec::new(),
+            pull_request: None,
+            repository: None,
         }
     }
 
@@ -1321,5 +1483,37 @@ mod tests {
             "open",
             false
         )));
+    }
+
+    #[test]
+    fn reconcile_autoclose_requires_done_and_completed_runtime() {
+        let issue = issue_with_labels(&["state/done", "orchd/state/completed"]);
+        let workflow = issue.workflow_state().expect("workflow should parse");
+        assert!(is_reconcile_autoclose_candidate(workflow, &issue.labels));
+
+        let issue = issue_with_labels(&["state/review", "orchd/state/completed"]);
+        let workflow = issue.workflow_state().expect("workflow should parse");
+        assert!(!is_reconcile_autoclose_candidate(workflow, &issue.labels));
+
+        let issue = issue_with_labels(&["state/done", "orchd/state/running"]);
+        let workflow = issue.workflow_state().expect("workflow should parse");
+        assert!(!is_reconcile_autoclose_candidate(workflow, &issue.labels));
+    }
+
+    #[test]
+    fn reconcile_autoclose_respects_hold_label() {
+        let issue = issue_with_labels(&[
+            "state/done",
+            "orchd/state/completed",
+            ORCHD_CONTROL_HOLD_LABEL,
+        ]);
+        let workflow = issue.workflow_state().expect("workflow should parse");
+        assert!(!is_reconcile_autoclose_candidate(workflow, &issue.labels));
+    }
+
+    #[test]
+    fn workflow_state_rejects_multiple_state_labels() {
+        let issue = issue_with_labels(&["state/done", "state/review", "orchd/state/completed"]);
+        assert!(issue.workflow_state().is_err());
     }
 }

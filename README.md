@@ -165,6 +165,7 @@ Core behavior:
 - sqlite event/decision/dispatch persistence
 - runtime dispatch status projected to `orchd/state/*` labels (`queued|running|blocked|failed|completed`)
 - successful `impl` completion transitions the issue workflow to `state/done` (dispatch failures do not force `state/blocked`)
+- reconcile auto-closes only when the issue is `state/done` and `orchd/state/completed`; `state/review` stays open for explicit human verification
 - one active dispatch per issue (duplicates blocked while running)
 - queue scheduling uses a per-issue FIFO head (`MIN(decision.id)` among pending), with same-actor + same-directive + same-target-role pending entries coalesced to the latest
 - impl remains repo-serialized by the dispatch gate, so a blocked impl head holds that issue queue until the repo lane clears
