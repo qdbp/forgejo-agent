@@ -14,7 +14,7 @@ use forgejo_agent::orchd_dispatch_core::{
 };
 
 use super::lexicon::{
-    DIRECTIVE_IMPL, EVENT_ISSUE_COMMENT, EVENT_ISSUES, directive_serializes_repo,
+    DECISION_IGNORED, EVENT_ISSUE_COMMENT, EVENT_ISSUES, directive_serializes_repo,
 };
 use super::migrations;
 use super::state::{DecisionRecord, EventRecord, IssueEventDeltaRow};
@@ -1273,35 +1273,6 @@ pub(super) fn list_issue_resume_dispatches(
     Ok(rows)
 }
 
-pub(super) fn latest_repo_inflight_impl_dispatch_id(
-    db_path: &Path,
-    repo_full_name: &str,
-) -> Result<Option<i64>> {
-    let conn = open_db(db_path)?;
-    let starting_status = DispatchState::Starting.as_db_str();
-    let running_status = DispatchState::Running.as_db_str();
-    conn.query_row(
-        r"
-        SELECT id
-        FROM dispatches
-        WHERE repo_full_name = ?1
-          AND directive = ?2
-          AND status IN (?3, ?4)
-        ORDER BY id DESC
-        LIMIT 1
-        ",
-        params![
-            repo_full_name,
-            DIRECTIVE_IMPL,
-            starting_status,
-            running_status
-        ],
-        |row| row.get::<_, i64>(0),
-    )
-    .optional()
-    .map_err(Into::into)
-}
-
 pub(super) fn mark_dispatch_failed_runtime(
     db_path: &Path,
     dispatch_id: i64,
@@ -1381,18 +1352,51 @@ pub(super) fn latest_issue_role_codex_session_id(
     Ok(session_id)
 }
 
-pub(super) fn queued_impl_decisions(db_path: &Path, limit: u32) -> Result<Vec<QueuedDecision>> {
+pub(super) fn queued_issue_head_decisions(
+    db_path: &Path,
+    limit: u32,
+) -> Result<Vec<QueuedDecision>> {
     let conn = open_db(db_path)?;
     let mut stmt = conn.prepare(
         r"
-        WITH latest AS (
-            SELECT repo_full_name, issue_number, target_role, MAX(id) AS decision_id
-            FROM decisions
-            WHERE would_dispatch = 1
-              AND directive = ?1
+        WITH pending AS (
+            SELECT
+                d.id,
+                d.event_id,
+                d.repo_full_name,
+                d.issue_number,
+                d.actor_login,
+                d.directive,
+                d.target_role,
+                d.decision,
+                d.reason_code,
+                d.principal_login,
+                d.would_dispatch
+            FROM decisions d
+            WHERE d.would_dispatch = 1
               AND issue_number IS NOT NULL
+              AND directive IS NOT NULL
               AND target_role IS NOT NULL
-            GROUP BY repo_full_name, issue_number, target_role
+              AND NOT EXISTS (SELECT 1 FROM dispatches x WHERE x.decision_id = d.id)
+        ),
+        deduped AS (
+            SELECT p.*
+            FROM pending p
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM pending newer
+                WHERE newer.repo_full_name = p.repo_full_name
+                  AND newer.issue_number = p.issue_number
+                  AND COALESCE(newer.actor_login, '') = COALESCE(p.actor_login, '')
+                  AND lower(newer.directive) = lower(p.directive)
+                  AND lower(newer.target_role) = lower(p.target_role)
+                  AND newer.id > p.id
+            )
+        ),
+        heads AS (
+            SELECT repo_full_name, issue_number, MIN(id) AS decision_id
+            FROM deduped
+            GROUP BY repo_full_name, issue_number
         )
         SELECT
             d.id,
@@ -1413,16 +1417,15 @@ pub(super) fn queued_impl_decisions(db_path: &Path, limit: u32) -> Result<Vec<Qu
             d.target_role,
             d.principal_login,
             d.would_dispatch
-        FROM latest l
-        JOIN decisions d ON d.id = l.decision_id
+        FROM heads h
+        JOIN deduped d ON d.id = h.decision_id
         JOIN events e ON e.id = d.event_id
-        WHERE NOT EXISTS (SELECT 1 FROM dispatches x WHERE x.decision_id = d.id)
         ORDER BY d.id ASC
-        LIMIT ?2
+        LIMIT ?1
         ",
     )?;
     let rows = stmt
-        .query_map(params![DIRECTIVE_IMPL, i64::from(limit)], |row| {
+        .query_map(params![i64::from(limit)], |row| {
             let decision_id: i64 = row.get(0)?;
             let event_id: i64 = row.get(1)?;
             let record = EventRecord {
@@ -1463,6 +1466,37 @@ pub(super) fn queued_impl_decisions(db_path: &Path, limit: u32) -> Result<Vec<Qu
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+pub(super) fn purge_pending_issue_decisions(
+    db_path: &Path,
+    repo_full_name: &str,
+    issue_number: u64,
+    reason_code: &str,
+) -> Result<usize> {
+    let conn = open_db(db_path)?;
+    let rows = conn.execute(
+        r"
+        UPDATE decisions
+        SET decision = ?4,
+            reason_code = ?3,
+            would_dispatch = 0,
+            directive = NULL,
+            target_role = NULL,
+            principal_login = NULL
+        WHERE repo_full_name = ?1
+          AND issue_number = ?2
+          AND would_dispatch = 1
+          AND NOT EXISTS (SELECT 1 FROM dispatches x WHERE x.decision_id = decisions.id)
+        ",
+        params![
+            repo_full_name,
+            i64::try_from(issue_number)?,
+            reason_code,
+            DECISION_IGNORED,
+        ],
+    )?;
     Ok(rows)
 }
 
@@ -1712,7 +1746,8 @@ mod tests {
     use rusqlite::params;
 
     use crate::orchd::lexicon::{
-        DECISION_ACCEPTED, DIRECTIVE_IMPL, DIRECTIVE_REPLY, EVENT_ISSUE_COMMENT, EVENT_ISSUES,
+        DECISION_ACCEPTED, DECISION_IGNORED, DIRECTIVE_IMPL, DIRECTIVE_REPLY, EVENT_ISSUE_COMMENT,
+        EVENT_ISSUES,
     };
 
     fn temp_db_path(label: &str) -> PathBuf {
@@ -1822,6 +1857,60 @@ mod tests {
             ],
         )
         .expect("insert decision");
+        conn.last_insert_rowid()
+    }
+
+    fn insert_dispatchable_decision(
+        db_path: &Path,
+        repo_full_name: &str,
+        issue_number: u64,
+        actor_login: &str,
+        directive: &str,
+        target_role: &str,
+    ) -> i64 {
+        let conn = super::open_db(db_path).expect("open db");
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            r"
+            INSERT INTO events (delivery_id, event_type, repo_full_name, issue_number, action, actor_login, raw_json, received_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            ",
+            params![
+                format!(
+                    "queue-delivery-{}",
+                    Utc::now().timestamp_nanos_opt().unwrap_or_default()
+                ),
+                EVENT_ISSUE_COMMENT,
+                repo_full_name,
+                i64::try_from(issue_number).expect("issue number fits i64"),
+                "created",
+                actor_login,
+                "{}",
+                now
+            ],
+        )
+        .expect("insert queue event");
+        let event_id = conn.last_insert_rowid();
+        conn.execute(
+            r"
+            INSERT INTO decisions
+            (event_id, repo_full_name, issue_number, actor_login, directive, target_role, decision, reason_code, would_dispatch, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            ",
+            params![
+                event_id,
+                repo_full_name,
+                i64::try_from(issue_number).expect("issue number fits i64"),
+                actor_login,
+                directive,
+                target_role,
+                DECISION_ACCEPTED,
+                "explicit_directive",
+                1_i64,
+                Utc::now().to_rfc3339(),
+            ],
+        )
+        .expect("insert queue decision");
         conn.last_insert_rowid()
     }
 
@@ -2007,6 +2096,225 @@ mod tests {
                 panic!("expected issue-level inflight, not repo-level inflight")
             }
         }
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn queued_issue_head_decisions_are_fifo_per_issue() {
+        let db_path = temp_db_path("queue-head-fifo");
+        super::init_db(&db_path).expect("db init");
+
+        let first_issue_first = insert_dispatchable_decision(
+            &db_path,
+            "main/orchd-debug",
+            71,
+            "main",
+            DIRECTIVE_REPLY,
+            "codex-orch",
+        );
+        let _first_issue_second = insert_dispatchable_decision(
+            &db_path,
+            "main/orchd-debug",
+            71,
+            "main",
+            DIRECTIVE_IMPL,
+            "codex-dev",
+        );
+        let second_issue_first = insert_dispatchable_decision(
+            &db_path,
+            "main/orchd-debug",
+            72,
+            "main",
+            DIRECTIVE_REPLY,
+            "codex-orch",
+        );
+
+        let queued = super::queued_issue_head_decisions(&db_path, 10).expect("queued heads");
+        let ids = queued
+            .into_iter()
+            .map(|row| row.decision_id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![first_issue_first, second_issue_first]);
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn queued_issue_head_decisions_dedupe_same_actor_directive_role_to_latest() {
+        let db_path = temp_db_path("queue-head-dedupe");
+        super::init_db(&db_path).expect("db init");
+
+        let older = insert_dispatchable_decision(
+            &db_path,
+            "main/orchd-debug",
+            81,
+            "main",
+            DIRECTIVE_REPLY,
+            "codex-orch",
+        );
+        let latest = insert_dispatchable_decision(
+            &db_path,
+            "main/orchd-debug",
+            81,
+            "main",
+            DIRECTIVE_REPLY,
+            "codex-orch",
+        );
+        let _different_role = insert_dispatchable_decision(
+            &db_path,
+            "main/orchd-debug",
+            81,
+            "main",
+            DIRECTIVE_REPLY,
+            "codex-lead",
+        );
+
+        let queued = super::queued_issue_head_decisions(&db_path, 10).expect("queued heads");
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].decision_id, latest);
+        assert_ne!(queued[0].decision_id, older);
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn queued_issue_head_decisions_skip_already_dispatched_decisions() {
+        let db_path = temp_db_path("queue-head-dispatched");
+        super::init_db(&db_path).expect("db init");
+
+        let dispatched = insert_dispatchable_decision(
+            &db_path,
+            "main/orchd-debug",
+            91,
+            "main",
+            DIRECTIVE_REPLY,
+            "codex-orch",
+        );
+        let remaining = insert_dispatchable_decision(
+            &db_path,
+            "main/orchd-debug",
+            91,
+            "main",
+            DIRECTIVE_IMPL,
+            "codex-dev",
+        );
+        insert_dispatch_row(
+            &db_path,
+            dispatched,
+            91,
+            DispatchState::Completed,
+            "codex-orch",
+            Some("session-a"),
+        );
+
+        let queued = super::queued_issue_head_decisions(&db_path, 10).expect("queued heads");
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].decision_id, remaining);
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn purge_pending_issue_decisions_clears_only_issue_pending_rows() {
+        let db_path = temp_db_path("queue-purge-poison");
+        super::init_db(&db_path).expect("db init");
+
+        let issue_a_first = insert_dispatchable_decision(
+            &db_path,
+            "main/orchd-debug",
+            101,
+            "main",
+            DIRECTIVE_REPLY,
+            "codex-orch",
+        );
+        let _issue_a_second = insert_dispatchable_decision(
+            &db_path,
+            "main/orchd-debug",
+            101,
+            "main",
+            DIRECTIVE_IMPL,
+            "codex-dev",
+        );
+        let _issue_b = insert_dispatchable_decision(
+            &db_path,
+            "main/orchd-debug",
+            102,
+            "main",
+            DIRECTIVE_REPLY,
+            "codex-orch",
+        );
+        insert_dispatch_row(
+            &db_path,
+            issue_a_first,
+            101,
+            DispatchState::Completed,
+            "codex-orch",
+            Some("session-b"),
+        );
+
+        let purged = super::purge_pending_issue_decisions(
+            &db_path,
+            "main/orchd-debug",
+            101,
+            "queue_poisoned_head",
+        )
+        .expect("purge queue");
+        assert_eq!(purged, 1);
+
+        let conn = super::open_db(&db_path).expect("open db");
+        let pending_for_101: i64 = conn
+            .query_row(
+                r"
+                SELECT COUNT(*)
+                FROM decisions
+                WHERE repo_full_name = ?1
+                  AND issue_number = ?2
+                  AND would_dispatch = 1
+                  AND NOT EXISTS (SELECT 1 FROM dispatches x WHERE x.decision_id = decisions.id)
+                ",
+                params!["main/orchd-debug", 101_i64],
+                |row| row.get(0),
+            )
+            .expect("query issue a pending");
+        assert_eq!(pending_for_101, 0);
+
+        let pending_for_102: i64 = conn
+            .query_row(
+                r"
+                SELECT COUNT(*)
+                FROM decisions
+                WHERE repo_full_name = ?1
+                  AND issue_number = ?2
+                  AND would_dispatch = 1
+                  AND NOT EXISTS (SELECT 1 FROM dispatches x WHERE x.decision_id = decisions.id)
+                ",
+                params!["main/orchd-debug", 102_i64],
+                |row| row.get(0),
+            )
+            .expect("query issue b pending");
+        assert_eq!(pending_for_102, 1);
+
+        let ignored_rows: i64 = conn
+            .query_row(
+                r"
+                SELECT COUNT(*)
+                FROM decisions
+                WHERE repo_full_name = ?1
+                  AND issue_number = ?2
+                  AND decision = ?3
+                  AND reason_code = ?4
+                ",
+                params![
+                    "main/orchd-debug",
+                    101_i64,
+                    DECISION_IGNORED,
+                    "queue_poisoned_head"
+                ],
+                |row| row.get(0),
+            )
+            .expect("query ignored rows");
+        assert_eq!(ignored_rows, 1);
 
         let _ = fs::remove_file(db_path);
     }

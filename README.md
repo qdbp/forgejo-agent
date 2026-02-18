@@ -166,6 +166,8 @@ Core behavior:
 - runtime dispatch status projected to `orchd/state/*` labels (`queued|running|blocked|failed|completed`)
 - successful `impl` completion transitions the issue workflow to `state/done` (dispatch failures do not force `state/blocked`)
 - one active dispatch per issue (duplicates blocked while running)
+- queue scheduling uses a per-issue FIFO head (`MIN(decision.id)` among pending), with same-actor + same-directive + same-target-role pending entries coalesced to the latest
+- impl remains repo-serialized by the dispatch gate, so a blocked impl head holds that issue queue until the repo lane clears
 - issue+role-scoped codex session reuse (`codex exec resume`) from latest `codex_session_id`
 - periodic heartbeat + reconcile scan logs
 - postmortem issue session inspection/resume via `orchd issue sessions` and `orchd issue resume`

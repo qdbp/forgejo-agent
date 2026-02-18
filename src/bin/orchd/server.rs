@@ -23,11 +23,9 @@ use super::db;
 use super::dispatch;
 use super::dispatch_config::DispatchTriggerGuardrailsConfig;
 use super::dispatch_config_live::{DispatchConfigHandle, run_dispatch_config_reload_loop};
-use super::errors::runtime_state_for_dispatch_error;
+use super::errors::{DispatchError, runtime_state_for_dispatch_error};
 use super::inquisition::{InquisitionSpec, maybe_spawn_inquisition};
-use super::lexicon::{
-    DIRECTIVE_AUDIT, DIRECTIVE_AUDIT_FAILURE, DIRECTIVE_IMPL, EVENT_ISSUE_COMMENT, EVENT_ISSUES,
-};
+use super::lexicon::{DIRECTIVE_AUDIT, DIRECTIVE_AUDIT_FAILURE, EVENT_ISSUE_COMMENT, EVENT_ISSUES};
 use super::notifier;
 use super::paths::{expand_tilde_path, resolve_dispatch_config_path};
 use super::projection;
@@ -742,186 +740,155 @@ async fn process_webhook(
             match state.dispatch_mode {
                 DispatchMode::DryRun => {}
                 DispatchMode::Exec => {
-                    let defer_impl = match decision.directive.as_deref() {
-                        Some(DIRECTIVE_IMPL) => match db::latest_repo_inflight_impl_dispatch_id(
-                            &state.db_path,
-                            &record.repo_full_name,
-                        ) {
-                            Ok(Some(inflight)) => {
-                                log_line(
-                                    "dispatch_deferred_repo_busy",
-                                    json!({
-                                        "repo": record.repo_full_name,
-                                        "issue_number": issue_number,
-                                        "directive": DIRECTIVE_IMPL,
-                                        "inflight_dispatch_id": inflight,
-                                    }),
-                                );
-                                true
+                    match dispatch::dispatch_issue(
+                        state.clone(),
+                        decision_id,
+                        event_id,
+                        &record,
+                        &decision,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            if let Err(err) = projection::project_issue_runtime_state(
+                                state.clone(),
+                                &record.repo_full_name,
+                                issue_number,
+                                OrchdRuntimeState::Running,
+                                None,
+                                dispatch_identity.clone(),
+                            )
+                            .await
+                            {
+                                if status_error.is_none() {
+                                    status_error = Some(err.to_string());
+                                }
+                            } else {
+                                status_projected = true;
                             }
-                            Ok(None) => false,
-                            Err(err) => {
-                                status_error = Some(format!(
-                                    "failed checking repo inflight impl dispatch: {err}"
-                                ));
-                                false
-                            }
-                        },
-                        _ => false,
-                    };
-
-                    if !defer_impl {
-                        match dispatch::dispatch_issue(
-                            state.clone(),
-                            decision_id,
-                            event_id,
-                            &record,
-                            &decision,
-                        )
-                        .await
-                        {
-                            Ok(()) => {
-                                if let Err(err) = projection::project_issue_runtime_state(
-                                    state.clone(),
+                            if let Some(role_name) = decision.target_role.as_deref()
+                                && let Err(err) = db::upsert_issue_role_cursor_event_id(
+                                    &state.db_path,
                                     &record.repo_full_name,
                                     issue_number,
-                                    OrchdRuntimeState::Running,
-                                    None,
-                                    dispatch_identity.clone(),
+                                    role_name,
+                                    event_id,
                                 )
-                                .await
-                                {
-                                    if status_error.is_none() {
-                                        status_error = Some(err.to_string());
-                                    }
-                                } else {
+                                && status_error.is_none()
+                            {
+                                status_error = Some(format!(
+                                    "failed updating issue cursor for role {role_name}: {err}"
+                                ));
+                            }
+                        }
+                        Err(err) => {
+                            let runtime_state = runtime_state_for_dispatch_error(&err);
+                            let projection = projection::project_issue_runtime_state(
+                                state.clone(),
+                                &record.repo_full_name,
+                                issue_number,
+                                runtime_state,
+                                Some(err.reason_code()),
+                                dispatch_identity.clone(),
+                            )
+                            .await;
+                            match projection {
+                                Ok(()) => {
                                     status_projected = true;
                                 }
-                                if let Some(role_name) = decision.target_role.as_deref()
-                                    && let Err(err) = db::upsert_issue_role_cursor_event_id(
-                                        &state.db_path,
-                                        &record.repo_full_name,
-                                        issue_number,
-                                        role_name,
-                                        event_id,
-                                    )
-                                    && status_error.is_none()
-                                {
-                                    status_error = Some(format!(
-                                        "failed updating issue cursor for role {role_name}: {err}"
-                                    ));
+                                Err(projection_err) => {
+                                    if status_error.is_none() {
+                                        status_error = Some(projection_err.to_string());
+                                    }
                                 }
                             }
-                            Err(err) => {
-                                let runtime_state = runtime_state_for_dispatch_error(&err);
-                                let projection = projection::project_issue_runtime_state(
-                                    state.clone(),
-                                    &record.repo_full_name,
-                                    issue_number,
-                                    runtime_state,
-                                    Some(err.reason_code()),
-                                    dispatch_identity.clone(),
-                                )
+
+                            if runtime_state == OrchdRuntimeState::Failed
+                                && decision.target_role.as_deref() != Some("codex-audit")
+                                && decision.directive.as_deref() != Some(DIRECTIVE_AUDIT)
+                                && decision.directive.as_deref() != Some(DIRECTIVE_AUDIT_FAILURE)
+                                && let Some(identity) = dispatch_identity.clone()
+                            {
+                                let db_path = state.db_path.clone();
+                                let default_owner = state.cfg.default_repo.owner.clone();
+                                let repo_full_name = record.repo_full_name.clone();
+                                let repo_full_name_for_log = repo_full_name.clone();
+                                let directive = decision.directive.clone();
+                                let role_name = decision.target_role.clone();
+                                let reason_code = err.reason_code().to_string();
+                                let reason_code_for_log = reason_code.clone();
+                                let error_text = err.to_string();
+                                let spawn_outcome = tokio::task::spawn_blocking(move || {
+                                    let repo = RepoRef::parse(&repo_full_name)
+                                        .context("invalid repo_full_name")?;
+                                    let source_issue = IssueRef {
+                                        repo,
+                                        number: issue_number,
+                                    };
+                                    let dispatch_id = db::latest_issue_dispatch_id(
+                                        &db_path,
+                                        &repo_full_name,
+                                        issue_number,
+                                    )
+                                    .ok()
+                                    .flatten();
+                                    let run_dir = dispatch_id.and_then(|dispatch_id| {
+                                        db_path.parent().map(|parent| {
+                                            parent
+                                                .join("dispatch-runs")
+                                                .join(format!("dispatch-{dispatch_id}"))
+                                                .to_string_lossy()
+                                                .into_owned()
+                                        })
+                                    });
+                                    let spec = InquisitionSpec {
+                                        source_issue,
+                                        source_issue_title: None,
+                                        source_issue_url: None,
+                                        dispatch_id,
+                                        directive,
+                                        role_name,
+                                        reason_code,
+                                        exit_code: None,
+                                        run_dir,
+                                        log_file: None,
+                                        completion_file: None,
+                                        error_text: Some(error_text),
+                                    };
+                                    maybe_spawn_inquisition(
+                                        &db_path,
+                                        &default_owner,
+                                        &identity,
+                                        spec,
+                                    )
+                                })
                                 .await;
-                                match projection {
-                                    Ok(()) => {
-                                        status_projected = true;
-                                    }
-                                    Err(projection_err) => {
-                                        if status_error.is_none() {
-                                            status_error = Some(projection_err.to_string());
-                                        }
-                                    }
+                                match spawn_outcome {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(err)) => log_line(
+                                        "inquisition_spawn_failed",
+                                        json!({
+                                            "repo": repo_full_name_for_log,
+                                            "issue_number": issue_number,
+                                            "reason_code": reason_code_for_log,
+                                            "error": err.to_string(),
+                                        }),
+                                    ),
+                                    Err(err) => log_line(
+                                        "inquisition_spawn_join_failed",
+                                        json!({
+                                            "repo": repo_full_name_for_log,
+                                            "issue_number": issue_number,
+                                            "reason_code": reason_code_for_log,
+                                            "error": err.to_string(),
+                                        }),
+                                    ),
                                 }
+                            }
 
-                                if runtime_state == OrchdRuntimeState::Failed
-                                    && decision.target_role.as_deref() != Some("codex-audit")
-                                    && decision.directive.as_deref() != Some(DIRECTIVE_AUDIT)
-                                    && decision.directive.as_deref()
-                                        != Some(DIRECTIVE_AUDIT_FAILURE)
-                                    && let Some(identity) = dispatch_identity.clone()
-                                {
-                                    let db_path = state.db_path.clone();
-                                    let default_owner = state.cfg.default_repo.owner.clone();
-                                    let repo_full_name = record.repo_full_name.clone();
-                                    let repo_full_name_for_log = repo_full_name.clone();
-                                    let directive = decision.directive.clone();
-                                    let role_name = decision.target_role.clone();
-                                    let reason_code = err.reason_code().to_string();
-                                    let reason_code_for_log = reason_code.clone();
-                                    let error_text = err.to_string();
-                                    let spawn_outcome = tokio::task::spawn_blocking(move || {
-                                        let repo = RepoRef::parse(&repo_full_name)
-                                            .context("invalid repo_full_name")?;
-                                        let source_issue = IssueRef {
-                                            repo,
-                                            number: issue_number,
-                                        };
-                                        let dispatch_id = db::latest_issue_dispatch_id(
-                                            &db_path,
-                                            &repo_full_name,
-                                            issue_number,
-                                        )
-                                        .ok()
-                                        .flatten();
-                                        let run_dir = dispatch_id.and_then(|dispatch_id| {
-                                            db_path.parent().map(|parent| {
-                                                parent
-                                                    .join("dispatch-runs")
-                                                    .join(format!("dispatch-{dispatch_id}"))
-                                                    .to_string_lossy()
-                                                    .into_owned()
-                                            })
-                                        });
-                                        let spec = InquisitionSpec {
-                                            source_issue,
-                                            source_issue_title: None,
-                                            source_issue_url: None,
-                                            dispatch_id,
-                                            directive,
-                                            role_name,
-                                            reason_code,
-                                            exit_code: None,
-                                            run_dir,
-                                            log_file: None,
-                                            completion_file: None,
-                                            error_text: Some(error_text),
-                                        };
-                                        maybe_spawn_inquisition(
-                                            &db_path,
-                                            &default_owner,
-                                            &identity,
-                                            spec,
-                                        )
-                                    })
-                                    .await;
-                                    match spawn_outcome {
-                                        Ok(Ok(())) => {}
-                                        Ok(Err(err)) => log_line(
-                                            "inquisition_spawn_failed",
-                                            json!({
-                                                "repo": repo_full_name_for_log,
-                                                "issue_number": issue_number,
-                                                "reason_code": reason_code_for_log,
-                                                "error": err.to_string(),
-                                            }),
-                                        ),
-                                        Err(err) => log_line(
-                                            "inquisition_spawn_join_failed",
-                                            json!({
-                                                "repo": repo_full_name_for_log,
-                                                "issue_number": issue_number,
-                                                "reason_code": reason_code_for_log,
-                                                "error": err.to_string(),
-                                            }),
-                                        ),
-                                    }
-                                }
-
-                                if status_error.is_none() {
-                                    status_error =
-                                        Some(format!("dispatch {}: {}", err.reason_code(), err));
-                                }
+                            if status_error.is_none() {
+                                status_error =
+                                    Some(format!("dispatch {}: {}", err.reason_code(), err));
                             }
                         }
                     }
@@ -1003,23 +970,8 @@ async fn dispatch_queue_once(state: &AppState) -> Result<()> {
     if matches!(state.dispatch_mode, DispatchMode::DryRun) {
         return Ok(());
     }
-    let items = db::queued_impl_decisions(&state.db_path, 10)?;
+    let items = db::queued_issue_head_decisions(&state.db_path, 10)?;
     for item in items {
-        let repo_full_name = item.record.repo_full_name.clone();
-        if let Ok(Some(inflight)) =
-            db::latest_repo_inflight_impl_dispatch_id(&state.db_path, &repo_full_name)
-        {
-            log_line(
-                "dispatch_queue_repo_busy",
-                json!({
-                    "repo": repo_full_name,
-                    "decision_id": item.decision_id,
-                    "event_id": item.event_id,
-                    "inflight_dispatch_id": inflight,
-                }),
-            );
-            continue;
-        }
         let issue_number = item
             .record
             .issue_number
@@ -1055,8 +1007,78 @@ async fn dispatch_queue_once(state: &AppState) -> Result<()> {
                 }
             }
             Err(err) => {
+                if let DispatchError::IssueDispatchInFlight { dispatch_id, .. } = &err {
+                    log_line(
+                        "dispatch_queue_head_blocked",
+                        json!({
+                            "repo": item.record.repo_full_name,
+                            "issue_number": issue_number,
+                            "decision_id": item.decision_id,
+                            "event_id": item.event_id,
+                            "inflight_dispatch_id": dispatch_id,
+                            "reason_code": err.reason_code(),
+                        }),
+                    );
+                    continue;
+                }
+                let runtime_state = runtime_state_for_dispatch_error(&err);
+                if let Err(projection_err) = projection::project_issue_runtime_state(
+                    state.clone(),
+                    &item.record.repo_full_name,
+                    issue_number,
+                    runtime_state,
+                    Some(err.reason_code()),
+                    dispatch_identity.clone(),
+                )
+                .await
+                {
+                    log_line(
+                        "dispatch_queue_projection_failed",
+                        json!({
+                            "repo": item.record.repo_full_name,
+                            "issue_number": issue_number,
+                            "decision_id": item.decision_id,
+                            "event_id": item.event_id,
+                            "reason_code": err.reason_code(),
+                            "projection_error": projection_err.to_string(),
+                        }),
+                    );
+                }
+                let purge_reason = "queue_poisoned_head";
+                let purged_count = match db::purge_pending_issue_decisions(
+                    &state.db_path,
+                    &item.record.repo_full_name,
+                    issue_number,
+                    purge_reason,
+                ) {
+                    Ok(count) => count,
+                    Err(purge_err) => {
+                        log_line(
+                            "dispatch_queue_purge_failed",
+                            json!({
+                                "repo": item.record.repo_full_name,
+                                "issue_number": issue_number,
+                                "decision_id": item.decision_id,
+                                "event_id": item.event_id,
+                                "reason_code": err.reason_code(),
+                                "purge_error": purge_err.to_string(),
+                            }),
+                        );
+                        0
+                    }
+                };
+                let _ = db::update_decision_comment_status(
+                    &state.db_path,
+                    item.decision_id,
+                    true,
+                    Some(format!(
+                        "queue dispatch {}: {}; queue_purged={purged_count}",
+                        err.reason_code(),
+                        err
+                    )),
+                );
                 log_line(
-                    "dispatch_queue_dispatch_failed",
+                    "dispatch_queue_poisoned_head",
                     json!({
                         "repo": item.record.repo_full_name,
                         "issue_number": issue_number,
@@ -1064,6 +1086,8 @@ async fn dispatch_queue_once(state: &AppState) -> Result<()> {
                         "event_id": item.event_id,
                         "reason_code": err.reason_code(),
                         "error": err.to_string(),
+                        "runtime_state": runtime_state.label(),
+                        "queue_purged": purged_count,
                     }),
                 );
             }
