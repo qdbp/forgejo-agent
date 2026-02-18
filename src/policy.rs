@@ -72,10 +72,16 @@ pub const ORCHD_CONTROL_LABELS: [(&str, &str, &str, bool); 2] = [
 ];
 
 pub const ORCHD_FAILURE_LABEL_PREFIX: &str = "orchd/failure/";
+pub const ORCHD_REASON_LABEL_PREFIX: &str = "orchd/reason/";
 
 #[must_use]
 pub fn is_orchd_failure_label(name: &str) -> bool {
     name.starts_with(ORCHD_FAILURE_LABEL_PREFIX)
+}
+
+#[must_use]
+pub fn is_orchd_reason_label(name: &str) -> bool {
+    name.starts_with(ORCHD_REASON_LABEL_PREFIX)
 }
 
 #[must_use]
@@ -85,6 +91,16 @@ pub fn orchd_failure_label(reason_code: &str) -> Option<String> {
         None
     } else {
         Some(format!("{ORCHD_FAILURE_LABEL_PREFIX}{normalized}"))
+    }
+}
+
+#[must_use]
+pub fn orchd_reason_label(reason_code: &str) -> Option<String> {
+    let normalized = normalize_reason_code_label_segment(reason_code);
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(format!("{ORCHD_REASON_LABEL_PREFIX}{normalized}"))
     }
 }
 
@@ -237,5 +253,18 @@ mod tests {
             Some("orchd/failure/registered_trigger-custom-closed".to_string())
         );
         assert_eq!(orchd_failure_label("   "), None);
+    }
+
+    #[test]
+    fn orchd_reason_label_normalizes_reason_code() {
+        assert_eq!(
+            orchd_reason_label("issue_dispatch_in_flight"),
+            Some("orchd/reason/issue_dispatch_in_flight".to_string())
+        );
+        assert_eq!(
+            orchd_reason_label("actor not allowed"),
+            Some("orchd/reason/actor-not-allowed".to_string())
+        );
+        assert_eq!(orchd_reason_label("   "), None);
     }
 }

@@ -5,7 +5,9 @@ use anyhow::{Context, Result, anyhow};
 use serde_json::json;
 
 use forgejo_agent::api::ForgejoClient;
-use forgejo_agent::policy::{is_orchd_failure_label, orchd_failure_label};
+use forgejo_agent::policy::{
+    is_orchd_failure_label, is_orchd_reason_label, orchd_failure_label, orchd_reason_label,
+};
 use forgejo_agent::types::{IssueRef, OrchdRuntimeState, RepoRef};
 
 use super::state::{AppState, DecisionRecord};
@@ -187,11 +189,11 @@ async fn project_issue_runtime_state_with_api(
                 exclusive,
             )?
             .id;
-        let failure_reason_label_id = if runtime_state == OrchdRuntimeState::Failed {
-            if let Some(reason_label_name) =
-                runtime_reason_code.as_deref().and_then(orchd_failure_label)
-            {
-                Some(
+        let reason_label_id = match runtime_state {
+            OrchdRuntimeState::Failed => runtime_reason_code
+                .as_deref()
+                .and_then(orchd_failure_label)
+                .map(|reason_label_name| {
                     api.ensure_label(
                         &state.cfg,
                         &issue.repo,
@@ -199,26 +201,40 @@ async fn project_issue_runtime_state_with_api(
                         "8a1c2d",
                         "dispatch failed for this reason",
                         false,
-                    )?
-                    .id,
-                )
-            } else {
-                None
-            }
-        } else {
-            None
+                    )
+                    .map(|label| label.id)
+                })
+                .transpose()?,
+            OrchdRuntimeState::Completed => None,
+            _ => runtime_reason_code
+                .as_deref()
+                .and_then(orchd_reason_label)
+                .map(|reason_label_name| {
+                    api.ensure_label(
+                        &state.cfg,
+                        &issue.repo,
+                        &reason_label_name,
+                        "fbca04",
+                        "orchd dispatch status reason code",
+                        false,
+                    )
+                    .map(|label| label.id)
+                })
+                .transpose()?,
         };
 
         let mut replacement_ids = existing
             .labels
             .iter()
             .filter(|label| {
-                !is_orchd_state_label(&label.name) && !is_orchd_failure_label(&label.name)
+                !is_orchd_state_label(&label.name)
+                    && !is_orchd_failure_label(&label.name)
+                    && !is_orchd_reason_label(&label.name)
             })
             .map(|label| label.id)
             .collect::<Vec<_>>();
         replacement_ids.push(target_id);
-        if let Some(reason_label_id) = failure_reason_label_id {
+        if let Some(reason_label_id) = reason_label_id {
             replacement_ids.push(reason_label_id);
         }
         replacement_ids.sort_unstable();

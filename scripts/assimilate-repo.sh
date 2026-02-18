@@ -36,6 +36,7 @@ options:
   --orch-login LOGIN             default: codex-orch
   --lead-login LOGIN             default: codex-lead
   --dev-login LOGIN              default: codex-dev
+  --audit-login LOGIN            default: codex-audit
   --skip-acl                     do not apply repo-scoped collaborator ACLs
   --skip-role-check-preflight    skip `orchd role check` preflight gate
   --bootstrap-token-file PATH    default: ~/.config/forgejo-agent/creds/codex-orch.token
@@ -57,6 +58,7 @@ forgejo_login="codex-orch"
 orch_login="codex-orch"
 lead_login="codex-lead"
 dev_login="codex-dev"
+audit_login="codex-audit"
 apply_acl=1
 skip_role_check_preflight=0
 bootstrap_token_file="$HOME/.config/forgejo-agent/creds/codex-orch.token"
@@ -76,6 +78,7 @@ while [[ $# -gt 0 ]]; do
     --orch-login) orch_login="${2-}"; shift 2 ;;
     --lead-login) lead_login="${2-}"; shift 2 ;;
     --dev-login) dev_login="${2-}"; shift 2 ;;
+    --audit-login) audit_login="${2-}"; shift 2 ;;
     --skip-acl) apply_acl=0; shift ;;
     --skip-role-check-preflight) skip_role_check_preflight=1; shift ;;
     --bootstrap-token-file) bootstrap_token_file="${2-}"; shift 2 ;;
@@ -194,6 +197,7 @@ apply_collaborator_acl() {
   set_acl "$orch_login" "admin"
   set_acl "$lead_login" "admin"
   set_acl "$dev_login" "write"
+  set_acl "$audit_login" "write"
 }
 
 ensure_local_remote() {
