@@ -220,6 +220,14 @@ pub(super) struct PromptPreviewArgs {
     #[arg(long, value_enum, default_value_t = PromptMode::Fresh)]
     pub(super) mode: PromptMode,
     #[arg(long)]
+    pub(super) with_history: bool,
+    #[arg(long)]
+    pub(super) with_delta: bool,
+    #[arg(long = "preview-row-cap", default_value_t = 120)]
+    pub(super) preview_row_cap: usize,
+    #[arg(long = "preview-byte-cap", default_value_t = 12_000)]
+    pub(super) preview_byte_cap: usize,
+    #[arg(long)]
     pub(super) json: bool,
 }
 
