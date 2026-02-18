@@ -138,6 +138,7 @@ pub(super) fn extract_event_context(
         source_issue_id,
         source_issue_anchor_at,
         actor_login,
+        conversation_role: None,
         text,
         source_comment_id,
         source_created_at,
@@ -156,6 +157,10 @@ pub(super) fn decide(
     };
 
     let action = action.map(|value| value.trim().to_ascii_lowercase());
+    // Dispatch is intentionally append-only: edits (issue or comment) must not trigger new work.
+    if action.as_deref() == Some("edited") {
+        return DecisionRecord::ignored("edits_do_not_dispatch");
+    }
     let parsed_directive = context.text.as_deref().and_then(parse_directive);
 
     let fallback_legacy;
@@ -349,6 +354,7 @@ fn resolve_trigger_role(
             parsed_directive.map(|directive| directive.role.to_ascii_lowercase())
         }
         DispatchTriggerRoleSource::SingleAssignee => single_codex_assignee(context),
+        DispatchTriggerRoleSource::ConversationRole => context.conversation_role.clone(),
     }
 }
 
@@ -366,6 +372,7 @@ fn resolve_trigger_principal(
         ),
         DispatchTriggerPrincipalSource::Literal(principal) => Some(principal.clone()),
         DispatchTriggerPrincipalSource::SingleAssignee => single_codex_assignee(context),
+        DispatchTriggerPrincipalSource::ConversationRole => context.conversation_role.clone(),
     }
 }
 
@@ -533,6 +540,7 @@ mod tests {
             source_issue_id: Some(99),
             source_issue_anchor_at: Some("2026-02-16T09:00:00Z".to_string()),
             actor_login: Some("main".to_string()),
+            conversation_role: None,
             text: Some("just checking in".to_string()),
             source_comment_id: None,
             source_created_at: None,
@@ -552,6 +560,7 @@ mod tests {
             source_issue_id: Some(99),
             source_issue_anchor_at: Some("2026-02-16T09:00:00Z".to_string()),
             actor_login: Some("main".to_string()),
+            conversation_role: None,
             text: Some("@codex-orch poke".to_string()),
             source_comment_id: Some(123),
             source_created_at: Some("2026-02-16T09:00:01Z".to_string()),
@@ -573,6 +582,7 @@ mod tests {
             source_issue_id: Some(99),
             source_issue_anchor_at: Some("2026-02-16T09:00:00Z".to_string()),
             actor_login: Some("main".to_string()),
+            conversation_role: None,
             text: Some("please take a look".to_string()),
             source_comment_id: Some(123),
             source_created_at: Some("2026-02-16T09:00:01Z".to_string()),
@@ -584,6 +594,69 @@ mod tests {
         assert_eq!(decision.directive.as_deref(), Some("reply"));
         assert_eq!(decision.target_role.as_deref(), Some("codex-orch"));
         assert!(decision.would_dispatch);
+    }
+
+    #[test]
+    fn comment_without_directive_prefers_conversation_role_over_assignee() {
+        let context = EventContext {
+            repo_full_name: "main/orchd-debug".to_string(),
+            issue_number: Some(1),
+            source_issue_id: Some(99),
+            source_issue_anchor_at: Some("2026-02-16T09:00:00Z".to_string()),
+            actor_login: Some("main".to_string()),
+            conversation_role: Some("codex-orch".to_string()),
+            text: Some("continuing the conversation".to_string()),
+            source_comment_id: Some(124),
+            source_created_at: Some("2026-02-16T09:00:02Z".to_string()),
+            assignees: vec!["codex-audit".to_string()],
+        };
+        let decision = decide("issue_comment", Some("created"), Some(&context), None);
+        assert_eq!(decision.decision, DECISION_ACCEPTED);
+        assert_eq!(decision.reason_code, "assignee_reply");
+        assert_eq!(decision.directive.as_deref(), Some("reply"));
+        assert_eq!(decision.target_role.as_deref(), Some("codex-orch"));
+        assert_eq!(decision.principal_login.as_deref(), Some("codex-orch"));
+        assert!(decision.would_dispatch);
+    }
+
+    #[test]
+    fn issue_edits_do_not_dispatch() {
+        let context = EventContext {
+            repo_full_name: "main/forgejo-work".to_string(),
+            issue_number: Some(16),
+            source_issue_id: Some(99),
+            source_issue_anchor_at: Some("2026-02-16T09:00:00Z".to_string()),
+            actor_login: Some("main".to_string()),
+            conversation_role: None,
+            text: Some("@codex-orch design".to_string()),
+            source_comment_id: None,
+            source_created_at: None,
+            assignees: Vec::new(),
+        };
+        let decision = decide("issues", Some("edited"), Some(&context), None);
+        assert_eq!(decision.decision, DECISION_IGNORED);
+        assert_eq!(decision.reason_code, "edits_do_not_dispatch");
+        assert!(!decision.would_dispatch);
+    }
+
+    #[test]
+    fn comment_edits_do_not_dispatch() {
+        let context = EventContext {
+            repo_full_name: "main/orchd-debug".to_string(),
+            issue_number: Some(1),
+            source_issue_id: Some(99),
+            source_issue_anchor_at: Some("2026-02-16T09:00:00Z".to_string()),
+            actor_login: Some("main".to_string()),
+            conversation_role: None,
+            text: Some("@codex-orch poke".to_string()),
+            source_comment_id: Some(123),
+            source_created_at: Some("2026-02-16T09:00:01Z".to_string()),
+            assignees: vec!["codex-orch".to_string()],
+        };
+        let decision = decide("issue_comment", Some("edited"), Some(&context), None);
+        assert_eq!(decision.decision, DECISION_IGNORED);
+        assert_eq!(decision.reason_code, "edits_do_not_dispatch");
+        assert!(!decision.would_dispatch);
     }
 
     #[test]
@@ -652,6 +725,7 @@ mod tests {
             source_issue_id: Some(99),
             source_issue_anchor_at: Some("2026-02-16T09:00:00Z".to_string()),
             actor_login: Some("codex-orch".to_string()),
+            conversation_role: None,
             text: Some("@codex-orch design".to_string()),
             source_comment_id: None,
             source_created_at: None,
@@ -671,6 +745,7 @@ mod tests {
             source_issue_id: Some(99),
             source_issue_anchor_at: Some("2026-02-16T09:00:00Z".to_string()),
             actor_login: Some("main".to_string()),
+            conversation_role: None,
             text: Some("@codex-orch design".to_string()),
             source_comment_id: None,
             source_created_at: None,
@@ -710,6 +785,7 @@ mod tests {
             source_issue_id: Some(4),
             source_issue_anchor_at: Some("2026-02-16T09:00:00Z".to_string()),
             actor_login: Some("main".to_string()),
+            conversation_role: None,
             text: Some("@codex-orch poke".to_string()),
             source_comment_id: Some(500),
             source_created_at: Some("2026-02-16T09:00:00Z".to_string()),

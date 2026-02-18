@@ -497,6 +497,44 @@ pub(super) fn upsert_issue_role_cursor_event_id(
     Ok(())
 }
 
+pub(super) fn latest_issue_role_comment_actor_login_before_event_id(
+    db_path: &Path,
+    repo_full_name: &str,
+    issue_number: u64,
+    before_event_id: i64,
+) -> Result<Option<String>> {
+    if before_event_id <= 0 {
+        return Ok(None);
+    }
+
+    let conn = open_db(db_path)?;
+    let issue_number = i64::try_from(issue_number)?;
+    conn.query_row(
+        r"
+        SELECT lower(actor_login)
+        FROM events
+        WHERE repo_full_name = ?1
+          AND issue_number = ?2
+          AND event_type = ?3
+          AND action = 'created'
+          AND actor_login IS NOT NULL
+          AND lower(actor_login) GLOB 'codex-*'
+          AND id < ?4
+        ORDER BY id DESC
+        LIMIT 1
+        ",
+        params![
+            repo_full_name,
+            issue_number,
+            EVENT_ISSUE_COMMENT,
+            before_event_id
+        ],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 pub(super) fn issue_delta_rows(
     db_path: &Path,
     repo_full_name: &str,

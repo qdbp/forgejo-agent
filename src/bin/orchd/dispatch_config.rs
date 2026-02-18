@@ -366,6 +366,7 @@ pub(super) enum DispatchTriggerRoleSource {
     Literal(String),
     ParsedDirectiveRole,
     SingleAssignee,
+    ConversationRole,
 }
 
 #[derive(Clone, Debug)]
@@ -373,6 +374,7 @@ pub(super) enum DispatchTriggerPrincipalSource {
     EventActor,
     Literal(String),
     SingleAssignee,
+    ConversationRole,
 }
 
 #[derive(Clone, Debug)]
@@ -1087,7 +1089,7 @@ pub(super) fn legacy_trigger_pack() -> Vec<DispatchTriggerConfig> {
             priority: 0,
             matcher: DispatchTriggerMatcher {
                 event_type: EVENT_ISSUE_COMMENT.to_string(),
-                actions: vec!["created".to_string(), "edited".to_string()],
+                actions: vec!["created".to_string()],
             },
             guards: DispatchTriggerGuards {
                 directive: DispatchTriggerDirectiveGuard::RequireParsed,
@@ -1108,7 +1110,7 @@ pub(super) fn legacy_trigger_pack() -> Vec<DispatchTriggerConfig> {
             priority: 0,
             matcher: DispatchTriggerMatcher {
                 event_type: EVENT_ISSUES.to_string(),
-                actions: vec!["opened".to_string(), "edited".to_string()],
+                actions: vec!["opened".to_string()],
             },
             guards: DispatchTriggerGuards {
                 directive: DispatchTriggerDirectiveGuard::RequireParsed,
@@ -1124,12 +1126,34 @@ pub(super) fn legacy_trigger_pack() -> Vec<DispatchTriggerConfig> {
             apply_guardrails: false,
         },
         DispatchTriggerConfig {
+            id: "legacy.conversation.reply".to_string(),
+            class: DispatchTriggerClass::AssigneeReply,
+            // Prefer conversational routing over assignee fallback.
+            priority: 1,
+            matcher: DispatchTriggerMatcher {
+                event_type: EVENT_ISSUE_COMMENT.to_string(),
+                actions: vec!["created".to_string()],
+            },
+            guards: DispatchTriggerGuards {
+                directive: DispatchTriggerDirectiveGuard::RequireAbsent,
+                assignee: DispatchTriggerAssigneeGuard::Any,
+                actor: DispatchTriggerActorGuard::Any,
+            },
+            action: DispatchTriggerAction {
+                directive: DispatchTriggerDirectiveSource::Literal(DIRECTIVE_REPLY.to_string()),
+                target_role: DispatchTriggerRoleSource::ConversationRole,
+                principal: DispatchTriggerPrincipalSource::ConversationRole,
+                reason_code: "assignee_reply".to_string(),
+            },
+            apply_guardrails: true,
+        },
+        DispatchTriggerConfig {
             id: "legacy.assignee.reply".to_string(),
             class: DispatchTriggerClass::AssigneeReply,
             priority: 0,
             matcher: DispatchTriggerMatcher {
                 event_type: EVENT_ISSUE_COMMENT.to_string(),
-                actions: vec!["created".to_string(), "edited".to_string()],
+                actions: vec!["created".to_string()],
             },
             guards: DispatchTriggerGuards {
                 directive: DispatchTriggerDirectiveGuard::RequireAbsent,
@@ -1561,9 +1585,12 @@ fn compile_trigger_action(
         (None, Some(source)) if source.trim().eq_ignore_ascii_case("assignee") => {
             DispatchTriggerRoleSource::SingleAssignee
         }
+        (None, Some(source)) if source.trim().eq_ignore_ascii_case("conversation") => {
+            DispatchTriggerRoleSource::ConversationRole
+        }
         (None, Some(source)) => {
             return Err(anyhow!(
-                "dispatch config {} trigger '{}' has unsupported action.target_role_from '{}'; expected 'parsed' or 'assignee'",
+                "dispatch config {} trigger '{}' has unsupported action.target_role_from '{}'; expected 'parsed', 'assignee', or 'conversation'",
                 config_path.display(),
                 trigger_id,
                 source
@@ -1611,9 +1638,12 @@ fn compile_trigger_action(
         (None, Some(source)) if source.trim().eq_ignore_ascii_case("assignee") => {
             DispatchTriggerPrincipalSource::SingleAssignee
         }
+        (None, Some(source)) if source.trim().eq_ignore_ascii_case("conversation") => {
+            DispatchTriggerPrincipalSource::ConversationRole
+        }
         (None, Some(source)) => {
             return Err(anyhow!(
-                "dispatch config {} trigger '{}' has unsupported action.principal_from '{}'; expected 'actor' or 'assignee'",
+                "dispatch config {} trigger '{}' has unsupported action.principal_from '{}'; expected 'actor', 'assignee', or 'conversation'",
                 config_path.display(),
                 trigger_id,
                 source

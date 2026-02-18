@@ -456,7 +456,7 @@ async fn process_webhook(
 
     let payload: WebhookPayload =
         serde_json::from_slice(body).context("invalid webhook payload JSON")?;
-    let context = extract_event_context(&event_type, &payload);
+    let mut context = extract_event_context(&event_type, &payload);
 
     let record = EventRecord {
         delivery_id: delivery_id.clone(),
@@ -492,6 +492,18 @@ async fn process_webhook(
     let _ = db::upsert_repo_seen(&state.db_path, &record.repo_full_name);
 
     let dispatch_config = state.dispatch_config.snapshot();
+
+    if record.event_type == EVENT_ISSUE_COMMENT
+        && record.action.as_deref() == Some("created")
+        && let (Some(issue_number), Some(ctx)) = (record.issue_number, context.as_mut())
+    {
+        ctx.conversation_role = db::latest_issue_role_comment_actor_login_before_event_id(
+            &state.db_path,
+            &record.repo_full_name,
+            issue_number,
+            event_id,
+        )?;
+    }
     let mut decision = decide(
         &event_type,
         record.action.as_deref(),

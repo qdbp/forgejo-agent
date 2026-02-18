@@ -94,6 +94,7 @@ pub(super) struct EventContext {
     pub(super) source_issue_id: Option<u64>,
     pub(super) source_issue_anchor_at: Option<String>,
     pub(super) actor_login: Option<String>,
+    pub(super) conversation_role: Option<String>,
     pub(super) text: Option<String>,
     pub(super) source_comment_id: Option<u64>,
     pub(super) source_created_at: Option<String>,
