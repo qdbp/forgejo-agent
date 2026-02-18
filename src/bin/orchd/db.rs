@@ -293,20 +293,21 @@ pub(super) fn insert_decision(
     conn.execute(
         r"
         INSERT INTO decisions
-        (event_id, repo_full_name, issue_number, actor_login, directive, target_role, decision, reason_code, would_dispatch, created_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        (event_id, repo_full_name, issue_number, actor_login, principal_login, directive, target_role, decision, reason_code, would_dispatch, created_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
         ",
         params![
             event_id,
             event.repo_full_name,
             event.issue_number,
             event.actor_login,
+            decision.principal_login,
             decision.directive,
             decision.target_role,
             decision.decision,
             decision.reason_code,
             i64::from(decision.would_dispatch),
-            now
+            now,
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -687,6 +688,7 @@ pub(super) struct DispatchInsert<'a> {
     pub(super) repo_full_name: &'a str,
     pub(super) issue_number: u64,
     pub(super) actor_login: Option<&'a str>,
+    pub(super) principal_login: Option<&'a str>,
     pub(super) directive: &'a str,
     pub(super) target_role: &'a str,
     pub(super) started_at: &'a str,
@@ -757,14 +759,15 @@ pub(super) fn reserve_dispatch_starting(
     tx.execute(
         r"
         INSERT INTO dispatches
-        (decision_id, repo_full_name, issue_number, actor_login, directive, target_role, status, started_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        (decision_id, repo_full_name, issue_number, actor_login, principal_login, directive, target_role, status, started_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
         ",
         params![
             insert.decision_id,
             insert.repo_full_name,
             issue_number,
             insert.actor_login,
+            insert.principal_login,
             insert.directive,
             insert.target_role,
             DispatchState::Starting.as_db_str(),
@@ -1300,6 +1303,7 @@ pub(super) fn queued_impl_decisions(db_path: &Path, limit: u32) -> Result<Vec<Qu
             d.reason_code,
             d.directive,
             d.target_role,
+            d.principal_login,
             d.would_dispatch
         FROM latest l
         JOIN decisions d ON d.id = l.decision_id
@@ -1329,12 +1333,14 @@ pub(super) fn queued_impl_decisions(db_path: &Path, limit: u32) -> Result<Vec<Qu
                 source_created_at: row.get(10)?,
                 raw_json: row.get(11)?,
             };
-            let would_dispatch_int: i64 = row.get(16)?;
+            let principal_login: Option<String> = row.get(16)?;
+            let would_dispatch_int: i64 = row.get(17)?;
             let decision = DecisionRecord {
                 decision: row.get(12)?,
                 reason_code: row.get(13)?,
                 directive: row.get(14)?,
                 target_role: row.get(15)?,
+                principal_login: principal_login.or_else(|| record.actor_login.clone()),
                 would_dispatch: would_dispatch_int != 0,
                 decision_source: "db".to_string(),
                 trigger_id: None,
@@ -1626,6 +1632,7 @@ mod tests {
                 repo_full_name: "main/orchd-debug",
                 issue_number,
                 actor_login: Some("main"),
+                principal_login: Some("main"),
                 directive,
                 target_role: "codex-orch",
                 started_at: &started_at,

@@ -9,7 +9,7 @@ struct Migration {
     apply: fn(&mut Connection) -> Result<()>,
 }
 
-const LATEST_SCHEMA_VERSION: i64 = 7;
+const LATEST_SCHEMA_VERSION: i64 = 8;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -46,6 +46,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 7,
         name: "canonicalize_poke_directive_to_reply",
         apply: migration_0007_canonicalize_poke_directive_to_reply,
+    },
+    Migration {
+        version: 8,
+        name: "add_dispatch_principal_logins",
+        apply: migration_0008_add_dispatch_principal_logins,
     },
 ];
 
@@ -446,6 +451,26 @@ fn migration_0007_canonicalize_poke_directive_to_reply(conn: &mut Connection) ->
     Ok(())
 }
 
+fn migration_0008_add_dispatch_principal_logins(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if table_exists(&tx, "decisions")? {
+        ensure_column_exists_tx(&tx, "decisions", "principal_login", "TEXT")?;
+        tx.execute(
+            "UPDATE decisions SET principal_login = actor_login WHERE principal_login IS NULL AND actor_login IS NOT NULL",
+            [],
+        )?;
+    }
+    if table_exists(&tx, "dispatches")? {
+        ensure_column_exists_tx(&tx, "dispatches", "principal_login", "TEXT")?;
+        tx.execute(
+            "UPDATE dispatches SET principal_login = actor_login WHERE principal_login IS NULL AND actor_login IS NOT NULL",
+            [],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -460,6 +485,8 @@ mod tests {
         assert!(!table_has_column(&conn, "dispatches", "tmux_window").expect("pragma"));
         assert!(table_has_column(&conn, "dispatches", "backend_kind").expect("pragma"));
         assert!(table_has_column(&conn, "dispatches", "backend_ref").expect("pragma"));
+        assert!(table_has_column(&conn, "decisions", "principal_login").expect("pragma"));
+        assert!(table_has_column(&conn, "dispatches", "principal_login").expect("pragma"));
         assert!(table_has_column(&conn, "trigger_dispatch_dedupes", "dedupe_key").expect("pragma"));
         assert_eq!(
             current_schema_version(&conn).expect("schema version query"),
@@ -539,11 +566,11 @@ mod tests {
         assert!(!table_has_column(&conn, "dispatches", "tmux_window").expect("pragma"));
         assert!(table_has_column(&conn, "trigger_dispatch_dedupes", "dedupe_key").expect("pragma"));
 
-        let (kind, backend_ref, directive): (Option<String>, Option<String>, String) = conn
+        let (kind, backend_ref, directive, principal): (Option<String>, Option<String>, String, Option<String>) = conn
             .query_row(
-                "SELECT backend_kind, backend_ref, directive FROM dispatches WHERE id = 1",
+                "SELECT backend_kind, backend_ref, directive, principal_login FROM dispatches WHERE id = 1",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .expect("query migrated dispatch");
         assert_eq!(kind.as_deref(), Some("tmux"));
@@ -552,6 +579,7 @@ mod tests {
             Some("codex-orch:rmain-forgejo-work-i1")
         );
         assert_eq!(directive.as_str(), "reply");
+        assert_eq!(principal.as_deref(), Some("main"));
         assert_eq!(
             current_schema_version(&conn).expect("schema version query"),
             LATEST_SCHEMA_VERSION

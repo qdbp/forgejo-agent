@@ -113,6 +113,7 @@ pub(super) struct DecisionRecord {
     pub(super) reason_code: String,
     pub(super) directive: Option<String>,
     pub(super) target_role: Option<String>,
+    pub(super) principal_login: Option<String>,
     pub(super) would_dispatch: bool,
     pub(super) decision_source: String,
     pub(super) trigger_id: Option<String>,
@@ -127,6 +128,7 @@ impl DecisionRecord {
             reason_code: reason_code.into(),
             directive: None,
             target_role: None,
+            principal_login: None,
             would_dispatch: false,
             decision_source: "none".to_string(),
             trigger_id: None,
@@ -140,6 +142,7 @@ impl DecisionRecord {
         self.reason_code = reason_code.into();
         self.directive = None;
         self.target_role = None;
+        self.principal_login = None;
         self.would_dispatch = false;
         self.decision_source = "none".to_string();
         self.trigger_apply_guardrails = false;

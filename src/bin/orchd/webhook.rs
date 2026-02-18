@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use super::dispatch_config::{
     DispatchTriggerActorGuard, DispatchTriggerAssigneeGuard, DispatchTriggerClass,
     DispatchTriggerConfig, DispatchTriggerDirectiveGuard, DispatchTriggerDirectiveSource,
-    DispatchTriggerRoleSource, legacy_trigger_pack,
+    DispatchTriggerPrincipalSource, DispatchTriggerRoleSource, legacy_trigger_pack,
 };
 use super::lexicon::{DECISION_ACCEPTED, EVENT_ISSUE_COMMENT, EVENT_ISSUES, directive_is_known};
 use super::paths::expand_tilde_path;
@@ -23,6 +23,7 @@ struct TriggerCandidate {
     order: usize,
     directive: String,
     target_role: String,
+    principal_login: String,
     reason_code: String,
     apply_guardrails: bool,
 }
@@ -202,6 +203,9 @@ pub(super) fn decide(
         else {
             continue;
         };
+        let Some(principal_login) = resolve_trigger_principal(trigger, context) else {
+            continue;
+        };
 
         let candidate = TriggerCandidate {
             id: trigger.id.clone(),
@@ -210,6 +214,7 @@ pub(super) fn decide(
             order,
             directive,
             target_role,
+            principal_login,
             reason_code: trigger.action.reason_code.clone(),
             apply_guardrails: trigger.apply_guardrails,
         };
@@ -227,6 +232,7 @@ pub(super) fn decide(
         reason_code: best.reason_code,
         directive: Some(best.directive),
         target_role: Some(best.target_role),
+        principal_login: Some(best.principal_login),
         would_dispatch: true,
         decision_source: match best.class {
             DispatchTriggerClass::ExplicitDirective => "explicit_directive".to_string(),
@@ -343,6 +349,23 @@ fn resolve_trigger_role(
             parsed_directive.map(|directive| directive.role.to_ascii_lowercase())
         }
         DispatchTriggerRoleSource::SingleAssignee => single_codex_assignee(context),
+    }
+}
+
+fn resolve_trigger_principal(
+    trigger: &DispatchTriggerConfig,
+    context: &EventContext,
+) -> Option<String> {
+    match &trigger.action.principal {
+        DispatchTriggerPrincipalSource::EventActor => Some(
+            context
+                .actor_login
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase(),
+        ),
+        DispatchTriggerPrincipalSource::Literal(principal) => Some(principal.clone()),
+        DispatchTriggerPrincipalSource::SingleAssignee => single_codex_assignee(context),
     }
 }
 
@@ -495,7 +518,7 @@ mod tests {
     use crate::orchd::dispatch_config::{
         DispatchTriggerAction, DispatchTriggerClass, DispatchTriggerConfig,
         DispatchTriggerDirectiveSource, DispatchTriggerGuards, DispatchTriggerMatcher,
-        DispatchTriggerRoleSource,
+        DispatchTriggerPrincipalSource, DispatchTriggerRoleSource,
     };
     use crate::orchd::lexicon::{DECISION_ACCEPTED, DECISION_IGNORED, DIRECTIVE_REPLY};
     use crate::orchd::state::{EventContext, EventRecord};
@@ -675,6 +698,7 @@ mod tests {
             action: DispatchTriggerAction {
                 directive: DispatchTriggerDirectiveSource::Literal("reply".to_string()),
                 target_role: DispatchTriggerRoleSource::Literal("codex-orch".to_string()),
+                principal: DispatchTriggerPrincipalSource::EventActor,
                 reason_code: "registered_trigger:custom.closed".to_string(),
             },
             apply_guardrails: true,

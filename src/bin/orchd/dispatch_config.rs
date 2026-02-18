@@ -351,6 +351,7 @@ pub(super) enum DispatchTriggerActorGuard {
 pub(super) struct DispatchTriggerAction {
     pub(super) directive: DispatchTriggerDirectiveSource,
     pub(super) target_role: DispatchTriggerRoleSource,
+    pub(super) principal: DispatchTriggerPrincipalSource,
     pub(super) reason_code: String,
 }
 
@@ -364,6 +365,13 @@ pub(super) enum DispatchTriggerDirectiveSource {
 pub(super) enum DispatchTriggerRoleSource {
     Literal(String),
     ParsedDirectiveRole,
+    SingleAssignee,
+}
+
+#[derive(Clone, Debug)]
+pub(super) enum DispatchTriggerPrincipalSource {
+    EventActor,
+    Literal(String),
     SingleAssignee,
 }
 
@@ -540,6 +548,8 @@ struct DispatchTriggerActionConfigFile {
     directive_from: Option<String>,
     target_role: Option<String>,
     target_role_from: Option<String>,
+    principal: Option<String>,
+    principal_from: Option<String>,
     reason_code: Option<String>,
 }
 
@@ -1087,6 +1097,7 @@ pub(super) fn legacy_trigger_pack() -> Vec<DispatchTriggerConfig> {
             action: DispatchTriggerAction {
                 directive: DispatchTriggerDirectiveSource::ParsedDirective,
                 target_role: DispatchTriggerRoleSource::ParsedDirectiveRole,
+                principal: DispatchTriggerPrincipalSource::EventActor,
                 reason_code: "explicit_directive".to_string(),
             },
             apply_guardrails: false,
@@ -1107,6 +1118,7 @@ pub(super) fn legacy_trigger_pack() -> Vec<DispatchTriggerConfig> {
             action: DispatchTriggerAction {
                 directive: DispatchTriggerDirectiveSource::ParsedDirective,
                 target_role: DispatchTriggerRoleSource::ParsedDirectiveRole,
+                principal: DispatchTriggerPrincipalSource::EventActor,
                 reason_code: "explicit_directive".to_string(),
             },
             apply_guardrails: false,
@@ -1127,6 +1139,7 @@ pub(super) fn legacy_trigger_pack() -> Vec<DispatchTriggerConfig> {
             action: DispatchTriggerAction {
                 directive: DispatchTriggerDirectiveSource::Literal(DIRECTIVE_REPLY.to_string()),
                 target_role: DispatchTriggerRoleSource::SingleAssignee,
+                principal: DispatchTriggerPrincipalSource::SingleAssignee,
                 reason_code: "assignee_reply".to_string(),
             },
             apply_guardrails: true,
@@ -1323,6 +1336,7 @@ pub(super) fn load_dispatch_config(path: &Path) -> Result<DispatchConfig> {
             trigger,
             &directives,
             &roles,
+            &rank_acl,
         )?);
     }
 
@@ -1371,6 +1385,7 @@ fn compile_registered_trigger(
     trigger: DispatchTriggerConfigFile,
     directives: &HashMap<String, DispatchDirectiveConfig>,
     roles: &HashMap<String, DispatchRoleConfig>,
+    rank_acl: &DispatchRankAclConfig,
 ) -> Result<DispatchTriggerConfig> {
     let trigger_id = trigger.id.trim().to_string();
     if trigger_id.is_empty() {
@@ -1425,8 +1440,14 @@ fn compile_registered_trigger(
         ));
     }
 
-    let action =
-        compile_trigger_action(config_path, &trigger_id, trigger.action, directives, roles)?;
+    let action = compile_trigger_action(
+        config_path,
+        &trigger_id,
+        trigger.action,
+        directives,
+        roles,
+        rank_acl,
+    )?;
 
     Ok(DispatchTriggerConfig {
         id: trigger_id,
@@ -1448,6 +1469,7 @@ fn compile_trigger_action(
     action: DispatchTriggerActionConfigFile,
     directives: &HashMap<String, DispatchDirectiveConfig>,
     roles: &HashMap<String, DispatchRoleConfig>,
+    rank_acl: &DispatchRankAclConfig,
 ) -> Result<DispatchTriggerAction> {
     let directive = match (action.directive, action.directive_from) {
         (Some(directive), None) => {
@@ -1555,6 +1577,50 @@ fn compile_trigger_action(
         }
     };
 
+    let principal = match (action.principal, action.principal_from) {
+        (Some(principal), None) => {
+            let principal = principal.trim().to_ascii_lowercase();
+            if principal.is_empty() {
+                return Err(anyhow!(
+                    "dispatch config {} trigger '{}' has empty action.principal",
+                    config_path.display(),
+                    trigger_id
+                ));
+            }
+            if !rank_acl.has_role_policy(&principal) {
+                return Err(anyhow!(
+                    "dispatch config {} trigger '{}' action.principal '{}' must refer to a configured rank ACL principal (role card + rank policy)",
+                    config_path.display(),
+                    trigger_id,
+                    principal
+                ));
+            }
+            DispatchTriggerPrincipalSource::Literal(principal)
+        }
+        (None, Some(source)) if source.trim().eq_ignore_ascii_case("actor") => {
+            DispatchTriggerPrincipalSource::EventActor
+        }
+        (None, Some(source)) if source.trim().eq_ignore_ascii_case("assignee") => {
+            DispatchTriggerPrincipalSource::SingleAssignee
+        }
+        (None, Some(source)) => {
+            return Err(anyhow!(
+                "dispatch config {} trigger '{}' has unsupported action.principal_from '{}'; expected 'actor' or 'assignee'",
+                config_path.display(),
+                trigger_id,
+                source
+            ));
+        }
+        (Some(_), Some(_)) => {
+            return Err(anyhow!(
+                "dispatch config {} trigger '{}' action must not set both principal and principal_from",
+                config_path.display(),
+                trigger_id
+            ));
+        }
+        (None, None) => DispatchTriggerPrincipalSource::EventActor,
+    };
+
     let reason_code = action
         .reason_code
         .map(|value| value.trim().to_string())
@@ -1572,6 +1638,7 @@ fn compile_trigger_action(
     Ok(DispatchTriggerAction {
         directive,
         target_role,
+        principal,
         reason_code,
     })
 }

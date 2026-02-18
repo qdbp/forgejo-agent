@@ -99,6 +99,7 @@ fn fail_dispatch_start(db_path: &Path, dispatch_id: i64, lock_path: &Path, err: 
 #[derive(Debug, Clone)]
 struct DispatchPlan {
     actor: String,
+    principal: String,
     event_type: String,
     directive: DispatchDirectiveConfig,
     role: DispatchRoleConfig,
@@ -352,6 +353,7 @@ fn render_dispatch_md(
         &prompt_envelopes.turn_context_file,
         &[
             ("actor", &plan.actor),
+            ("principal", &plan.principal),
             ("issue_ref", &issue_ref),
             ("turn_type", turn_type),
             ("trigger", trigger),
@@ -638,6 +640,11 @@ async fn plan_dispatch(
         .clone()
         .unwrap_or_default()
         .to_ascii_lowercase();
+    let principal = decision
+        .principal_login
+        .clone()
+        .unwrap_or_else(|| actor.clone())
+        .to_ascii_lowercase();
     let self_directive =
         decision.reason_code == "explicit_directive" && !actor.is_empty() && actor == role_name;
     // Assignee replies are implicitly scoped by the ticket assignment itself; allowlist applies to
@@ -666,7 +673,7 @@ async fn plan_dispatch(
     } else {
         dispatch_config
             .rank_acl
-            .assert_actor_can_dispatch(&actor, &role_name, directive_name)
+            .assert_actor_can_dispatch(&principal, &role_name, directive_name)
             .map_err(|err| DispatchError::RankAclDenied(err.to_string()))?;
     }
 
@@ -685,7 +692,7 @@ async fn plan_dispatch(
         delivery_id: record.delivery_id.clone(),
         parent_dispatch_id: None,
         created_at: Utc::now(),
-        policy_snapshot: Some("cp3-rank-acl-v1".to_string()),
+        policy_snapshot: Some("cp4-rank-acl-principal-v1".to_string()),
     };
 
     let repo_binding = dispatch_config.repo_bindings.get(&intent.repo_full_name);
@@ -764,6 +771,7 @@ async fn plan_dispatch(
             repo_full_name: &intent.repo_full_name,
             issue_number: intent.issue_number,
             actor_login: record.actor_login.as_deref(),
+            principal_login: Some(principal.as_str()),
             directive: &intent.directive,
             target_role: &intent.role,
             started_at: &now,
@@ -941,6 +949,7 @@ async fn plan_dispatch(
 
         Ok(DispatchPlan {
             actor,
+            principal,
             event_type: record.event_type.clone(),
             directive,
             role,
