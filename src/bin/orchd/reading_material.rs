@@ -623,12 +623,16 @@ fn render_reading_material_markdown(
             let _ = writeln!(
                 &mut out,
                 "ref: {} (importance: {})",
-                doc.doc_ref,
+                path.display(),
                 doc_importance_str(doc.importance)
             );
             out.push('\n');
 
-            let _ = writeln!(&mut out, "BEGIN DOC");
+            let doc_title = doc_title_from_path(&path);
+            let _ = writeln!(
+                &mut out,
+                "The document titled {doc_title} is included in the block below:"
+            );
             let fence = backtick_fence(&content);
             let _ = writeln!(&mut out, "{fence}md");
             out.push_str(&content);
@@ -636,7 +640,7 @@ fn render_reading_material_markdown(
                 out.push('\n');
             }
             let _ = writeln!(&mut out, "{fence}");
-            let _ = writeln!(&mut out, "END DOC\n");
+            let _ = writeln!(&mut out, "End document\n");
         }
         out.push('\n');
     }
@@ -644,17 +648,22 @@ fn render_reading_material_markdown(
     if !points.is_empty() {
         out.push_str("### Pointers\n");
         for doc in points {
-            let content =
-                resolve_for_render(repo_root, repo_bindings, doc, warnings).and_then(|path| {
-                    match read_doc_utf8(&path) {
-                        Ok(v) => Some(v),
-                        Err(err) => {
-                            warnings.push(format!("{}: {err}", doc.doc_ref));
-                            None
-                        }
+            let (path, content) = match resolve_for_render(repo_root, repo_bindings, doc, warnings)
+            {
+                Some(path) => match read_doc_utf8(&path) {
+                    Ok(content) => (Some(path), Some(content)),
+                    Err(err) => {
+                        warnings.push(format!("{}: {err}", doc.doc_ref));
+                        (Some(path), None)
                     }
-                });
+                },
+                None => (None, None),
+            };
             let blurb = doc_blurb(&doc.doc_ref, content.as_deref());
+            let ref_path = path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| doc.doc_ref.clone());
 
             match blurb.summary {
                 Some(summary) => {
@@ -662,7 +671,7 @@ fn render_reading_material_markdown(
                         &mut out,
                         "- {} (ref: {}, importance: {}): {}",
                         blurb.title,
-                        doc.doc_ref,
+                        ref_path,
                         doc_importance_str(doc.importance),
                         summary
                     );
@@ -672,7 +681,7 @@ fn render_reading_material_markdown(
                         &mut out,
                         "- {} (ref: {}, importance: {})",
                         blurb.title,
-                        doc.doc_ref,
+                        ref_path,
                         doc_importance_str(doc.importance)
                     );
                 }
@@ -722,6 +731,16 @@ fn fallback_title_from_ref(doc_ref: &str) -> String {
         .and_then(|v| v.to_str())
         .unwrap_or(path)
         .to_string()
+}
+
+fn doc_title_from_path(path: &Path) -> String {
+    if let Some(stem) = path.file_stem().and_then(|v| v.to_str()) {
+        return stem.to_string();
+    }
+    if let Some(name) = path.file_name().and_then(|v| v.to_str()) {
+        return name.to_string();
+    }
+    path.to_string_lossy().into_owned()
 }
 
 fn is_md_fence(line_trimmed: &str) -> bool {
@@ -983,19 +1002,25 @@ importance = "recommended"
 
         assert!(outcome.markdown.contains("## Reading material"));
         assert!(outcome.markdown.contains("### a.txt"));
+        let a_path = tmp.path().join("docs/a.txt").to_string_lossy().into_owned();
         assert!(
             outcome
                 .markdown
-                .contains("ref: workdir:docs/a.txt (importance: required)")
+                .contains(&format!("ref: {a_path} (importance: required)"))
         );
-        assert!(outcome.markdown.contains("BEGIN DOC"));
-        assert!(outcome.markdown.contains("alpha"));
-        assert!(outcome.markdown.contains("END DOC"));
-        assert!(outcome.markdown.contains("### Pointers"));
         assert!(
             outcome
                 .markdown
-                .contains("b.txt (ref: workdir:docs/b.txt, importance: recommended)")
+                .contains("The document titled a is included in the block below:")
+        );
+        assert!(outcome.markdown.contains("alpha"));
+        assert!(outcome.markdown.contains("End document"));
+        assert!(outcome.markdown.contains("### Pointers"));
+        let b_path = tmp.path().join("docs/b.txt").to_string_lossy().into_owned();
+        assert!(
+            outcome
+                .markdown
+                .contains(&format!("b.txt (ref: {b_path}, importance: recommended)"))
         );
 
         let docs = &outcome.doc_plan.docs;
@@ -1064,11 +1089,22 @@ importance = "recommended"
         );
 
         assert!(outcome.markdown.contains("### Included Doc"));
-        assert!(outcome.markdown.contains("BEGIN DOC"));
+        assert!(
+            outcome
+                .markdown
+                .contains("The document titled included is included in the block below:")
+        );
         // Nested ``` in markdown docs should not terminate the outer fence (````).
         assert!(outcome.markdown.contains("````md"));
-        assert!(outcome.markdown.contains("END DOC"));
+        assert!(outcome.markdown.contains("End document"));
         assert!(outcome.markdown.contains("### Pointers"));
-        assert!(outcome.markdown.contains("Pointer Doc (ref: workdir:docs/pointer.md, importance: recommended): First paragraph is used as a summary."));
+        let pointer_path = tmp
+            .path()
+            .join("docs/pointer.md")
+            .to_string_lossy()
+            .into_owned();
+        assert!(outcome.markdown.contains(&format!(
+            "Pointer Doc (ref: {pointer_path}, importance: recommended): First paragraph is used as a summary."
+        )));
     }
 }
