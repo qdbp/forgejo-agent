@@ -633,6 +633,16 @@ fn terminal_spec_from_outcome(
     }
 }
 
+fn work_state_transition_target(
+    directive: &str,
+    state_literal: DispatchState,
+) -> Option<&'static str> {
+    // Keep work-plane workflow semantics independent from dispatch runtime outcomes.
+    // `state/blocked` is reserved for explicit dependency blockers, not generic dispatch failures.
+    (directive_uses_worktree(directive) && state_literal == DispatchState::Completed)
+        .then_some("review")
+}
+
 fn maybe_post_landing_comment(
     args: &FinalizeDispatchArgs,
     comment: &LandingCommentSpec,
@@ -800,13 +810,8 @@ pub(super) fn finalize_dispatch_command(args: FinalizeDispatchArgs) -> Result<()
         eprintln!("finalize-dispatch: landing comment failed: {err}");
     }
 
-    let work_state_target = directive_uses_worktree(args.directive.as_str()).then_some(
-        if status_spec.state_literal == DispatchState::Completed {
-            "review"
-        } else {
-            "blocked"
-        },
-    );
+    let work_state_target =
+        work_state_transition_target(args.directive.as_str(), status_spec.state_literal);
 
     if let Some(work_state_target) = work_state_target {
         let phase_transition_start = Instant::now();
@@ -928,7 +933,9 @@ mod tests {
     use std::path::PathBuf;
 
     use super::merge_endpoint_reports_try_again_later;
+    use super::work_state_transition_target;
     use forgejo_agent::api::ApiHttpError;
+    use forgejo_agent::orchd_dispatch_core::DispatchState;
 
     #[test]
     fn merge_endpoint_transient_405_is_detected() {
@@ -971,5 +978,32 @@ mod tests {
             .expect("rendered template includes a parseable directive line");
         assert_eq!(parsed.role, "codex-orch");
         assert_eq!(parsed.directive, "impl");
+    }
+
+    #[test]
+    fn work_state_transition_only_happens_on_completed_impl() {
+        assert_eq!(
+            work_state_transition_target(super::DIRECTIVE_IMPL, DispatchState::Completed),
+            Some("review")
+        );
+        assert_eq!(
+            work_state_transition_target(super::DIRECTIVE_IMPL, DispatchState::Blocked),
+            None
+        );
+        assert_eq!(
+            work_state_transition_target(super::DIRECTIVE_IMPL, DispatchState::FailedRuntime),
+            None
+        );
+        assert_eq!(
+            work_state_transition_target(super::DIRECTIVE_IMPL, DispatchState::TimedOut),
+            None
+        );
+        assert_eq!(
+            work_state_transition_target(
+                super::super::lexicon::DIRECTIVE_DESIGN,
+                DispatchState::Completed
+            ),
+            None
+        );
     }
 }

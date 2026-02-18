@@ -158,6 +158,7 @@ Core behavior:
 - directive parse (`@codex-orch design|investigate|impl|reply`; `poke` is an alias for `reply`, and `@codex` aliases to `@codex-orch`)
 - sqlite event/decision/dispatch persistence
 - runtime dispatch status projected to `orchd/state/*` labels (`queued|running|blocked|failed|completed`)
+- successful `impl` completion transitions the issue workflow to `state/review` (dispatch failures do not force `state/blocked`)
 - one active dispatch per issue (duplicates blocked while running)
 - issue+role-scoped codex session reuse (`codex exec resume`) from latest `codex_session_id`
 - periodic heartbeat + reconcile scan logs
