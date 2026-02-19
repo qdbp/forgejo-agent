@@ -3753,7 +3753,10 @@ fn live_orchd_deploy_failure_opens_autoticket_with_impl_ping() -> Result<()> {
     )?;
 
     let managed_repo = harness.repo_ref.clone();
-    let env = [("ORCHD_DEPLOY_MANAGED_REPO", managed_repo.as_str())];
+    let env = [
+        ("ORCHD_DEPLOY_MANAGED_REPO", managed_repo.as_str()),
+        ("ORCHD_EMBEDDED_DEPLOY_WORKER", "1"),
+    ];
     let port = pick_unused_port().ok_or_else(|| anyhow!("failed to pick unused port"))?;
     let orchd = OrchdTestProcess::spawn(OrchdSpawnInputs {
         listen_port: port,

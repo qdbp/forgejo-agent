@@ -165,7 +165,7 @@ Core behavior:
 - sqlite event/decision/dispatch persistence
 - runtime dispatch status projected to `orchd/state/*` labels (`queued|running|blocked|failed|completed`)
 - successful `impl` completion transitions the issue workflow to `state/done` (dispatch failures do not force `state/blocked`)
-- for `main/forgejo-agent`, deploy is now push-driven via a dedicated `deploy_jobs` queue and orchd-owned checkout (not the human principal checkout); deploy failures trigger rollback-safe handling and auto-open a self-healing issue pinging `@codex-orch impl`
+- for `main/forgejo-agent`, deploy is push-driven via a dedicated `deploy_jobs` queue and orchd-owned checkout (not the human principal checkout); deploy execution is handled by `orchd deploy worker` (separate service lane), and failures auto-open a self-healing issue pinging `@codex-orch impl`
 - reconcile auto-closes only when the issue is `state/done` and `orchd/state/completed`; `state/review` stays open for explicit human verification
 - one active dispatch per issue (duplicates blocked while running)
 - queue scheduling uses a per-issue FIFO head (`MIN(decision.id)` among pending), with same-actor + same-directive + same-target-role pending entries coalesced to the latest
@@ -232,6 +232,7 @@ The installer enables both `orchd.service` and a metronome
 `orchd-schedule-tick.timer` (every 60s), so timer schedules stay in
 `/home/main/swarm/config/orchd-dispatch.toml` instead of per-timer systemd
 units.
+It also enables `orchd-deployd.service`, the dedicated deploy worker lane.
 
 If you already have `orchd.service` installed and only need to install/enable
 the scheduler timer as a user unit:
@@ -247,11 +248,24 @@ Then:
 
 ```bash
 XDG_RUNTIME_DIR=/run/user/$(id -u) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus systemctl --user status orchd.service --no-pager
+XDG_RUNTIME_DIR=/run/user/$(id -u) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus systemctl --user status orchd-deployd.service --no-pager
 XDG_RUNTIME_DIR=/run/user/$(id -u) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus systemctl --user status orchd-schedule-tick.timer --no-pager
 XDG_RUNTIME_DIR=/run/user/$(id -u) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus systemctl --user list-timers orchd-schedule-tick.timer --no-pager
 XDG_RUNTIME_DIR=/run/user/$(id -u) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus systemctl --user restart orchd.service
+XDG_RUNTIME_DIR=/run/user/$(id -u) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus systemctl --user restart orchd-deployd.service
 XDG_RUNTIME_DIR=/run/user/$(id -u) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus journalctl --user -u orchd.service -f
+XDG_RUNTIME_DIR=/run/user/$(id -u) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus journalctl --user -u orchd-deployd.service -f
 XDG_RUNTIME_DIR=/run/user/$(id -u) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus journalctl --user -u orchd-schedule-tick.service -f
+```
+
+Deploy worker manual invoke:
+
+```bash
+cargo run --bin orchd -- \
+  --token-file ~/.config/forgejo-agent/creds/orchd.token \
+  --db-path ~/.local/state/orchd-dev/orchd.sqlite \
+  --dispatch-config /home/main/swarm/config/orchd-dispatch.toml \
+  deploy worker --once
 ```
 
 Run (`dry-run`):
@@ -372,8 +386,6 @@ Installed hooks:
 
 - `pre-commit`: runs `scripts/check.py`
 - `pre-push`: runs `scripts/check.py`
-- `post-commit`: runs `scripts/deploy-local.sh` (builds + installs `forgejoctl` + `orchd`; when `orchd.service` exists, syncs user units and restarts both `orchd.service` and `orchd-schedule-tick.timer`)
-- `post-merge`: runs `scripts/deploy-local.sh` (keeps artifacts deployed after pulls/merges; failures are no longer silently ignored)
 
 `check.py` includes a skill/API sync enforcement hook:
 

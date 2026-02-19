@@ -1,9 +1,0 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-ROOT_DIR="$(git rev-parse --show-toplevel)"
-cd "$ROOT_DIR"
-
-echo "[post-commit] deploying local artifacts"
-./scripts/deploy-local.sh
-

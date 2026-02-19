@@ -43,12 +43,15 @@ pub(super) struct Cli {
 pub(super) enum OrchdCommand {
     FinalizeDispatch(Box<FinalizeDispatchArgs>),
     RunDispatch(RunDispatchArgs),
+    SchemaContract(SchemaContractArgs),
     #[command(subcommand)]
     Obs(ObsCommand),
     #[command(subcommand)]
     Role(RoleCommand),
     #[command(subcommand)]
     Schedule(ScheduleCommand),
+    #[command(subcommand)]
+    Deploy(DeployCommand),
 }
 
 #[derive(Subcommand, Debug)]
@@ -93,6 +96,11 @@ pub(super) enum ScheduleCommand {
     Tick(ScheduleTickArgs),
 }
 
+#[derive(Subcommand, Debug)]
+pub(super) enum DeployCommand {
+    Worker(DeployWorkerArgs),
+}
+
 #[derive(Args, Debug)]
 pub(super) struct ScheduleListArgs {
     #[arg(long)]
@@ -105,6 +113,22 @@ pub(super) struct ScheduleTickArgs {
     pub(super) timer: Option<String>,
     #[arg(long)]
     pub(super) manual: bool,
+}
+
+#[derive(Args, Debug)]
+pub(super) struct DeployWorkerArgs {
+    #[arg(long, default_value_t = 15)]
+    pub(super) interval_sec: u64,
+    #[arg(long)]
+    pub(super) once: bool,
+    #[arg(long)]
+    pub(super) worker_identity: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub(super) struct SchemaContractArgs {
+    #[arg(long)]
+    pub(super) json: bool,
 }
 
 #[derive(Args, Debug)]

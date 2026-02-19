@@ -9,7 +9,8 @@ struct Migration {
     apply: fn(&mut Connection) -> Result<()>,
 }
 
-const LATEST_SCHEMA_VERSION: i64 = 12;
+pub(super) const LATEST_SCHEMA_VERSION: i64 = 13;
+pub(super) const MIN_COMPAT_SCHEMA_VERSION: i64 = 1;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -72,6 +73,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "add_deploy_jobs_table",
         apply: migration_0012_add_deploy_jobs_table,
     },
+    Migration {
+        version: 13,
+        name: "ensure_deploy_v2_tables",
+        apply: migration_0013_ensure_deploy_v2_tables,
+    },
 ];
 
 pub(super) fn apply_all(conn: &mut Connection) -> Result<()> {
@@ -98,6 +104,10 @@ pub(super) fn apply_all(conn: &mut Connection) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+pub(super) const fn schema_contract() -> (i64, i64) {
+    (LATEST_SCHEMA_VERSION, MIN_COMPAT_SCHEMA_VERSION)
 }
 
 fn ensure_schema_migrations_table(conn: &Connection) -> Result<()> {
@@ -590,6 +600,47 @@ fn migration_0012_add_deploy_jobs_table(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+fn migration_0013_ensure_deploy_v2_tables(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if table_exists(&tx, "deploy_jobs")? {
+        ensure_column_exists_tx(&tx, "deploy_jobs", "superseded_by_job_id", "INTEGER")?;
+        ensure_column_exists_tx(&tx, "deploy_jobs", "worker_identity", "TEXT")?;
+    }
+    tx.execute_batch(
+        r"
+        CREATE TABLE IF NOT EXISTS deploy_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            deploy_job_id INTEGER NOT NULL,
+            repo_full_name TEXT NOT NULL,
+            target_branch TEXT NOT NULL,
+            target_sha TEXT NOT NULL,
+            phase TEXT NOT NULL,
+            status TEXT NOT NULL,
+            reason_code TEXT,
+            detail_json TEXT,
+            started_at TEXT NOT NULL,
+            ended_at TEXT,
+            FOREIGN KEY(deploy_job_id) REFERENCES deploy_jobs(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_deploy_runs_job_id
+            ON deploy_runs (deploy_job_id, id DESC);
+        CREATE INDEX IF NOT EXISTS idx_deploy_runs_status_id
+            ON deploy_runs (status, id DESC);
+
+        CREATE TABLE IF NOT EXISTS deploy_releases (
+            repo_full_name TEXT NOT NULL,
+            target_branch TEXT NOT NULL,
+            active_sha TEXT,
+            previous_sha TEXT,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(repo_full_name, target_branch)
+        );
+        ",
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn ensure_timer_schedule_context_schema(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     if table_exists(&tx, "decisions")? {
@@ -646,6 +697,8 @@ mod tests {
         assert!(table_exists(&conn, "schedule_claims").expect("table exists"));
         assert!(table_exists(&conn, "timer_contexts").expect("table exists"));
         assert!(table_exists(&conn, "deploy_jobs").expect("table exists"));
+        assert!(table_exists(&conn, "deploy_runs").expect("table exists"));
+        assert!(table_exists(&conn, "deploy_releases").expect("table exists"));
         assert!(!table_has_column(&conn, "dispatches", "tmux_session").expect("pragma"));
         assert!(!table_has_column(&conn, "dispatches", "tmux_window").expect("pragma"));
         assert!(table_has_column(&conn, "dispatches", "backend_kind").expect("pragma"));
@@ -733,6 +786,8 @@ mod tests {
         assert!(table_exists(&conn, "schedule_claims").expect("table exists"));
         assert!(table_exists(&conn, "timer_contexts").expect("table exists"));
         assert!(table_exists(&conn, "deploy_jobs").expect("table exists"));
+        assert!(table_exists(&conn, "deploy_runs").expect("table exists"));
+        assert!(table_exists(&conn, "deploy_releases").expect("table exists"));
         assert!(!table_has_column(&conn, "dispatches", "tmux_session").expect("pragma"));
         assert!(!table_has_column(&conn, "dispatches", "tmux_window").expect("pragma"));
         assert!(table_has_column(&conn, "trigger_dispatch_dedupes", "dedupe_key").expect("pragma"));
@@ -823,6 +878,8 @@ mod tests {
         assert!(table_exists(&conn, "schedule_claims").expect("table exists"));
         assert!(table_exists(&conn, "timer_contexts").expect("table exists"));
         assert!(table_exists(&conn, "deploy_jobs").expect("table exists"));
+        assert!(table_exists(&conn, "deploy_runs").expect("table exists"));
+        assert!(table_exists(&conn, "deploy_releases").expect("table exists"));
         assert_eq!(
             current_schema_version(&conn).expect("schema version query"),
             LATEST_SCHEMA_VERSION
@@ -861,6 +918,8 @@ mod tests {
         assert!(table_exists(&conn, "schedule_claims").expect("table exists"));
         assert!(table_exists(&conn, "timer_contexts").expect("table exists"));
         assert!(table_exists(&conn, "deploy_jobs").expect("table exists"));
+        assert!(table_exists(&conn, "deploy_runs").expect("table exists"));
+        assert!(table_exists(&conn, "deploy_releases").expect("table exists"));
         assert_eq!(
             current_schema_version(&conn).expect("schema version query"),
             LATEST_SCHEMA_VERSION

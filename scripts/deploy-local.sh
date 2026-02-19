@@ -8,13 +8,16 @@ SERVICE_FILE="${ORCHD_SERVICE_FILE:-$HOME/.config/systemd/user/orchd.service}"
 SERVICE_DIR="${ORCHD_SERVICE_DIR:-$(dirname "$SERVICE_FILE")}"
 SCHEDULE_SERVICE_FILE="${ORCHD_SCHEDULE_SERVICE_FILE:-$SERVICE_DIR/orchd-schedule-tick.service}"
 SCHEDULE_TIMER_FILE="${ORCHD_SCHEDULE_TIMER_FILE:-$SERVICE_DIR/orchd-schedule-tick.timer}"
+DEPLOYD_SERVICE_FILE="${ORCHD_DEPLOYD_SERVICE_FILE:-$SERVICE_DIR/orchd-deployd.service}"
 FORGEJOCTL_BIN="${FORGEJOCTL_BIN:-$HOME/.local/bin/forgejoctl}"
 ORCHD_BIN="${ORCHD_BIN:-$HOME/.local/bin/orchd}"
 ORCHD_SERVICE_TEMPLATE="${ORCHD_SERVICE_TEMPLATE:-$ROOT_DIR/templates/orchd.service}"
+DEPLOYD_SERVICE_TEMPLATE="${ORCHD_DEPLOYD_SERVICE_TEMPLATE:-$ROOT_DIR/templates/orchd-deployd.service}"
 SCHEDULE_SERVICE_TEMPLATE="${ORCHD_SCHEDULE_SERVICE_TEMPLATE:-$ROOT_DIR/templates/orchd-schedule-tick.service}"
 SCHEDULE_TIMER_TEMPLATE="${ORCHD_SCHEDULE_TIMER_TEMPLATE:-$ROOT_DIR/templates/orchd-schedule-tick.timer}"
 SKIP_ORCHD_RESTART="${ORCHD_DEPLOY_SKIP_ORCHD_RESTART:-0}"
 SKIP_TIMER_RESTART="${ORCHD_DEPLOY_SKIP_TIMER_RESTART:-0}"
+SKIP_DEPLOYD_RESTART="${ORCHD_DEPLOY_SKIP_DEPLOYD_RESTART:-0}"
 
 snapshot_dir=""
 rollback_needed=0
@@ -69,9 +72,15 @@ restart_orchd_service() {
   systemctl --user --quiet is-active orchd.service
 }
 
+restart_deployd_service() {
+  systemctl --user restart orchd-deployd.service
+  systemctl --user --quiet is-active orchd-deployd.service
+}
+
 install_orchd_units() {
   mkdir -p "$SERVICE_DIR"
   install -m 0644 "$ORCHD_SERVICE_TEMPLATE" "$SERVICE_FILE"
+  install -m 0644 "$DEPLOYD_SERVICE_TEMPLATE" "$DEPLOYD_SERVICE_FILE"
   install -m 0644 "$SCHEDULE_SERVICE_TEMPLATE" "$SCHEDULE_SERVICE_FILE"
   install -m 0644 "$SCHEDULE_TIMER_TEMPLATE" "$SCHEDULE_TIMER_FILE"
 }
@@ -99,6 +108,13 @@ rollback_install() {
     else
       echo "[deploy-local] rollback: orchd.service restore failed" >&2
     fi
+    if [[ -f "$DEPLOYD_SERVICE_FILE" ]]; then
+      if restart_deployd_service; then
+        echo "[deploy-local] rollback: orchd-deployd.service restored" >&2
+      else
+        echo "[deploy-local] rollback: orchd-deployd.service restore failed" >&2
+      fi
+    fi
   fi
 }
 
@@ -123,13 +139,20 @@ if [[ -f "$SERVICE_FILE" ]]; then
   ensure_systemd_user_env
   install_orchd_units
   systemctl --user daemon-reload
-  systemctl --user enable --now orchd.service
+  systemctl --user enable --now orchd.service orchd-deployd.service
   if [[ "$SKIP_ORCHD_RESTART" == "1" ]]; then
     echo "[deploy-local] skipping orchd.service restart (ORCHD_DEPLOY_SKIP_ORCHD_RESTART=1)"
   else
     echo "[deploy-local] restarting orchd.service"
     restart_orchd_service
     echo "[deploy-local] orchd.service is active"
+  fi
+  if [[ "$SKIP_DEPLOYD_RESTART" == "1" ]]; then
+    echo "[deploy-local] skipping orchd-deployd.service restart (ORCHD_DEPLOY_SKIP_DEPLOYD_RESTART=1)"
+  else
+    echo "[deploy-local] restarting orchd-deployd.service"
+    restart_deployd_service
+    echo "[deploy-local] orchd-deployd.service is active"
   fi
   if [[ "$SKIP_TIMER_RESTART" == "1" ]]; then
     echo "[deploy-local] skipping orchd-schedule-tick.timer restart (ORCHD_DEPLOY_SKIP_TIMER_RESTART=1)"

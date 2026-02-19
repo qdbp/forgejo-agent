@@ -113,6 +113,7 @@ pub(super) enum DeployJobStatus {
     Running,
     Succeeded,
     Failed,
+    Superseded,
 }
 
 impl DeployJobStatus {
@@ -122,6 +123,7 @@ impl DeployJobStatus {
             Self::Running => "running",
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
+            Self::Superseded => "superseded",
         }
     }
 }
@@ -169,6 +171,29 @@ pub(super) struct DeployJobSuccessUpdate<'a> {
 pub(super) enum DeployEnqueueOutcome {
     Inserted,
     Existing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DeployRunStatus {
+    Running,
+    Succeeded,
+    Failed,
+}
+
+impl DeployRunStatus {
+    pub(super) const fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct DeployReleaseState {
+    pub(super) active_sha: Option<String>,
+    pub(super) previous_sha: Option<String>,
 }
 
 pub(super) fn init_db(db_path: &Path) -> Result<()> {
@@ -337,8 +362,10 @@ pub(super) fn enqueue_deploy_job(
     source_delivery_id: Option<&str>,
     source_actor_login: Option<&str>,
 ) -> Result<DeployEnqueueOutcome> {
-    let conn = open_db(db_path)?;
-    let inserted = conn.execute(
+    let mut conn = open_db(db_path)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let now = Utc::now().to_rfc3339();
+    let inserted = tx.execute(
         r"
         INSERT INTO deploy_jobs (
             repo_full_name,
@@ -359,11 +386,35 @@ pub(super) fn enqueue_deploy_job(
             source_delivery_id,
             source_actor_login,
             DeployJobStatus::Queued.as_db_str(),
-            Utc::now().to_rfc3339(),
+            now,
         ],
     );
-    match inserted {
-        Ok(_) => Ok(DeployEnqueueOutcome::Inserted),
+    let outcome = match inserted {
+        Ok(_) => {
+            tx.execute(
+                r"
+                UPDATE deploy_jobs
+                SET status = ?1,
+                    reason_code = 'superseded_by_newer_sha',
+                    error_text = NULL,
+                    started_at = NULL,
+                    ended_at = ?2
+                WHERE repo_full_name = ?3
+                  AND target_branch = ?4
+                  AND status = ?5
+                  AND target_sha <> ?6
+                ",
+                params![
+                    DeployJobStatus::Superseded.as_db_str(),
+                    now,
+                    repo_full_name,
+                    target_branch,
+                    DeployJobStatus::Queued.as_db_str(),
+                    target_sha
+                ],
+            )?;
+            DeployEnqueueOutcome::Inserted
+        }
         Err(err) => {
             let duplicate = matches!(
                 err,
@@ -371,12 +422,14 @@ pub(super) fn enqueue_deploy_job(
                     if matches!(sqlite_err.extended_code, 1555 | 2067)
             );
             if duplicate {
-                Ok(DeployEnqueueOutcome::Existing)
+                DeployEnqueueOutcome::Existing
             } else {
-                Err(err.into())
+                return Err(err.into());
             }
         }
-    }
+    };
+    tx.commit()?;
+    Ok(outcome)
 }
 
 pub(super) fn requeue_running_deploy_jobs(db_path: &Path) -> Result<u64> {
@@ -549,6 +602,137 @@ pub(super) fn complete_deploy_job_failure(
                 .map(|path| path.to_string_lossy().into_owned()),
             update.incident_issue_number,
             update.rollback_status,
+            Utc::now().to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+pub(super) fn mark_deploy_job_worker_identity(
+    db_path: &Path,
+    job_id: i64,
+    worker_identity: &str,
+) -> Result<()> {
+    let conn = open_db(db_path)?;
+    conn.execute(
+        r"
+        UPDATE deploy_jobs
+        SET worker_identity = ?2
+        WHERE id = ?1
+        ",
+        params![job_id, worker_identity],
+    )?;
+    Ok(())
+}
+
+pub(super) fn start_deploy_run(
+    db_path: &Path,
+    job: &DeployJob,
+    phase: &str,
+    detail_json: Option<&str>,
+) -> Result<i64> {
+    let conn = open_db(db_path)?;
+    conn.execute(
+        r"
+        INSERT INTO deploy_runs (
+            deploy_job_id,
+            repo_full_name,
+            target_branch,
+            target_sha,
+            phase,
+            status,
+            detail_json,
+            started_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        ",
+        params![
+            job.id,
+            job.repo_full_name,
+            job.target_branch,
+            job.target_sha,
+            phase,
+            DeployRunStatus::Running.as_db_str(),
+            detail_json,
+            Utc::now().to_rfc3339(),
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub(super) fn finish_deploy_run(
+    db_path: &Path,
+    run_id: i64,
+    status: DeployRunStatus,
+    reason_code: Option<&str>,
+    detail_json: Option<&str>,
+) -> Result<()> {
+    let conn = open_db(db_path)?;
+    conn.execute(
+        r"
+        UPDATE deploy_runs
+        SET status = ?2,
+            reason_code = ?3,
+            detail_json = COALESCE(?4, detail_json),
+            ended_at = ?5
+        WHERE id = ?1
+        ",
+        params![
+            run_id,
+            status.as_db_str(),
+            reason_code,
+            detail_json,
+            Utc::now().to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+pub(super) fn deploy_release_state(
+    db_path: &Path,
+    repo_full_name: &str,
+    target_branch: &str,
+) -> Result<Option<DeployReleaseState>> {
+    let conn = open_db(db_path)?;
+    conn.query_row(
+        r"
+        SELECT active_sha, previous_sha
+        FROM deploy_releases
+        WHERE repo_full_name = ?1 AND target_branch = ?2
+        ",
+        params![repo_full_name, target_branch],
+        |row| {
+            Ok(DeployReleaseState {
+                active_sha: row.get(0)?,
+                previous_sha: row.get(1)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+pub(super) fn upsert_deploy_release_state(
+    db_path: &Path,
+    repo_full_name: &str,
+    target_branch: &str,
+    active_sha: Option<&str>,
+    previous_sha: Option<&str>,
+) -> Result<()> {
+    let conn = open_db(db_path)?;
+    conn.execute(
+        r"
+        INSERT INTO deploy_releases(repo_full_name, target_branch, active_sha, previous_sha, updated_at)
+        VALUES (?1, ?2, ?3, ?4, ?5)
+        ON CONFLICT(repo_full_name, target_branch)
+        DO UPDATE SET active_sha = excluded.active_sha,
+                      previous_sha = excluded.previous_sha,
+                      updated_at = excluded.updated_at
+        ",
+        params![
+            repo_full_name,
+            target_branch,
+            active_sha,
+            previous_sha,
             Utc::now().to_rfc3339(),
         ],
     )?;
@@ -3856,6 +4040,53 @@ mod tests {
         assert_eq!(second_claim.id, first_claim.id);
         assert_eq!(second_claim.attempt_count, 2);
         assert_eq!(second_claim.status, super::DeployJobStatus::Running);
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn deploy_enqueue_supersedes_older_queued_sha_same_lane() {
+        let db_path = temp_db_path("deploy-jobs-supersede");
+        super::init_db(&db_path).expect("db init");
+
+        super::enqueue_deploy_job(
+            &db_path,
+            "main/forgejo-agent",
+            "main",
+            "1111111111111111111111111111111111111111",
+            None,
+            Some("delivery-1"),
+            Some("main"),
+        )
+        .expect("enqueue first");
+        super::enqueue_deploy_job(
+            &db_path,
+            "main/forgejo-agent",
+            "main",
+            "2222222222222222222222222222222222222222",
+            None,
+            Some("delivery-2"),
+            Some("main"),
+        )
+        .expect("enqueue newer");
+
+        let conn = super::open_db(&db_path).expect("open db");
+        let older_status: String = conn
+            .query_row(
+                "SELECT status FROM deploy_jobs WHERE target_sha = '1111111111111111111111111111111111111111'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query old status");
+        let newer_status: String = conn
+            .query_row(
+                "SELECT status FROM deploy_jobs WHERE target_sha = '2222222222222222222222222222222222222222'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query new status");
+        assert_eq!(older_status, super::DeployJobStatus::Superseded.as_db_str());
+        assert_eq!(newer_status, super::DeployJobStatus::Queued.as_db_str());
 
         let _ = fs::remove_file(db_path);
     }

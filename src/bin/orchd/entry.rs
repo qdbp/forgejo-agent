@@ -2,11 +2,13 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use super::cli::{
-    Cli, IssueCommand, ObsCommand, OrchdCommand, PromptCommand, RoleCommand, ScheduleCommand,
-    TimerCommand,
+    Cli, DeployCommand, IssueCommand, ObsCommand, OrchdCommand, PromptCommand, RoleCommand,
+    ScheduleCommand, TimerCommand,
 };
+use super::deploy;
 use super::finalize;
 use super::issue;
+use super::migrations;
 use super::prompt;
 use super::role;
 use super::run_dispatch;
@@ -34,9 +36,26 @@ fn run_command(cli: &Cli, command: OrchdCommand) -> Result<()> {
     match command {
         OrchdCommand::FinalizeDispatch(args) => finalize::finalize_dispatch_command(*args),
         OrchdCommand::RunDispatch(args) => run_dispatch::run_dispatch_command(args),
+        OrchdCommand::SchemaContract(args) => {
+            let (latest, min_compatible) = migrations::schema_contract();
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "latest": latest,
+                        "min_compatible": min_compatible,
+                    })
+                );
+            } else {
+                println!("latest={latest}");
+                println!("min_compatible={min_compatible}");
+            }
+            Ok(())
+        }
         OrchdCommand::Obs(command) => run_obs_command(cli, command),
         OrchdCommand::Role(command) => run_role_command(cli, command),
         OrchdCommand::Schedule(command) => run_schedule_command(cli, command),
+        OrchdCommand::Deploy(command) => run_deploy_command(cli, command),
     }
 }
 
@@ -80,5 +99,11 @@ fn run_schedule_command(cli: &Cli, command: ScheduleCommand) -> Result<()> {
     match command {
         ScheduleCommand::List(args) => schedule::schedule_list_command(cli, args),
         ScheduleCommand::Tick(args) => schedule::schedule_tick_command(cli, args),
+    }
+}
+
+fn run_deploy_command(cli: &Cli, command: DeployCommand) -> Result<()> {
+    match command {
+        DeployCommand::Worker(args) => deploy::deploy_worker_command(cli, args),
     }
 }

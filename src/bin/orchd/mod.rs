@@ -85,7 +85,7 @@ mod telemetry;
 // Desktop notification loop for dispatch lifecycle and codex replies. Read when changing operator alerts.
 mod notifier;
 
-// Push-triggered deploy queue + dedicated deploy checkout executor. Read when changing autodeploy behavior.
+// Push-triggered deploy queue + Rust-native deploy worker lane (`orchd deploy worker`). Read when changing autodeploy behavior.
 mod deploy;
 
 // Axum server (webhook ingress) + background loops. Read when changing runtime wiring or webhook handling.

@@ -348,11 +348,22 @@ pub(super) async fn run_server(cli: Cli) -> Result<()> {
         run_dispatch_queue_loop(queue_state, cli.heartbeat_sec).await;
     });
 
-    if matches!(state.dispatch_mode, DispatchMode::Exec) {
+    let embedded_deploy_worker = std::env::var("ORCHD_EMBEDDED_DEPLOY_WORKER")
+        .ok()
+        .is_some_and(|value| value == "1");
+    if matches!(state.dispatch_mode, DispatchMode::Exec) && embedded_deploy_worker {
         let deploy_state = state.clone();
         tokio::spawn(async move {
             run_deploy_loop(deploy_state, cli.heartbeat_sec).await;
         });
+    } else if matches!(state.dispatch_mode, DispatchMode::Exec) {
+        log_line(
+            "deploy_worker_external_mode",
+            json!({
+                "enabled": false,
+                "hint": "run `orchd deploy worker` as a separate service",
+            }),
+        );
     }
 
     if let Some(notifications) = state
