@@ -4,6 +4,7 @@
 
 pub(super) const EVENT_ISSUES: &str = "issues";
 pub(super) const EVENT_ISSUE_COMMENT: &str = "issue_comment";
+pub(super) const EVENT_SCHEDULE: &str = "schedule";
 
 pub(super) const DECISION_ACCEPTED: &str = "accepted";
 pub(super) const DECISION_IGNORED: &str = "ignored";

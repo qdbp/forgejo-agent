@@ -842,13 +842,36 @@ async fn plan_dispatch(
         });
     }
 
-    let issue_session_id = db::latest_issue_role_codex_session_id(
-        &state.db_path,
-        &intent.repo_full_name,
-        intent.issue_number,
-        &intent.role,
-    )
-    .map_err(|err| DispatchError::Db(err.to_string()))?;
+    let issue_session_id = if let Some(explicit_session_id) = decision
+        .resume_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(explicit_session_id.to_string())
+    } else {
+        db::latest_issue_role_codex_session_id(
+            &state.db_path,
+            &intent.repo_full_name,
+            intent.issue_number,
+            &intent.role,
+        )
+        .map_err(|err| DispatchError::Db(err.to_string()))?
+    };
+    let timer_context_cwd = if let Some(context_key) = decision.timer_context_key.as_deref() {
+        db::timer_context(&state.db_path, context_key)
+            .map_err(|err| DispatchError::Db(err.to_string()))?
+            .and_then(|context| {
+                let raw = context.cwd.trim();
+                if raw.is_empty() {
+                    None
+                } else {
+                    Some(PathBuf::from(raw))
+                }
+            })
+    } else {
+        None
+    };
     let lock_path = repo::acquire_repo_lock(&state.db_path, &intent.repo_full_name)?;
 
     let repo_ref = RepoRef::parse(&intent.repo_full_name)
@@ -1009,8 +1032,19 @@ async fn plan_dispatch(
                 )?;
                 (workdir, git_remote, git_base, git_branch)
             } else {
+                let run_cwd = if let Some(timer_cwd) = timer_context_cwd.clone() {
+                    fs::create_dir_all(&timer_cwd).map_err(|err| {
+                        DispatchError::Io(format!(
+                            "failed creating timer context cwd {}: {err}",
+                            timer_cwd.display()
+                        ))
+                    })?;
+                    timer_cwd
+                } else {
+                    base_repo_checkout
+                };
                 (
-                    base_repo_checkout,
+                    run_cwd,
                     repo::DEFAULT_GIT_REMOTE.to_string(),
                     repo::DEFAULT_GIT_BASE_BRANCH.to_string(),
                     String::new(),

@@ -1,12 +1,13 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use super::cli::{Cli, IssueCommand, OrchdCommand, PromptCommand, RoleCommand};
+use super::cli::{Cli, IssueCommand, OrchdCommand, PromptCommand, RoleCommand, ScheduleCommand};
 use super::finalize;
 use super::issue;
 use super::prompt;
 use super::role;
 use super::run_dispatch;
+use super::schedule;
 use super::server;
 use super::telemetry::init_telemetry;
 
@@ -32,6 +33,7 @@ fn run_command(cli: &Cli, command: OrchdCommand) -> Result<()> {
         OrchdCommand::Prompt(command) => run_prompt_command(cli, command),
         OrchdCommand::Issue(command) => run_issue_command(cli, command),
         OrchdCommand::Role(command) => run_role_command(cli, command),
+        OrchdCommand::Schedule(command) => run_schedule_command(cli, command),
     }
 }
 
@@ -53,5 +55,11 @@ fn run_role_command(cli: &Cli, command: RoleCommand) -> Result<()> {
         RoleCommand::List(args) => role::role_list_command(cli, args),
         RoleCommand::Check(args) => role::role_check_command(cli, args),
         RoleCommand::Add(args) => role::role_add_command(cli, *args),
+    }
+}
+
+fn run_schedule_command(cli: &Cli, command: ScheduleCommand) -> Result<()> {
+    match command {
+        ScheduleCommand::Tick(args) => schedule::schedule_tick_command(cli, args),
     }
 }

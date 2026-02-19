@@ -49,6 +49,8 @@ pub(super) enum OrchdCommand {
     Issue(IssueCommand),
     #[command(subcommand)]
     Role(RoleCommand),
+    #[command(subcommand)]
+    Schedule(ScheduleCommand),
 }
 
 #[derive(Subcommand, Debug)]
@@ -67,6 +69,17 @@ pub(super) enum RoleCommand {
     List(RoleListArgs),
     Check(RoleCheckArgs),
     Add(Box<RoleAddArgs>),
+}
+
+#[derive(Subcommand, Debug)]
+pub(super) enum ScheduleCommand {
+    Tick(ScheduleTickArgs),
+}
+
+#[derive(Args, Debug)]
+pub(super) struct ScheduleTickArgs {
+    #[arg(long)]
+    pub(super) timer: Option<String>,
 }
 
 #[derive(Args, Debug)]

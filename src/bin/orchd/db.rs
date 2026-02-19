@@ -90,6 +90,17 @@ pub(super) struct IssueTriggerGuardrailStats {
     pub(super) last_created_at: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct TimerContextRow {
+    pub(super) cwd: String,
+    pub(super) codex_session_id: Option<String>,
+    pub(super) run_count: u64,
+    pub(super) prompt_bytes_total: u64,
+    pub(super) last_context_pct: Option<u8>,
+    pub(super) last_status: Option<String>,
+    pub(super) updated_at: String,
+}
+
 pub(super) fn init_db(db_path: &Path) -> Result<()> {
     if let Some(parent) = db_path.parent() {
         fs::create_dir_all(parent)
@@ -276,7 +287,7 @@ pub(super) fn insert_event(db_path: &Path, event: &EventRecord) -> Result<Option
             let duplicate = matches!(
                 err,
                 rusqlite::Error::SqliteFailure(sqlite_err, _)
-                    if sqlite_err.extended_code == 2067
+                    if matches!(sqlite_err.extended_code, 1555 | 2067)
             );
             if duplicate { Ok(None) } else { Err(err.into()) }
         }
@@ -294,8 +305,8 @@ pub(super) fn insert_decision(
     conn.execute(
         r"
         INSERT INTO decisions
-        (event_id, repo_full_name, issue_number, actor_login, principal_login, directive, target_role, decision, reason_code, would_dispatch, created_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        (event_id, repo_full_name, issue_number, actor_login, principal_login, schedule_timer_id, timer_context_key, resume_session_id, directive, target_role, decision, reason_code, would_dispatch, created_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
         ",
         params![
             event_id,
@@ -303,6 +314,9 @@ pub(super) fn insert_decision(
             event.issue_number,
             event.actor_login,
             decision.principal_login,
+            decision.schedule_timer_id,
+            decision.timer_context_key,
+            decision.resume_session_id,
             decision.directive,
             decision.target_role,
             decision.decision,
@@ -346,7 +360,7 @@ pub(super) fn claim_trigger_dispatch_dedupe(
             let duplicate = matches!(
                 err,
                 rusqlite::Error::SqliteFailure(sqlite_err, _)
-                    if sqlite_err.extended_code == 2067
+                    if matches!(sqlite_err.extended_code, 1555 | 2067)
             );
             if duplicate {
                 Ok(false)
@@ -426,6 +440,283 @@ pub(super) fn issue_trigger_guardrail_stats(
         recent,
         last_created_at,
     })
+}
+
+pub(super) fn latest_schedule_slot_index(db_path: &Path, timer_id: &str) -> Result<Option<i64>> {
+    let conn = open_db(db_path)?;
+    conn.query_row(
+        r"
+        SELECT slot_index
+        FROM schedule_claims
+        WHERE timer_id = ?1
+        ORDER BY slot_index DESC
+        LIMIT 1
+        ",
+        params![timer_id],
+        |row| row.get::<_, i64>(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+pub(super) fn claim_schedule_slot(
+    db_path: &Path,
+    timer_id: &str,
+    slot_index: i64,
+    scheduled_for: &str,
+) -> Result<bool> {
+    let conn = open_db(db_path)?;
+    let inserted = conn.execute(
+        r"
+        INSERT INTO schedule_claims (
+            timer_id,
+            slot_index,
+            scheduled_for,
+            issue_number,
+            event_id,
+            decision_id,
+            created_at
+        )
+        VALUES (?1, ?2, ?3, NULL, NULL, NULL, ?4)
+        ",
+        params![timer_id, slot_index, scheduled_for, Utc::now().to_rfc3339()],
+    );
+    match inserted {
+        Ok(_) => Ok(true),
+        Err(err) => {
+            let duplicate = matches!(
+                err,
+                rusqlite::Error::SqliteFailure(sqlite_err, _)
+                    if matches!(sqlite_err.extended_code, 1555 | 2067)
+            );
+            if duplicate {
+                Ok(false)
+            } else {
+                Err(err.into())
+            }
+        }
+    }
+}
+
+pub(super) fn annotate_schedule_claim(
+    db_path: &Path,
+    timer_id: &str,
+    slot_index: i64,
+    issue_number: u64,
+    event_id: i64,
+    decision_id: i64,
+) -> Result<()> {
+    let conn = open_db(db_path)?;
+    conn.execute(
+        r"
+        UPDATE schedule_claims
+        SET issue_number = ?3,
+            event_id = ?4,
+            decision_id = ?5
+        WHERE timer_id = ?1
+          AND slot_index = ?2
+        ",
+        params![
+            timer_id,
+            slot_index,
+            i64::try_from(issue_number)?,
+            event_id,
+            decision_id
+        ],
+    )?;
+    Ok(())
+}
+
+pub(super) fn delete_schedule_claim(db_path: &Path, timer_id: &str, slot_index: i64) -> Result<()> {
+    let conn = open_db(db_path)?;
+    conn.execute(
+        r"
+        DELETE FROM schedule_claims
+        WHERE timer_id = ?1
+          AND slot_index = ?2
+        ",
+        params![timer_id, slot_index],
+    )?;
+    Ok(())
+}
+
+pub(super) fn timer_active_dispatch_count(db_path: &Path, timer_id: &str) -> Result<u64> {
+    let conn = open_db(db_path)?;
+    conn.query_row(
+        r"
+        SELECT COUNT(1)
+        FROM decisions d
+        LEFT JOIN dispatches x ON x.decision_id = d.id
+        WHERE d.schedule_timer_id = ?1
+          AND d.would_dispatch = 1
+          AND (
+              x.id IS NULL
+              OR x.status IN ('queued', 'launching', 'starting', 'running')
+          )
+        ",
+        params![timer_id],
+        |row| row.get::<_, u64>(0),
+    )
+    .map_err(Into::into)
+}
+
+pub(super) fn timer_context(db_path: &Path, context_key: &str) -> Result<Option<TimerContextRow>> {
+    let conn = open_db(db_path)?;
+    conn.query_row(
+        r"
+        SELECT
+            cwd,
+            codex_session_id,
+            run_count,
+            prompt_bytes_total,
+            last_context_pct,
+            last_status,
+            updated_at
+        FROM timer_contexts
+        WHERE context_key = ?1
+        ",
+        params![context_key],
+        |row| {
+            let run_count_i64: i64 = row.get(2)?;
+            let prompt_bytes_i64: i64 = row.get(3)?;
+            let last_context_pct_i64: Option<i64> = row.get(4)?;
+            Ok(TimerContextRow {
+                cwd: row.get(0)?,
+                codex_session_id: row.get(1)?,
+                run_count: u64::try_from(run_count_i64).unwrap_or(0),
+                prompt_bytes_total: u64::try_from(prompt_bytes_i64).unwrap_or(0),
+                last_context_pct: last_context_pct_i64.and_then(|value| u8::try_from(value).ok()),
+                last_status: row.get(5)?,
+                updated_at: row.get(6)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+pub(super) fn upsert_timer_context_seed(
+    db_path: &Path,
+    context_key: &str,
+    role_name: &str,
+    repo_full_name: &str,
+    principal_login: &str,
+    cwd: &str,
+) -> Result<()> {
+    let conn = open_db(db_path)?;
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        r"
+        INSERT INTO timer_contexts (
+            context_key,
+            role_name,
+            repo_full_name,
+            principal_login,
+            cwd,
+            codex_session_id,
+            run_count,
+            prompt_bytes_total,
+            last_context_pct,
+            last_status,
+            updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, NULL, 0, 0, NULL, NULL, ?6)
+        ON CONFLICT(context_key)
+        DO UPDATE SET
+            role_name = excluded.role_name,
+            repo_full_name = excluded.repo_full_name,
+            principal_login = excluded.principal_login,
+            cwd = excluded.cwd,
+            updated_at = excluded.updated_at
+        ",
+        params![
+            context_key,
+            role_name,
+            repo_full_name,
+            principal_login,
+            cwd,
+            now
+        ],
+    )?;
+    Ok(())
+}
+
+pub(super) fn reset_timer_context_state(db_path: &Path, context_key: &str) -> Result<()> {
+    let conn = open_db(db_path)?;
+    conn.execute(
+        r"
+        UPDATE timer_contexts
+        SET codex_session_id = NULL,
+            run_count = 0,
+            prompt_bytes_total = 0,
+            last_context_pct = NULL,
+            last_status = NULL,
+            updated_at = ?2
+        WHERE context_key = ?1
+        ",
+        params![context_key, Utc::now().to_rfc3339()],
+    )?;
+    Ok(())
+}
+
+pub(super) fn record_timer_context_completion(
+    db_path: &Path,
+    dispatch_id: i64,
+    session_id: Option<&str>,
+    status: &str,
+    prompt_bytes: u64,
+    context_pct: Option<u8>,
+) -> Result<()> {
+    let mut conn = open_db(db_path)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let Some(context_key) = tx
+        .query_row(
+            r"
+            SELECT d.timer_context_key
+            FROM dispatches x
+            JOIN decisions d ON d.id = x.decision_id
+            WHERE x.id = ?1
+            ",
+            params![dispatch_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten()
+    else {
+        tx.commit()?;
+        return Ok(());
+    };
+    let session_id = session_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let prompt_bytes_i64 = i64::try_from(prompt_bytes).unwrap_or(i64::MAX);
+    let context_pct_i64 = context_pct.map(i64::from);
+    tx.execute(
+        r"
+        UPDATE timer_contexts
+        SET codex_session_id = CASE
+                WHEN ?2 IS NULL OR trim(?2) = '' THEN codex_session_id
+                ELSE ?2
+            END,
+            run_count = run_count + 1,
+            prompt_bytes_total = prompt_bytes_total + ?3,
+            last_context_pct = ?4,
+            last_status = ?5,
+            updated_at = ?6
+        WHERE context_key = ?1
+        ",
+        params![
+            context_key,
+            session_id,
+            prompt_bytes_i64,
+            context_pct_i64,
+            status,
+            Utc::now().to_rfc3339()
+        ],
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 
 pub(super) fn update_decision_comment_status(
@@ -1366,6 +1657,9 @@ pub(super) fn queued_issue_head_decisions(
                 d.repo_full_name,
                 d.issue_number,
                 d.actor_login,
+                d.schedule_timer_id,
+                d.timer_context_key,
+                d.resume_session_id,
                 d.directive,
                 d.target_role,
                 d.decision,
@@ -1413,6 +1707,9 @@ pub(super) fn queued_issue_head_decisions(
             e.raw_json,
             d.decision,
             d.reason_code,
+            d.schedule_timer_id,
+            d.timer_context_key,
+            d.resume_session_id,
             d.directive,
             d.target_role,
             d.principal_login,
@@ -1444,13 +1741,16 @@ pub(super) fn queued_issue_head_decisions(
                 source_created_at: row.get(10)?,
                 raw_json: row.get(11)?,
             };
-            let principal_login: Option<String> = row.get(16)?;
-            let would_dispatch_int: i64 = row.get(17)?;
+            let principal_login: Option<String> = row.get(19)?;
+            let would_dispatch_int: i64 = row.get(20)?;
             let decision = DecisionRecord {
                 decision: row.get(12)?,
                 reason_code: row.get(13)?,
-                directive: row.get(14)?,
-                target_role: row.get(15)?,
+                schedule_timer_id: row.get(14)?,
+                timer_context_key: row.get(15)?,
+                resume_session_id: row.get(16)?,
+                directive: row.get(17)?,
+                target_role: row.get(18)?,
                 principal_login: principal_login.or_else(|| record.actor_login.clone()),
                 would_dispatch: would_dispatch_int != 0,
                 decision_source: "db".to_string(),
@@ -1484,7 +1784,10 @@ pub(super) fn purge_pending_issue_decisions(
             would_dispatch = 0,
             directive = NULL,
             target_role = NULL,
-            principal_login = NULL
+            principal_login = NULL,
+            schedule_timer_id = NULL,
+            timer_context_key = NULL,
+            resume_session_id = NULL
         WHERE repo_full_name = ?1
           AND issue_number = ?2
           AND would_dispatch = 1
@@ -2701,6 +3004,152 @@ mod tests {
         assert_eq!(stats.total, 2);
         assert_eq!(stats.recent, 2);
         assert_eq!(stats.last_created_at.as_deref(), Some(created_b));
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn schedule_slot_claim_is_idempotent() {
+        let db_path = temp_db_path("schedule-claims");
+        super::init_db(&db_path).expect("db init");
+
+        let first = super::claim_schedule_slot(&db_path, "doc_scrub", 7, "2026-02-19T00:00:00Z")
+            .expect("first claim");
+        let second = super::claim_schedule_slot(&db_path, "doc_scrub", 7, "2026-02-19T00:00:00Z")
+            .expect("second claim");
+        assert!(first);
+        assert!(!second);
+        assert_eq!(
+            super::latest_schedule_slot_index(&db_path, "doc_scrub").expect("slot query"),
+            Some(7)
+        );
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn timer_context_completion_tracks_session_and_prompt_budget() {
+        let db_path = temp_db_path("timer-context");
+        super::init_db(&db_path).expect("db init");
+        super::upsert_timer_context_seed(
+            &db_path,
+            "shared-scrub",
+            "codex-lead",
+            "main/forgejo-agent",
+            "codex-orch",
+            "/home/main/swarm/offices/codex-lead",
+        )
+        .expect("seed timer context");
+
+        let conn = super::open_db(&db_path).expect("open db");
+        conn.execute(
+            r"
+            INSERT INTO events (delivery_id, event_type, repo_full_name, issue_number, action, actor_login, raw_json, received_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            ",
+            params![
+                "schedule:doc_scrub:1",
+                "schedule",
+                "main/forgejo-agent",
+                88_i64,
+                "tick",
+                "orchd",
+                "{}",
+                Utc::now().to_rfc3339(),
+            ],
+        )
+        .expect("insert event");
+        let event_id = conn.last_insert_rowid();
+        conn.execute(
+            r"
+            INSERT INTO decisions (
+                event_id,
+                repo_full_name,
+                issue_number,
+                actor_login,
+                principal_login,
+                schedule_timer_id,
+                timer_context_key,
+                directive,
+                target_role,
+                decision,
+                reason_code,
+                would_dispatch,
+                created_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            ",
+            params![
+                event_id,
+                "main/forgejo-agent",
+                88_i64,
+                "orchd",
+                "codex-orch",
+                "doc_scrub",
+                "shared-scrub",
+                "investigate",
+                "codex-lead",
+                DECISION_ACCEPTED,
+                "scheduled:doc_scrub",
+                1_i64,
+                Utc::now().to_rfc3339(),
+            ],
+        )
+        .expect("insert decision");
+        let decision_id = conn.last_insert_rowid();
+        conn.execute(
+            r"
+            INSERT INTO dispatches (
+                decision_id,
+                repo_full_name,
+                issue_number,
+                actor_login,
+                principal_login,
+                directive,
+                target_role,
+                status,
+                started_at,
+                ended_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            ",
+            params![
+                decision_id,
+                "main/forgejo-agent",
+                88_i64,
+                "orchd",
+                "codex-orch",
+                "investigate",
+                "codex-lead",
+                DispatchState::Completed.as_db_str(),
+                Utc::now().to_rfc3339(),
+                Utc::now().to_rfc3339(),
+            ],
+        )
+        .expect("insert dispatch");
+        let dispatch_id = conn.last_insert_rowid();
+
+        super::record_timer_context_completion(
+            &db_path,
+            dispatch_id,
+            Some("11111111-1111-1111-1111-111111111111"),
+            DispatchState::Completed.as_db_str(),
+            12_345,
+            Some(47),
+        )
+        .expect("record completion");
+
+        let row = super::timer_context(&db_path, "shared-scrub")
+            .expect("query context")
+            .expect("context present");
+        assert_eq!(
+            row.codex_session_id.as_deref(),
+            Some("11111111-1111-1111-1111-111111111111")
+        );
+        assert_eq!(row.run_count, 1);
+        assert_eq!(row.prompt_bytes_total, 12_345);
+        assert_eq!(row.last_context_pct, Some(47));
+        assert_eq!(row.last_status.as_deref(), Some("completed"));
 
         let _ = fs::remove_file(db_path);
     }

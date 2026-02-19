@@ -238,6 +238,9 @@ pub(super) fn decide(
         directive: Some(best.directive),
         target_role: Some(best.target_role),
         principal_login: Some(best.principal_login),
+        schedule_timer_id: None,
+        timer_context_key: None,
+        resume_session_id: None,
         would_dispatch: true,
         decision_source: match best.class {
             DispatchTriggerClass::ExplicitDirective => "explicit_directive".to_string(),

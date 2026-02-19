@@ -33,6 +33,7 @@ pub(super) struct DispatchConfig {
     pub(super) repo_bindings: HashMap<String, DispatchRepoBindingConfig>,
     pub(super) triggers: Vec<DispatchTriggerConfig>,
     pub(super) trigger_guardrails: DispatchTriggerGuardrailsConfig,
+    pub(super) timers: Vec<DispatchTimerConfig>,
     pub(super) forgejoctl_bin: PathBuf,
 }
 
@@ -91,6 +92,75 @@ pub(super) struct DispatchRepoBindingConfig {
     pub(super) git_remote: String,
     pub(super) git_base: String,
     pub(super) sidecar_repo: Option<RepoRef>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum DispatchTimerCatchUp {
+    Coalesce,
+    Skip,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum DispatchTimerContextMode {
+    Fresh,
+    Reuse,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct DispatchTimerScheduleConfig {
+    pub(super) interval_sec: u64,
+    pub(super) start_at: String,
+    pub(super) jitter_sec: u64,
+    pub(super) catch_up: DispatchTimerCatchUp,
+    pub(super) max_inflight: u32,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct DispatchTimerTargetConfig {
+    pub(super) repo: RepoRef,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct DispatchTimerRunIssueConfig {
+    pub(super) title_template: String,
+    pub(super) body_file: PathBuf,
+    pub(super) workflow: String,
+    pub(super) labels: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct DispatchTimerDispatchConfig {
+    pub(super) directive: String,
+    pub(super) target_role: String,
+    pub(super) principal: String,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct DispatchTimerContextConfig {
+    pub(super) mode: DispatchTimerContextMode,
+    pub(super) key: String,
+    pub(super) max_age_sec: Option<u64>,
+    pub(super) max_runs: Option<u64>,
+    pub(super) reset_on_failure: bool,
+    pub(super) min_context_pct: u8,
+    pub(super) fallback_max_prompt_bytes: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct DispatchTimerWorkspaceConfig {
+    pub(super) cwd: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct DispatchTimerConfig {
+    pub(super) id: String,
+    pub(super) enabled: bool,
+    pub(super) schedule: DispatchTimerScheduleConfig,
+    pub(super) target: DispatchTimerTargetConfig,
+    pub(super) run_issue: DispatchTimerRunIssueConfig,
+    pub(super) dispatch: DispatchTimerDispatchConfig,
+    pub(super) context: DispatchTimerContextConfig,
+    pub(super) workspace: DispatchTimerWorkspaceConfig,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -424,6 +494,8 @@ struct DispatchConfigFile {
     trigger_guardrails: DispatchTriggerGuardrailsConfigFile,
     #[serde(default)]
     triggers: Vec<DispatchTriggerConfigFile>,
+    #[serde(default)]
+    timers: Vec<DispatchTimerConfigFile>,
     #[serde(default = "default_forgejoctl_bin")]
     forgejoctl_bin: String,
 }
@@ -567,6 +639,110 @@ struct DispatchTriggerActionConfigFile {
     reason_code: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum DispatchTimerCatchUpFile {
+    Coalesce,
+    Skip,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum DispatchTimerContextModeFile {
+    Fresh,
+    Reuse,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DispatchTimerConfigFile {
+    id: String,
+    #[serde(default = "default_true")]
+    enabled: bool,
+    schedule: DispatchTimerScheduleConfigFile,
+    target: DispatchTimerTargetConfigFile,
+    run_issue: DispatchTimerRunIssueConfigFile,
+    dispatch: DispatchTimerDispatchConfigFile,
+    #[serde(default)]
+    context: DispatchTimerContextConfigFile,
+    #[serde(default)]
+    workspace: DispatchTimerWorkspaceConfigFile,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DispatchTimerScheduleConfigFile {
+    interval_sec: u64,
+    start_at: String,
+    #[serde(default)]
+    jitter_sec: u64,
+    #[serde(default = "default_timer_catch_up")]
+    catch_up: DispatchTimerCatchUpFile,
+    #[serde(default = "default_timer_max_inflight")]
+    max_inflight: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DispatchTimerTargetConfigFile {
+    repo: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DispatchTimerRunIssueConfigFile {
+    title_template: String,
+    body_file: String,
+    #[serde(default = "default_timer_issue_workflow")]
+    workflow: String,
+    #[serde(default)]
+    labels: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DispatchTimerDispatchConfigFile {
+    directive: String,
+    target_role: String,
+    principal: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DispatchTimerContextConfigFile {
+    #[serde(default = "default_timer_context_mode")]
+    mode: DispatchTimerContextModeFile,
+    key: Option<String>,
+    max_age_sec: Option<u64>,
+    max_runs: Option<u64>,
+    #[serde(default = "default_true")]
+    reset_on_failure: bool,
+    #[serde(default = "default_timer_min_context_pct")]
+    min_context_pct: u8,
+    #[serde(default = "default_timer_fallback_prompt_bytes")]
+    fallback_max_prompt_bytes: u64,
+}
+
+impl Default for DispatchTimerContextConfigFile {
+    fn default() -> Self {
+        Self {
+            mode: default_timer_context_mode(),
+            key: None,
+            max_age_sec: None,
+            max_runs: None,
+            reset_on_failure: true,
+            min_context_pct: default_timer_min_context_pct(),
+            fallback_max_prompt_bytes: default_timer_fallback_prompt_bytes(),
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DispatchTimerWorkspaceConfigFile {
+    cwd: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DispatchRankAclConfigFile {
@@ -680,6 +856,30 @@ const fn default_timeout_sec() -> u64 {
 
 const fn default_true() -> bool {
     true
+}
+
+const fn default_timer_catch_up() -> DispatchTimerCatchUpFile {
+    DispatchTimerCatchUpFile::Coalesce
+}
+
+const fn default_timer_context_mode() -> DispatchTimerContextModeFile {
+    DispatchTimerContextModeFile::Fresh
+}
+
+const fn default_timer_max_inflight() -> u32 {
+    1
+}
+
+fn default_timer_issue_workflow() -> String {
+    "ready".to_string()
+}
+
+const fn default_timer_min_context_pct() -> u8 {
+    50
+}
+
+const fn default_timer_fallback_prompt_bytes() -> u64 {
+    2_000_000
 }
 
 const fn default_legacy_triggers() -> bool {
@@ -1439,6 +1639,55 @@ pub(super) fn load_dispatch_config_from_str(path: &Path, raw_text: &str) -> Resu
         }
     }
 
+    let mut timers = Vec::new();
+    let mut seen_timer_ids = HashSet::new();
+    let mut seen_context_keys: HashMap<String, (String, String)> = HashMap::new();
+    for timer in raw.timers {
+        let compiled =
+            compile_timer_config(path, &base_dir, timer, &directives, &roles, &rank_acl)?;
+        if !seen_timer_ids.insert(compiled.id.clone()) {
+            return Err(anyhow!(
+                "dispatch config {} has duplicate timer id '{}'",
+                path.display(),
+                compiled.id
+            ));
+        }
+        if compiled.context.mode == DispatchTimerContextMode::Reuse {
+            if let Some((prior_role, prior_repo)) = seen_context_keys
+                .get(compiled.context.key.as_str())
+                .cloned()
+            {
+                if prior_role != compiled.dispatch.target_role {
+                    return Err(anyhow!(
+                        "dispatch config {} reuses timer context key '{}' across different target roles ('{}' vs '{}')",
+                        path.display(),
+                        compiled.context.key,
+                        prior_role,
+                        compiled.dispatch.target_role
+                    ));
+                }
+                if prior_repo != compiled.target.repo.to_string() {
+                    return Err(anyhow!(
+                        "dispatch config {} reuses timer context key '{}' across different target repos ('{}' vs '{}')",
+                        path.display(),
+                        compiled.context.key,
+                        prior_repo,
+                        compiled.target.repo
+                    ));
+                }
+            } else {
+                seen_context_keys.insert(
+                    compiled.context.key.clone(),
+                    (
+                        compiled.dispatch.target_role.clone(),
+                        compiled.target.repo.to_string(),
+                    ),
+                );
+            }
+        }
+        timers.push(compiled);
+    }
+
     Ok(DispatchConfig {
         allowed_actors,
         prompt_envelopes,
@@ -1466,6 +1715,7 @@ pub(super) fn load_dispatch_config_from_str(path: &Path, raw_text: &str) -> Resu
             cooldown_sec: raw.trigger_guardrails.cooldown_sec,
             deny_immediate_self_loop: raw.trigger_guardrails.deny_immediate_self_loop,
         },
+        timers,
         forgejoctl_bin: resolve_config_path(&base_dir, &raw.forgejoctl_bin)?,
     })
 }
@@ -1748,6 +1998,218 @@ fn resolve_config_path(base_dir: &Path, raw: &str) -> Result<PathBuf> {
     } else {
         Ok(base_dir.join(expanded))
     }
+}
+
+fn resolve_timer_path(base_dir: &Path, raw: &str) -> Result<PathBuf> {
+    let expanded = expand_tilde_path(raw)?;
+    if expanded.is_absolute() {
+        Ok(expanded)
+    } else {
+        let swarm_root = base_dir.parent().unwrap_or(base_dir);
+        Ok(swarm_root.join(expanded))
+    }
+}
+
+fn compile_timer_config(
+    config_path: &Path,
+    base_dir: &Path,
+    timer: DispatchTimerConfigFile,
+    directives: &HashMap<String, DispatchDirectiveConfig>,
+    roles: &HashMap<String, DispatchRoleConfig>,
+    rank_acl: &DispatchRankAclConfig,
+) -> Result<DispatchTimerConfig> {
+    let timer_id = timer.id.trim().to_ascii_lowercase();
+    if timer_id.is_empty() {
+        return Err(anyhow!(
+            "dispatch config {} includes timer with empty id",
+            config_path.display()
+        ));
+    }
+
+    if timer.schedule.interval_sec == 0 {
+        return Err(anyhow!(
+            "dispatch config {} timer '{}' has invalid schedule.interval_sec=0",
+            config_path.display(),
+            timer_id
+        ));
+    }
+    let schedule_start_at = timer.schedule.start_at.trim().to_string();
+    if schedule_start_at.is_empty() {
+        return Err(anyhow!(
+            "dispatch config {} timer '{}' has empty schedule.start_at",
+            config_path.display(),
+            timer_id
+        ));
+    }
+    let target_repo = RepoRef::parse(timer.target.repo.trim()).with_context(|| {
+        format!(
+            "dispatch config {} timer '{}' has invalid target.repo '{}'",
+            config_path.display(),
+            timer_id,
+            timer.target.repo
+        )
+    })?;
+
+    let title_template = timer.run_issue.title_template.trim().to_string();
+    if title_template.is_empty() {
+        return Err(anyhow!(
+            "dispatch config {} timer '{}' has empty run_issue.title_template",
+            config_path.display(),
+            timer_id
+        ));
+    }
+    let workflow = timer.run_issue.workflow.trim().to_ascii_lowercase();
+    if workflow.is_empty() {
+        return Err(anyhow!(
+            "dispatch config {} timer '{}' has empty run_issue.workflow",
+            config_path.display(),
+            timer_id
+        ));
+    }
+    let labels = timer
+        .run_issue
+        .labels
+        .into_iter()
+        .map(|label| label.trim().to_string())
+        .filter(|label| !label.is_empty())
+        .collect::<Vec<_>>();
+
+    let directive = timer.dispatch.directive.trim().to_ascii_lowercase();
+    if directive.is_empty() {
+        return Err(anyhow!(
+            "dispatch config {} timer '{}' has empty dispatch.directive",
+            config_path.display(),
+            timer_id
+        ));
+    }
+    if !directive_is_known(directive.as_str()) {
+        return Err(anyhow!(
+            "dispatch config {} timer '{}' references unknown directive '{}'",
+            config_path.display(),
+            timer_id,
+            directive
+        ));
+    }
+    if !directives.contains_key(directive.as_str()) {
+        return Err(anyhow!(
+            "dispatch config {} timer '{}' references unconfigured directive '{}'",
+            config_path.display(),
+            timer_id,
+            directive
+        ));
+    }
+
+    let target_role = timer.dispatch.target_role.trim().to_ascii_lowercase();
+    if target_role.is_empty() {
+        return Err(anyhow!(
+            "dispatch config {} timer '{}' has empty dispatch.target_role",
+            config_path.display(),
+            timer_id
+        ));
+    }
+    if !roles.contains_key(target_role.as_str()) {
+        return Err(anyhow!(
+            "dispatch config {} timer '{}' references unknown target role '{}'",
+            config_path.display(),
+            timer_id,
+            target_role
+        ));
+    }
+    let principal = timer
+        .dispatch
+        .principal
+        .unwrap_or_else(|| "codex-orch".to_string())
+        .trim()
+        .to_ascii_lowercase();
+    if principal.is_empty() {
+        return Err(anyhow!(
+            "dispatch config {} timer '{}' has empty dispatch.principal",
+            config_path.display(),
+            timer_id
+        ));
+    }
+    if !rank_acl.has_role_policy(principal.as_str()) {
+        return Err(anyhow!(
+            "dispatch config {} timer '{}' dispatch.principal '{}' is not rank-ACL configured",
+            config_path.display(),
+            timer_id,
+            principal
+        ));
+    }
+    rank_acl
+        .assert_actor_can_dispatch(principal.as_str(), target_role.as_str(), directive.as_str())
+        .with_context(|| {
+            format!(
+                "dispatch config {} timer '{}' has invalid principal/role/directive tuple",
+                config_path.display(),
+                timer_id
+            )
+        })?;
+
+    let context_mode = match timer.context.mode {
+        DispatchTimerContextModeFile::Fresh => DispatchTimerContextMode::Fresh,
+        DispatchTimerContextModeFile::Reuse => DispatchTimerContextMode::Reuse,
+    };
+    let context_key = timer
+        .context
+        .key
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| timer_id.clone());
+    if timer.context.min_context_pct > 100 {
+        return Err(anyhow!(
+            "dispatch config {} timer '{}' context.min_context_pct={} is out of range 0..=100",
+            config_path.display(),
+            timer_id,
+            timer.context.min_context_pct
+        ));
+    }
+    let fallback_max_prompt_bytes = timer.context.fallback_max_prompt_bytes.max(1);
+
+    let workspace_cwd = timer
+        .workspace
+        .cwd
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    let catch_up = match timer.schedule.catch_up {
+        DispatchTimerCatchUpFile::Coalesce => DispatchTimerCatchUp::Coalesce,
+        DispatchTimerCatchUpFile::Skip => DispatchTimerCatchUp::Skip,
+    };
+
+    Ok(DispatchTimerConfig {
+        id: timer_id,
+        enabled: timer.enabled,
+        schedule: DispatchTimerScheduleConfig {
+            interval_sec: timer.schedule.interval_sec,
+            start_at: schedule_start_at,
+            jitter_sec: timer.schedule.jitter_sec,
+            catch_up,
+            max_inflight: timer.schedule.max_inflight.max(1),
+        },
+        target: DispatchTimerTargetConfig { repo: target_repo },
+        run_issue: DispatchTimerRunIssueConfig {
+            title_template,
+            body_file: resolve_timer_path(base_dir, timer.run_issue.body_file.as_str())?,
+            workflow,
+            labels,
+        },
+        dispatch: DispatchTimerDispatchConfig {
+            directive,
+            target_role,
+            principal,
+        },
+        context: DispatchTimerContextConfig {
+            mode: context_mode,
+            key: context_key,
+            max_age_sec: timer.context.max_age_sec.filter(|value| *value > 0),
+            max_runs: timer.context.max_runs.filter(|value| *value > 0),
+            reset_on_failure: timer.context.reset_on_failure,
+            min_context_pct: timer.context.min_context_pct,
+            fallback_max_prompt_bytes,
+        },
+        workspace: DispatchTimerWorkspaceConfig { cwd: workspace_cwd },
+    })
 }
 
 #[cfg(test)]
@@ -2545,6 +3007,246 @@ own_directives = ["reply", "design"]
                 .is_ok()
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn load_dispatch_config_parses_timer_with_context_defaults() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path();
+        let config_path = root.join("dispatch.toml");
+        let prompts_dir = root.join("prompts");
+        let orders_dir = prompts_dir.join("orders");
+        let standing_orders_dir = prompts_dir.join("standing_orders");
+        let roles_dir = prompts_dir.join("roles");
+        fs::create_dir_all(&orders_dir)?;
+        fs::create_dir_all(&standing_orders_dir)?;
+        fs::create_dir_all(&roles_dir)?;
+        fs::write(
+            roles_dir.join("codex-orch.md"),
+            "# codex-orch role card\n\n- OF-8\n",
+        )?;
+        fs::write(
+            roles_dir.join("codex-lead.md"),
+            "# codex-lead role card\n\n- OF-6\n",
+        )?;
+        fs::write(roles_dir.join("main.md"), "# main role card\n\n- OF-10\n")?;
+        fs::write(prompts_dir.join("orchd-preamble.md"), "preamble\n")?;
+        fs::write(
+            prompts_dir.join("orchd-envelope-fresh.md"),
+            "{{preamble_md}}\n",
+        )?;
+        fs::write(
+            prompts_dir.join("orchd-envelope-followup.md"),
+            "{{dispatch_md}}\n",
+        )?;
+        fs::write(orders_dir.join("orchd-investigate.md"), "investigate\n")?;
+        fs::write(orders_dir.join("orchd-reply.md"), "reply\n")?;
+        fs::write(
+            standing_orders_dir.join("doc-scrub.md"),
+            "## task\n- scrub docs\n",
+        )?;
+        fs::write(root.join("orch.token"), "orch\n")?;
+        fs::write(root.join("lead.token"), "lead\n")?;
+
+        let config_toml = format!(
+            r#"version = 1
+allowed_actors = ["main"]
+legacy_triggers = false
+
+[prompt_envelopes]
+preamble_file = "{preamble}"
+fresh_envelope = "{fresh}"
+followup_envelope = "{followup}"
+
+[roles.codex-orch]
+token_file = "{orch_token}"
+
+[roles.codex-lead]
+token_file = "{lead_token}"
+
+[directives.investigate]
+role = "codex-orch"
+prompt_file = "{investigate_prompt}"
+
+[directives.reply]
+role = "codex-orch"
+prompt_file = "{reply_prompt}"
+
+[[timers]]
+id = "doc_scrub"
+enabled = true
+
+[timers.schedule]
+interval_sec = 3600
+start_at = "2026-02-18T00:00:00Z"
+jitter_sec = 120
+catch_up = "coalesce"
+max_inflight = 2
+
+[timers.target]
+repo = "main/forgejo-agent"
+
+[timers.run_issue]
+title_template = "doc scrub {{date}}"
+body_file = "{doc_scrub_body}"
+workflow = "ready"
+labels = ["pri/low"]
+
+[timers.dispatch]
+directive = "investigate"
+target_role = "codex-lead"
+principal = "codex-orch"
+
+[timers.context]
+mode = "reuse"
+key = "scrub-shared"
+min_context_pct = 40
+"#,
+            preamble = prompts_dir.join("orchd-preamble.md").display(),
+            fresh = prompts_dir.join("orchd-envelope-fresh.md").display(),
+            followup = prompts_dir.join("orchd-envelope-followup.md").display(),
+            orch_token = root.join("orch.token").display(),
+            lead_token = root.join("lead.token").display(),
+            investigate_prompt = orders_dir.join("orchd-investigate.md").display(),
+            reply_prompt = orders_dir.join("orchd-reply.md").display(),
+            doc_scrub_body = standing_orders_dir.join("doc-scrub.md").display(),
+        );
+        fs::write(&config_path, config_toml)?;
+
+        let config = load_dispatch_config(&config_path)?;
+        assert_eq!(config.timers.len(), 1);
+        let timer = &config.timers[0];
+        assert_eq!(timer.id, "doc_scrub");
+        assert_eq!(timer.context.key, "scrub-shared");
+        assert_eq!(timer.context.min_context_pct, 40);
+        assert_eq!(timer.context.fallback_max_prompt_bytes, 2_000_000);
+        assert_eq!(timer.dispatch.principal, "codex-orch");
+        assert_eq!(timer.dispatch.target_role, "codex-lead");
+        assert_eq!(timer.target.repo.to_string(), "main/forgejo-agent");
+        assert_eq!(timer.run_issue.workflow, "ready");
+        assert_eq!(timer.run_issue.labels, vec!["pri/low"]);
+        Ok(())
+    }
+
+    #[test]
+    fn load_dispatch_config_rejects_reused_context_key_with_mixed_roles() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path();
+        let config_path = root.join("dispatch.toml");
+        let prompts_dir = root.join("prompts");
+        let orders_dir = prompts_dir.join("orders");
+        let standing_orders_dir = prompts_dir.join("standing_orders");
+        let roles_dir = prompts_dir.join("roles");
+        fs::create_dir_all(&orders_dir)?;
+        fs::create_dir_all(&standing_orders_dir)?;
+        fs::create_dir_all(&roles_dir)?;
+        fs::write(
+            roles_dir.join("codex-orch.md"),
+            "# codex-orch role card\n\n- OF-8\n",
+        )?;
+        fs::write(
+            roles_dir.join("codex-lead.md"),
+            "# codex-lead role card\n\n- OF-6\n",
+        )?;
+        fs::write(
+            roles_dir.join("codex-dev.md"),
+            "# codex-dev role card\n\n- OF-2\n",
+        )?;
+        fs::write(roles_dir.join("main.md"), "# main role card\n\n- OF-10\n")?;
+        fs::write(prompts_dir.join("orchd-preamble.md"), "preamble\n")?;
+        fs::write(
+            prompts_dir.join("orchd-envelope-fresh.md"),
+            "{{preamble_md}}\n",
+        )?;
+        fs::write(
+            prompts_dir.join("orchd-envelope-followup.md"),
+            "{{dispatch_md}}\n",
+        )?;
+        fs::write(orders_dir.join("orchd-investigate.md"), "investigate\n")?;
+        fs::write(standing_orders_dir.join("doc.md"), "doc\n")?;
+        fs::write(standing_orders_dir.join("bug.md"), "bug\n")?;
+        fs::write(root.join("orch.token"), "orch\n")?;
+        fs::write(root.join("lead.token"), "lead\n")?;
+        fs::write(root.join("dev.token"), "dev\n")?;
+
+        let config_toml = format!(
+            r#"version = 1
+allowed_actors = ["main"]
+legacy_triggers = false
+
+[prompt_envelopes]
+preamble_file = "{preamble}"
+fresh_envelope = "{fresh}"
+followup_envelope = "{followup}"
+
+[roles.codex-orch]
+token_file = "{orch_token}"
+
+[roles.codex-lead]
+token_file = "{lead_token}"
+
+[roles.codex-dev]
+token_file = "{dev_token}"
+
+[directives.investigate]
+role = "codex-orch"
+prompt_file = "{investigate_prompt}"
+
+[[timers]]
+id = "doc_scrub"
+[timers.schedule]
+interval_sec = 3600
+start_at = "2026-02-18T00:00:00Z"
+[timers.target]
+repo = "main/forgejo-agent"
+[timers.run_issue]
+title_template = "doc scrub {{date}}"
+body_file = "{doc_body}"
+[timers.dispatch]
+directive = "investigate"
+target_role = "codex-lead"
+principal = "main"
+[timers.context]
+mode = "reuse"
+key = "shared-lane"
+
+[[timers]]
+id = "bug_scrub"
+[timers.schedule]
+interval_sec = 3600
+start_at = "2026-02-18T00:00:00Z"
+[timers.target]
+repo = "main/forgejo-agent"
+[timers.run_issue]
+title_template = "bug scrub {{date}}"
+body_file = "{bug_body}"
+[timers.dispatch]
+directive = "investigate"
+target_role = "codex-orch"
+principal = "main"
+[timers.context]
+mode = "reuse"
+key = "shared-lane"
+"#,
+            preamble = prompts_dir.join("orchd-preamble.md").display(),
+            fresh = prompts_dir.join("orchd-envelope-fresh.md").display(),
+            followup = prompts_dir.join("orchd-envelope-followup.md").display(),
+            orch_token = root.join("orch.token").display(),
+            lead_token = root.join("lead.token").display(),
+            dev_token = root.join("dev.token").display(),
+            investigate_prompt = orders_dir.join("orchd-investigate.md").display(),
+            doc_body = standing_orders_dir.join("doc.md").display(),
+            bug_body = standing_orders_dir.join("bug.md").display(),
+        );
+        fs::write(&config_path, config_toml)?;
+
+        let err = load_dispatch_config(&config_path).expect_err("config should fail");
+        assert!(
+            err.to_string()
+                .contains("reuses timer context key 'shared-lane' across different target roles"),
+            "unexpected error: {err:#}"
+        );
         Ok(())
     }
 }

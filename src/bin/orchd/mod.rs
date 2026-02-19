@@ -70,6 +70,9 @@ mod issue;
 // Role inventory/check/add subcommands for dispatch identity hygiene. Read when onboarding roles or debugging role drift.
 mod role;
 
+// Timer scheduler entrypoints (`orchd schedule tick`). Read when changing periodic dispatch behavior or context reuse policy.
+mod schedule;
+
 // Prompt inspection utilities (preview rendered prompt + DocPlan). Read when debugging prompt composition.
 mod prompt;
 

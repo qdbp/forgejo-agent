@@ -1,4 +1,4 @@
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -101,6 +101,37 @@ fn append_completion_section(completion_file: &Path, header: &str, lines: &[Stri
         writeln!(file, "- {line}")?;
     }
     Ok(())
+}
+
+fn parse_context_remaining_pct(log_file: &Path) -> Option<u8> {
+    let raw = fs::read_to_string(log_file).ok()?;
+    for line in raw.lines().rev() {
+        let lower = line.to_ascii_lowercase();
+        if !lower.contains("context") || !line.contains('%') {
+            continue;
+        }
+        let mut best: Option<u8> = None;
+        for token in line.split(|ch: char| !ch.is_ascii_digit()) {
+            if token.is_empty() {
+                continue;
+            }
+            let Ok(value) = token.parse::<u16>() else {
+                continue;
+            };
+            if value <= 100 {
+                best = u8::try_from(value).ok();
+            }
+        }
+        if best.is_some() {
+            return best;
+        }
+    }
+    None
+}
+
+fn prompt_bytes_for_dispatch(run_dir: &Path) -> u64 {
+    let prompt_path = run_dir.join("prompt.md");
+    fs::metadata(prompt_path).map_or(0, |meta| meta.len())
 }
 
 fn whoami_login(api: &ForgejoClient, cfg: &AgentConfig) -> Result<String> {
@@ -803,6 +834,25 @@ pub(super) fn finalize_dispatch_command(args: FinalizeDispatchArgs) -> Result<()
     if !did_transition {
         info!("finalize-dispatch: no-op (dispatch already terminal or missing)");
         return Ok(());
+    }
+
+    let context_pct = parse_context_remaining_pct(&args.log_file);
+    let prompt_bytes = prompt_bytes_for_dispatch(&args.run_dir);
+    let session_id = args.session_id.trim();
+    let session_id = if session_id.is_empty() {
+        None
+    } else {
+        Some(session_id)
+    };
+    if let Err(err) = db::record_timer_context_completion(
+        &args.db_path,
+        args.dispatch_id,
+        session_id,
+        status_spec.state_literal.as_db_str(),
+        prompt_bytes,
+        context_pct,
+    ) {
+        eprintln!("finalize-dispatch: timer context update failed: {err}");
     }
 
     if let Some(outcome) = sidecar_outcome.as_ref() {
