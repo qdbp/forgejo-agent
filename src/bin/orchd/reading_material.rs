@@ -452,7 +452,7 @@ fn normalize_style_guide_langs(raw: &[String], warnings: &mut Vec<String>) -> Ve
 
 fn style_guide_doc_ref(slug: &LangSlug) -> Result<DocRef, String> {
     DocRef::parse(&format!(
-        "repo:{STYLE_GUIDE_REPO_FULL_NAME}:docs/{}.md",
+        "repo:{STYLE_GUIDE_REPO_FULL_NAME}:docs/style/{}.md",
         slug.as_str()
     ))
 }
@@ -1150,7 +1150,7 @@ langs = ["rust"]
         let swarm = TempDir::new().unwrap();
         write_file(
             &swarm,
-            "docs/rust.md",
+            "docs/style/rust.md",
             r"# Rust Style Guide
 
 First sentence. Second sentence.
@@ -1182,7 +1182,7 @@ First sentence. Second sentence.
         assert_eq!(impl_outcome.doc_plan.docs.len(), 1);
         assert_eq!(
             impl_outcome.doc_plan.docs[0].doc_ref,
-            "repo:main/swarm:docs/rust.md"
+            "repo:main/swarm:docs/style/rust.md"
         );
         assert_eq!(
             impl_outcome.doc_plan.docs[0].disposition,
@@ -1202,7 +1202,7 @@ First sentence. Second sentence.
         assert_eq!(design_outcome.doc_plan.docs.len(), 1);
         assert_eq!(
             design_outcome.doc_plan.docs[0].doc_ref,
-            "repo:main/swarm:docs/rust.md"
+            "repo:main/swarm:docs/style/rust.md"
         );
         assert_eq!(
             design_outcome.doc_plan.docs[0].disposition,
