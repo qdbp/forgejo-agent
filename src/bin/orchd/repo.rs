@@ -464,3 +464,130 @@ pub(super) fn best_effort_sync_principal(
     ));
     lines
 }
+
+#[derive(Debug, Clone)]
+pub(super) struct PrincipalSyncReport {
+    pub(super) lines: Vec<String>,
+    pub(super) head_changed: bool,
+}
+
+pub(super) fn sync_principal_strict(
+    db_path: &Path,
+    token_file: &Path,
+    principal_workdir: &Path,
+    base_branch: &str,
+    source_remote_url: &str,
+) -> Result<PrincipalSyncReport> {
+    git_checked(principal_workdir, &["rev-parse", "--is-inside-work-tree"])
+        .context("principal sync requires a git checkout")?;
+
+    let status = git_checked(
+        principal_workdir,
+        &["status", "--porcelain", "--untracked-files=no"],
+    )
+    .map(|out| git_stdout_trim(&out))
+    .context("principal sync failed to read git status")?;
+    if !status.is_empty() {
+        return Err(anyhow!(
+            "principal sync requires a clean checkout; found uncommitted changes"
+        ));
+    }
+
+    let current_branch = git_checked(principal_workdir, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .map(|out| git_stdout_trim(&out))
+        .context("principal sync failed to determine active branch")?;
+    if current_branch != base_branch {
+        return Err(anyhow!(
+            "principal sync requires branch '{base_branch}' but found '{current_branch}'"
+        ));
+    }
+
+    git_checked_with_token(
+        db_path,
+        token_file,
+        Some(principal_workdir),
+        &["fetch", source_remote_url, base_branch],
+    )
+    .map_err(|err| anyhow!("principal sync fetch failed: {err}"))?;
+
+    let before = git_checked(principal_workdir, &["rev-parse", "HEAD"])
+        .map(|out| git_stdout_trim(&out))
+        .context("principal sync failed to resolve pre-merge head")?;
+    let before_short = git_checked(principal_workdir, &["rev-parse", "--short", "HEAD"])
+        .map(|out| git_stdout_trim(&out))
+        .unwrap_or_else(|_| "?".to_string());
+
+    // Strict finalize deploy runs deployment explicitly after the merge, so skip git hooks
+    // here to avoid duplicate deploy executions from post-merge.
+    git_checked(
+        principal_workdir,
+        &[
+            "-c",
+            "core.hooksPath=/dev/null",
+            "merge",
+            "--ff-only",
+            "FETCH_HEAD",
+        ],
+    )
+    .context("principal sync ff-only merge failed")?;
+
+    let after = git_checked(principal_workdir, &["rev-parse", "HEAD"])
+        .map(|out| git_stdout_trim(&out))
+        .context("principal sync failed to resolve post-merge head")?;
+    let after_short = git_checked(principal_workdir, &["rev-parse", "--short", "HEAD"])
+        .map(|out| git_stdout_trim(&out))
+        .unwrap_or_else(|_| "?".to_string());
+
+    Ok(PrincipalSyncReport {
+        lines: vec![format!(
+            "principal_sync: fast-forwarded {before_short} -> {after_short} from {source_remote_url}:{base_branch}"
+        )],
+        head_changed: before != after,
+    })
+}
+
+pub(super) fn run_strict_post_merge_deploy(
+    principal_workdir: &Path,
+    service_file: &Path,
+) -> Result<Vec<String>> {
+    if !service_file.is_file() {
+        return Err(anyhow!(
+            "required orchd service file missing: {}",
+            service_file.display()
+        ));
+    }
+
+    let deploy_script = principal_workdir.join("scripts/deploy-local.sh");
+    if !deploy_script.is_file() {
+        return Err(anyhow!(
+            "required deploy script missing: {}",
+            deploy_script.display()
+        ));
+    }
+
+    let output = Command::new("bash")
+        .arg(deploy_script.as_os_str())
+        .current_dir(principal_workdir)
+        .env("ORCHD_SERVICE_FILE", service_file)
+        .output()
+        .with_context(|| {
+            format!(
+                "failed running deploy script from {}",
+                principal_workdir.display()
+            )
+        })?;
+
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "post-merge deploy failed (status={:?})\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status.code()
+        ));
+    }
+
+    Ok(vec![format!(
+        "post_merge_deploy: applied scripts/deploy-local.sh (service file: {})",
+        service_file.display()
+    )])
+}

@@ -165,6 +165,7 @@ Core behavior:
 - sqlite event/decision/dispatch persistence
 - runtime dispatch status projected to `orchd/state/*` labels (`queued|running|blocked|failed|completed`)
 - successful `impl` completion transitions the issue workflow to `state/done` (dispatch failures do not force `state/blocked`)
+- for `main/forgejo-agent`, merge finalization now performs a strict post-merge deploy (`scripts/deploy-local.sh`) in the principal checkout; deploy failures trigger rollback and mark the dispatch failed
 - reconcile auto-closes only when the issue is `state/done` and `orchd/state/completed`; `state/review` stays open for explicit human verification
 - one active dispatch per issue (duplicates blocked while running)
 - queue scheduling uses a per-issue FIFO head (`MIN(decision.id)` among pending), with same-actor + same-directive + same-target-role pending entries coalesced to the latest
@@ -343,8 +344,8 @@ Installed hooks:
 
 - `pre-commit`: runs `scripts/check.py`
 - `pre-push`: runs `scripts/check.py`
-- `post-commit`: runs `scripts/deploy-local.sh` (builds + installs `forgejoctl` + `orchd`)
-- `post-merge`: runs `scripts/deploy-local.sh` (keeps artifacts deployed after pulls/merges)
+- `post-commit`: runs `scripts/deploy-local.sh` (builds + installs `forgejoctl` + `orchd`, restarts orchd when service file exists)
+- `post-merge`: runs `scripts/deploy-local.sh` (keeps artifacts deployed after pulls/merges; failures are no longer silently ignored)
 
 `check.py` includes a skill/API sync enforcement hook:
 
