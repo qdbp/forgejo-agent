@@ -22,6 +22,7 @@ use super::template;
 const DEPLOY_REPO_OWNER: &str = "main";
 const DEPLOY_REPO_NAME: &str = "forgejo-agent";
 const DEPLOY_SERVICE_FILE: &str = "/home/main/.config/systemd/user/orchd.service";
+const DEPLOY_MANAGED_REPO_ENV: &str = "ORCHD_DEPLOY_MANAGED_REPO";
 
 #[derive(Debug)]
 struct DeploySuccess {
@@ -38,12 +39,23 @@ struct DeployFailure {
     rollback_status: String,
 }
 
-fn managed_repo() -> RepoRef {
+fn managed_repo_from_override(raw: Option<&str>) -> RepoRef {
+    if let Some(candidate) = raw.map(str::trim).filter(|value| !value.is_empty())
+        && let Ok(parsed) = RepoRef::parse(candidate)
+    {
+        return parsed;
+    }
     RepoRef::new(DEPLOY_REPO_OWNER, DEPLOY_REPO_NAME)
 }
 
+fn managed_repo() -> RepoRef {
+    let override_value = std::env::var(DEPLOY_MANAGED_REPO_ENV).ok();
+    managed_repo_from_override(override_value.as_deref())
+}
+
 fn is_managed_repo(repo: &RepoRef) -> bool {
-    repo.owner == DEPLOY_REPO_OWNER && repo.repo == DEPLOY_REPO_NAME
+    let managed = managed_repo();
+    repo.owner == managed.owner && repo.repo == managed.repo
 }
 
 fn is_null_sha(value: &str) -> bool {
@@ -603,7 +615,7 @@ pub(super) async fn run_worker_once(state: &AppState) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_push_target;
+    use super::{extract_push_target, managed_repo_from_override};
     use crate::orchd::state::WebhookPayload;
 
     #[test]
@@ -641,5 +653,16 @@ mod tests {
             deleted: Some(false),
         };
         assert_eq!(extract_push_target(&payload, "main"), None);
+    }
+
+    #[test]
+    fn managed_repo_override_parses_and_falls_back() {
+        let parsed = managed_repo_from_override(Some("itest-owner/itest-repo"));
+        assert_eq!(parsed.owner, "itest-owner");
+        assert_eq!(parsed.repo, "itest-repo");
+
+        let fallback = managed_repo_from_override(Some("not-a-repo-ref"));
+        assert_eq!(fallback.owner, "main");
+        assert_eq!(fallback.repo, "forgejo-agent");
     }
 }

@@ -887,6 +887,30 @@ fn orchd_issue_dispatch_statuses(
     Ok(statuses)
 }
 
+fn orchd_latest_failed_deploy_incident(
+    db_path: &Path,
+    repo_full_name: &str,
+) -> Result<Option<(String, Option<u64>)>> {
+    let conn = Connection::open(db_path)
+        .with_context(|| format!("failed opening orchd db: {}", db_path.display()))?;
+    let mut stmt = conn.prepare(
+        "SELECT reason_code, incident_issue_number \
+         FROM deploy_jobs \
+         WHERE repo_full_name = ?1 AND status = 'failed' \
+         ORDER BY id DESC LIMIT 1",
+    )?;
+    let mut rows = stmt.query(params![repo_full_name])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    let reason_code: String = row.get(0)?;
+    let incident_i64: Option<i64> = row.get(1)?;
+    let incident = incident_i64
+        .map(|value| u64::try_from(value).context("incident_issue_number overflowed u64"))
+        .transpose()?;
+    Ok(Some((reason_code, incident)))
+}
+
 fn orchd_starting_dispatch_count(
     db_path: &Path,
     repo_full_name: &str,
@@ -1315,6 +1339,39 @@ fn post_orchd_issue_comment_webhook(
         actor,
         comment_body,
     )?;
+    Ok(())
+}
+
+fn post_orchd_push_webhook(
+    client: &Client,
+    orchd_base_url: &str,
+    repo_ref: &str,
+    actor: &str,
+    branch: &str,
+    target_sha: &str,
+) -> Result<()> {
+    let delivery_id = format!("itest-push-webhook-{}", unique_suffix()?);
+    let webhook_body = serde_json::json!({
+        "repository": { "full_name": repo_ref },
+        "ref": format!("refs/heads/{branch}"),
+        "after": target_sha,
+        "deleted": false,
+        "sender": { "login": actor },
+    });
+
+    let response = client
+        .post(format!("{orchd_base_url}/webhook"))
+        .header("Content-Type", "application/json")
+        .header("X-Forgejo-Event", "push")
+        .header("X-Forgejo-Delivery", delivery_id)
+        .body(webhook_body.to_string())
+        .send()
+        .context("failed POSTing push webhook to orchd")?;
+    let status = response.status();
+    let body = response.text().unwrap_or_default();
+    if status != StatusCode::ACCEPTED && status != StatusCode::OK {
+        bail!("orchd push webhook returned {} body={body}", status);
+    }
     Ok(())
 }
 
@@ -3640,6 +3697,126 @@ fn live_orchd_impl_sidecar_dirty_blocks_primary_landing() -> Result<()> {
     if completion.contains(&primary_marker) {
         bail!("expected primary landing section to be absent when sidecar landing blocks");
     }
+
+    Ok(())
+}
+
+#[test]
+#[serial(live_forgejo)]
+fn live_orchd_deploy_failure_opens_autoticket_with_impl_ping() -> Result<()> {
+    if !live_tests_enabled() {
+        eprintln!(
+            "skipping live orchd integration test; enable with {}=1",
+            LIVE_TESTS_ENV
+        );
+        return Ok(());
+    }
+
+    let harness =
+        LiveHarness::bootstrap("live_orchd_deploy_failure_opens_autoticket_with_impl_ping")?;
+
+    let dispatch_cfg_path = harness
+        .fixture
+        .work_path
+        .join("orchd-dispatch-deploy-failure.toml");
+    let db_path = harness
+        .fixture
+        .work_path
+        .join("orchd-deploy-failure.sqlite");
+    let orchd_stdout = harness
+        .fixture
+        .work_path
+        .join("orchd-deploy-failure-stdout.log");
+    let orchd_stderr = harness
+        .fixture
+        .work_path
+        .join("orchd-deploy-failure-stderr.log");
+
+    let fake_codex = ensure_fake_codex_bin()?;
+    let forgejoctl = forgejo_agent_bin()?;
+
+    write_orchd_dispatch_toml(
+        &dispatch_cfg_path,
+        OrchdDispatchTomlInputs {
+            actor: harness.fixture.owner.as_str(),
+            forgejo_login: harness.fixture.owner.as_str(),
+            repo_ref: harness.repo_ref.as_str(),
+            principal_workdir: &harness.principal_workdir,
+            sidecar_repo_ref: None,
+            sidecar_principal_workdir: None,
+            codex_bin: &fake_codex,
+            token_file: &harness.token_path,
+            forgejoctl: &forgejoctl,
+            directives: &[OrchdTestDirective::Reply],
+            timeout_sec: 60,
+        },
+    )?;
+
+    let managed_repo = harness.repo_ref.clone();
+    let env = [("ORCHD_DEPLOY_MANAGED_REPO", managed_repo.as_str())];
+    let port = pick_unused_port().ok_or_else(|| anyhow!("failed to pick unused port"))?;
+    let orchd = OrchdTestProcess::spawn(OrchdSpawnInputs {
+        listen_port: port,
+        db_path: &db_path,
+        repo_ref: &harness.repo_ref,
+        dispatch_cfg_path: &dispatch_cfg_path,
+        config_path: &harness.config_path,
+        token_path: &harness.token_path,
+        stdout_path: &orchd_stdout,
+        stderr_path: &orchd_stderr,
+        env: &env,
+    })?;
+
+    let fake_sha = "ffffffffffffffffffffffffffffffffffffffff";
+    let push_started = Instant::now();
+    post_orchd_push_webhook(
+        &orchd.client,
+        &orchd.base_url,
+        &harness.repo_ref,
+        harness.fixture.owner.as_str(),
+        "main",
+        fake_sha,
+    )?;
+    harness
+        .timer
+        .record("orchd.push_webhook.deploy_failure", push_started)?;
+
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let (reason_code, incident_issue_number) = loop {
+        if let Some((reason, Some(incident))) =
+            orchd_latest_failed_deploy_incident(&db_path, harness.repo_ref.as_str())?
+        {
+            break (reason, incident);
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "timed out waiting for failed deploy incident issue on repo {}",
+                harness.repo_ref
+            );
+        }
+        thread::sleep(Duration::from_millis(200));
+    };
+
+    if reason_code != "deploy_checkout_failed" && reason_code != "deploy_script_failed" {
+        bail!("unexpected deploy failure reason: {reason_code}");
+    }
+
+    let incident = harness.get_issue(incident_issue_number)?;
+    let incident_title = json_str_field(&incident, "title")?;
+    if !incident_title.starts_with("deploy failure:") {
+        bail!("unexpected incident title: {incident_title}");
+    }
+    let incident_body = json_str_field(&incident, "body")?;
+    ensure_contains(
+        incident_body,
+        "@codex-orch impl",
+        "deploy incident body impl mention",
+    )?;
+    ensure_contains(
+        incident_body,
+        "if the fix is clear, implement it immediately",
+        "deploy incident body immediate-fix instruction",
+    )?;
 
     Ok(())
 }
