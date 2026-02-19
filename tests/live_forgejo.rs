@@ -733,6 +733,13 @@ fn json_str_field<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
         .ok_or_else(|| anyhow!("JSON missing string field '{field}'"))
 }
 
+fn json_bool_field(value: &Value, field: &str) -> Result<bool> {
+    value
+        .get(field)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| anyhow!("JSON missing bool field '{field}'"))
+}
+
 fn issue_label_names(issue: &Value) -> Result<Vec<String>> {
     let labels = issue
         .get("labels")
@@ -1012,6 +1019,32 @@ impl LiveHarness {
             .as_array()
             .ok_or_else(|| anyhow!("list open issues payload was not an array"))?;
         Ok(issues.clone())
+    }
+
+    fn list_pull_requests(&self, state: &str) -> Result<Vec<Value>> {
+        let start = Instant::now();
+        let payload = self.fixture.authed_get(&format!(
+            "/api/v1/repos/{}/{}/pulls?state={state}&limit=100",
+            self.fixture.owner, self.repo_name
+        ))?;
+        self.timer.record("pulls.list", start)?;
+        let prs = payload
+            .as_array()
+            .ok_or_else(|| anyhow!("list pulls payload was not an array"))?;
+        Ok(prs.clone())
+    }
+
+    fn list_issue_comments(&self, issue_number: u64) -> Result<Vec<Value>> {
+        let start = Instant::now();
+        let payload = self.fixture.authed_get(&format!(
+            "/api/v1/repos/{}/{}/issues/{issue_number}/comments?limit=100",
+            self.fixture.owner, self.repo_name
+        ))?;
+        self.timer.record("issue.comments.list", start)?;
+        let comments = payload
+            .as_array()
+            .ok_or_else(|| anyhow!("list comments payload was not an array"))?;
+        Ok(comments.clone())
     }
 }
 
@@ -2752,6 +2785,323 @@ fn live_orchd_impl_dirty_principal_blocks_push() -> Result<()> {
     )?)?;
     if principal_head == after_head {
         bail!("expected dirty principal to skip sync (principal already at landed head)");
+    }
+
+    Ok(())
+}
+
+#[test]
+#[serial(live_forgejo)]
+fn live_orchd_impl_redispatch_closes_superseded_open_pr() -> Result<()> {
+    if !live_tests_enabled() {
+        eprintln!(
+            "skipping live orchd integration test; enable with {}=1",
+            LIVE_TESTS_ENV
+        );
+        return Ok(());
+    }
+
+    let harness = LiveHarness::bootstrap("live_orchd_impl_redispatch_closes_superseded_open_pr")?;
+    let issue_number =
+        harness.create_issue("orchd impl supersede stale pr", "issue body", "ready")?;
+    let issue_prefix = format!("{}: ", harness.issue_ref(issue_number));
+
+    let fake_codex = ensure_fake_codex_bin()?;
+    let forgejoctl = forgejo_agent_bin()?;
+
+    let dispatch_cfg_path = harness
+        .fixture
+        .work_path
+        .join("orchd-dispatch-impl-supersede.toml");
+    write_orchd_dispatch_toml(
+        &dispatch_cfg_path,
+        OrchdDispatchTomlInputs {
+            actor: harness.fixture.owner.as_str(),
+            forgejo_login: harness.fixture.owner.as_str(),
+            repo_ref: harness.repo_ref.as_str(),
+            principal_workdir: &harness.principal_workdir,
+            sidecar_repo_ref: None,
+            sidecar_principal_workdir: None,
+            codex_bin: &fake_codex,
+            token_file: &harness.token_path,
+            forgejoctl: &forgejoctl,
+            directives: &[OrchdTestDirective::Impl],
+            timeout_sec: 90,
+        },
+    )?;
+
+    let db_path = harness
+        .fixture
+        .work_path
+        .join("orchd-impl-supersede.sqlite");
+    let orchd_stdout = harness
+        .fixture
+        .work_path
+        .join("orchd-impl-supersede-stdout.log");
+    let orchd_stderr = harness
+        .fixture
+        .work_path
+        .join("orchd-impl-supersede-stderr.log");
+    let port = pick_unused_port().ok_or_else(|| anyhow!("failed to pick unused port"))?;
+
+    let orchd = OrchdTestProcess::spawn(OrchdSpawnInputs {
+        listen_port: port,
+        db_path: &db_path,
+        repo_ref: &harness.repo_ref,
+        dispatch_cfg_path: &dispatch_cfg_path,
+        config_path: &harness.config_path,
+        token_path: &harness.token_path,
+        stdout_path: &orchd_stdout,
+        stderr_path: &orchd_stderr,
+        env: &[
+            ("FAKE_CODEX_MODE", "git_append_commit"),
+            ("FAKE_CODEX_GIT_FILE", "orchd-supersede-conflict.txt"),
+            // Ensure the test has enough time to advance `main` before first landing.
+            ("FAKE_CODEX_SLEEP_MS", "8000"),
+        ],
+    })?;
+
+    // First impl: advance main mid-dispatch so landing rebase conflicts and leaves an open PR.
+    post_orchd_issue_comment_webhook(
+        &orchd.client,
+        &orchd.base_url,
+        &harness.repo_ref,
+        issue_number,
+        harness.fixture.owner.as_str(),
+        "@codex-orch impl",
+    )?;
+
+    wait_for_orchd_dispatch_status(
+        &db_path,
+        &harness.repo_ref,
+        issue_number,
+        "running",
+        Duration::from_secs(20),
+    )?;
+
+    let temp = TempDir::new().context("failed creating temp dir for conflicting main advance")?;
+    let askpass = temp.path().join("askpass.sh");
+    fs::write(
+        &askpass,
+        "#!/bin/sh\nset -eu\ncat \"${ORCHD_GIT_TOKEN_FILE:?missing ORCHD_GIT_TOKEN_FILE}\"\n",
+    )
+    .with_context(|| format!("failed writing {}", askpass.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut perms = fs::metadata(&askpass)
+            .with_context(|| format!("failed stat {}", askpass.display()))?
+            .permissions();
+        perms.set_mode(0o700);
+        fs::set_permissions(&askpass, perms)
+            .with_context(|| format!("failed chmod {}", askpass.display()))?;
+    }
+
+    let http_url = {
+        let mut url = url::Url::parse(&harness.fixture.base_url)
+            .context("invalid fixture base_url for conflicting main advance clone")?;
+        url.set_username(harness.fixture.owner.as_str())
+            .map_err(|()| anyhow!("failed to set username in fixture git url"))?;
+        url.set_path(&format!(
+            "/{}/{}.git",
+            harness.fixture.owner, harness.repo_name
+        ));
+        url.to_string()
+    };
+
+    let checkout = temp.path().join("advance-main-conflict");
+    let mut clone = Command::new("git");
+    clone.args(["clone"]).arg(&http_url).arg(&checkout);
+    clone
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", &askpass)
+        .env("ORCHD_GIT_TOKEN_FILE", &harness.token_path);
+    run_command_checked(
+        &mut clone,
+        "git clone via http for conflicting main advance",
+    )?;
+
+    let conflict_file = checkout.join("orchd-supersede-conflict.txt");
+    fs::write(&conflict_file, "main branch conflicting edit\n")
+        .with_context(|| format!("failed writing {}", conflict_file.display()))?;
+    let git_env = |cmd: &mut Command| {
+        cmd.env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_ASKPASS", &askpass)
+            .env("ORCHD_GIT_TOKEN_FILE", &harness.token_path);
+    };
+
+    let mut add = Command::new("git");
+    add.arg("-C")
+        .arg(&checkout)
+        .args(["add", "--", "orchd-supersede-conflict.txt"]);
+    git_env(&mut add);
+    run_command_checked(&mut add, "git add conflicting file")?;
+    let mut commit = Command::new("git");
+    commit.arg("-C").arg(&checkout).args([
+        "-c",
+        "user.name=itest-conflict",
+        "-c",
+        "user.email=itest-conflict@localhost",
+        "commit",
+        "-m",
+        "itest: conflicting main advance",
+    ]);
+    git_env(&mut commit);
+    run_command_checked(&mut commit, "git commit conflicting main advance")?;
+    let mut push = Command::new("git");
+    push.arg("-C")
+        .arg(&checkout)
+        .args(["push", "origin", "HEAD:main"]);
+    git_env(&mut push);
+    run_command_checked(&mut push, "git push conflicting main advance")?;
+
+    let _ = wait_for_issue_label(
+        &harness,
+        issue_number,
+        "orchd/state/blocked",
+        Duration::from_secs(120),
+    )?;
+
+    let blocked_status =
+        orchd_latest_dispatch_status_reason(&db_path, &harness.repo_ref, issue_number)?
+            .ok_or_else(|| anyhow!("expected blocked dispatch row for issue"))?;
+    if blocked_status.0 != "blocked" {
+        bail!(
+            "expected blocked after first conflict run, got status={} reason={:?}",
+            blocked_status.0,
+            blocked_status.1
+        );
+    }
+    if blocked_status.1.as_deref() != Some("pr_rebase_conflict") {
+        bail!(
+            "expected pr_rebase_conflict reason after first conflict run, got {:?}",
+            blocked_status.1
+        );
+    }
+
+    let open_after_block = harness.list_pull_requests("open")?;
+    let stale_pr = open_after_block
+        .iter()
+        .find(|pr| {
+            pr.get("title")
+                .and_then(Value::as_str)
+                .is_some_and(|title| title.starts_with(&issue_prefix))
+        })
+        .ok_or_else(|| anyhow!("expected one open stale PR for issue after blocked landing"))?
+        .clone();
+    let stale_pr_number = json_u64_field(&stale_pr, "number")?;
+
+    // Sync principal to advanced main so the second run can land cleanly.
+    git_output_checked(
+        &harness.principal_workdir,
+        &["fetch", "origin", "main"],
+        "git fetch origin main before second dispatch",
+    )?;
+    git_output_checked(
+        &harness.principal_workdir,
+        &["reset", "--hard", "origin/main"],
+        "git reset --hard origin/main before second dispatch",
+    )?;
+
+    // Restart orchd with a non-conflicting fake-codex file for the second run.
+    drop(orchd);
+    let orchd_retry_stdout = harness
+        .fixture
+        .work_path
+        .join("orchd-impl-supersede-retry-stdout.log");
+    let orchd_retry_stderr = harness
+        .fixture
+        .work_path
+        .join("orchd-impl-supersede-retry-stderr.log");
+    let orchd_retry = OrchdTestProcess::spawn(OrchdSpawnInputs {
+        listen_port: port,
+        db_path: &db_path,
+        repo_ref: &harness.repo_ref,
+        dispatch_cfg_path: &dispatch_cfg_path,
+        config_path: &harness.config_path,
+        token_path: &harness.token_path,
+        stdout_path: &orchd_retry_stdout,
+        stderr_path: &orchd_retry_stderr,
+        env: &[
+            ("FAKE_CODEX_MODE", "git_append_commit"),
+            ("FAKE_CODEX_GIT_FILE", "orchd-supersede-success.txt"),
+        ],
+    })?;
+
+    // Second impl: should land and supersede-close the stale open PR from first run.
+    post_orchd_issue_comment_webhook(
+        &orchd_retry.client,
+        &orchd_retry.base_url,
+        &harness.repo_ref,
+        issue_number,
+        harness.fixture.owner.as_str(),
+        "@codex-orch impl\nretry after blocked landing",
+    )?;
+
+    let _ = wait_for_issue_label(
+        &harness,
+        issue_number,
+        "orchd/state/completed",
+        Duration::from_secs(120),
+    )?;
+
+    let final_status =
+        orchd_latest_dispatch_status_reason(&db_path, &harness.repo_ref, issue_number)?
+            .ok_or_else(|| anyhow!("expected completed dispatch row for issue"))?;
+    if final_status.0 != "completed" {
+        bail!(
+            "expected completed after second run, got status={} reason={:?}",
+            final_status.0,
+            final_status.1
+        );
+    }
+
+    let prs_all = harness.list_pull_requests("all")?;
+    let successor_pr = prs_all
+        .iter()
+        .filter(|pr| {
+            pr.get("title")
+                .and_then(Value::as_str)
+                .is_some_and(|title| title.starts_with(&issue_prefix))
+                && pr
+                    .get("number")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|number| number != stale_pr_number)
+                && pr.get("merged").and_then(Value::as_bool) == Some(true)
+        })
+        .max_by_key(|pr| pr.get("number").and_then(Value::as_u64).unwrap_or(0))
+        .ok_or_else(|| anyhow!("expected merged successor PR for issue after second run"))?
+        .clone();
+    let successor_pr_number = json_u64_field(&successor_pr, "number")?;
+    let successor_pr_url = json_str_field(&successor_pr, "html_url")?.to_string();
+
+    let stale_pr_after = prs_all
+        .iter()
+        .find(|pr| pr.get("number").and_then(Value::as_u64) == Some(stale_pr_number))
+        .ok_or_else(|| anyhow!("stale PR #{stale_pr_number} missing from PR list"))?;
+    let stale_state = json_str_field(stale_pr_after, "state")?;
+    if stale_state != "closed" {
+        bail!("expected stale PR #{stale_pr_number} to be closed, got state={stale_state}");
+    }
+    if json_bool_field(stale_pr_after, "merged")? {
+        bail!("expected stale PR #{stale_pr_number} to be closed-not-merged");
+    }
+
+    let stale_comments = harness.list_issue_comments(stale_pr_number)?;
+    let expected_phrase = format!(
+        "Superseded by #{} ({})",
+        successor_pr_number, successor_pr_url
+    );
+    let has_supersede_link = stale_comments.iter().any(|comment| {
+        comment
+            .get("body")
+            .and_then(Value::as_str)
+            .is_some_and(|body| body.contains(&expected_phrase))
+    });
+    if !has_supersede_link {
+        bail!(
+            "expected stale PR #{stale_pr_number} to include superseded link comment containing: {expected_phrase}"
+        );
     }
 
     Ok(())

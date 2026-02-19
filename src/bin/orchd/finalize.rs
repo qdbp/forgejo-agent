@@ -10,8 +10,7 @@ use forgejo_agent::api::{ApiHttpError, ForgejoClient, MergePullMethod};
 use forgejo_agent::config::AgentConfig;
 
 use forgejo_agent::orchd_dispatch_core::{DispatchEventKind, DispatchState};
-use forgejo_agent::types::OrchdRuntimeState;
-use forgejo_agent::types::RepoRef;
+use forgejo_agent::types::{ApiPullRequest, IssueRef, OpenState, OrchdRuntimeState, RepoRef};
 
 use super::cli::FinalizeDispatchArgs;
 use super::db;
@@ -169,6 +168,82 @@ fn classify_persistent_merge_block(mergeable_state: Option<bool>) -> (&'static s
     } else {
         ("pr_merge_blocked", "merge still blocked after retry")
     }
+}
+
+fn issue_identity_matches_pr(pr: &ApiPullRequest, issue_ref: &IssueRef) -> bool {
+    let title_prefix = format!("{issue_ref}: ");
+    let issue_token = format!("-i{}-", issue_ref.number);
+    pr.title.starts_with(&title_prefix) || pr.head.ref_name.contains(&issue_token)
+}
+
+fn superseded_pr_candidates(
+    open_prs: Vec<ApiPullRequest>,
+    issue_ref: &IssueRef,
+    landed_pr_number: u64,
+) -> Vec<ApiPullRequest> {
+    let mut candidates = open_prs
+        .into_iter()
+        .filter(|pr| {
+            pr.number != landed_pr_number
+                && !pr.merged
+                && pr.state.eq_ignore_ascii_case("open")
+                && pr.head.ref_name.starts_with("orchd/d")
+                && issue_identity_matches_pr(pr, issue_ref)
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|pr| pr.number);
+    candidates
+}
+
+fn reconcile_superseded_open_prs(
+    api: &ForgejoClient,
+    cfg: &AgentConfig,
+    repo_ref: &RepoRef,
+    issue_ref: &IssueRef,
+    landed_pr_number: u64,
+    landed_pr_url: &str,
+    lines: &mut Vec<String>,
+) -> Result<()> {
+    let prefix = format!("[{}] ", repo_ref);
+    let open_prs = api
+        .list_pull_requests(cfg, repo_ref, "open", 200)
+        .context("listing open PRs for superseded reconciliation failed")?;
+    let candidates = superseded_pr_candidates(open_prs, issue_ref, landed_pr_number);
+
+    for candidate in candidates {
+        let candidate_ref = IssueRef {
+            repo: repo_ref.clone(),
+            number: candidate.number,
+        };
+        let body = format!(
+            "Superseded by #{} ({}) after successful re-dispatch; closing.",
+            landed_pr_number, landed_pr_url
+        );
+        if let Err(err) = api.comment_issue(cfg, &candidate_ref, &body) {
+            lines.push(format!(
+                "{prefix}pr_supersede_comment_failed: #{}: {err:#}",
+                candidate.number
+            ));
+        } else {
+            lines.push(format!(
+                "{prefix}pr_supersede_comment: #{} -> #{} ({})",
+                candidate.number, landed_pr_number, landed_pr_url
+            ));
+        }
+        if let Err(err) = api.set_issue_open_state(cfg, &candidate_ref, OpenState::Closed) {
+            lines.push(format!(
+                "{prefix}pr_supersede_close_failed: #{}: {err:#}",
+                candidate.number
+            ));
+        } else {
+            lines.push(format!(
+                "{prefix}pr_supersede_close: #{} -> #{} ({})",
+                candidate.number, landed_pr_number, landed_pr_url
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 fn merge_ff_only_with_retry(
@@ -364,6 +439,17 @@ fn evaluate_landing_target(
             "{prefix}pr landing: already merged #{} ({})",
             pr.number, pr.html_url
         ));
+        if let Err(err) = reconcile_superseded_open_prs(
+            &api,
+            &cfg,
+            &repo_ref,
+            &args.issue_ref,
+            pr.number,
+            &pr.html_url,
+            &mut lines,
+        ) {
+            lines.push(format!("{prefix}pr_supersede_scan_failed: {err:#}"));
+        }
         if let Some(principal_workdir) = target.principal_workdir {
             lines.extend(repo::best_effort_sync_principal(
                 &args.db_path,
@@ -434,6 +520,17 @@ fn evaluate_landing_target(
                 "{prefix}pr_merge: ff-only #{} ({})",
                 pr.number, pr.html_url
             ));
+            if let Err(err) = reconcile_superseded_open_prs(
+                &api,
+                &cfg,
+                &repo_ref,
+                &args.issue_ref,
+                pr.number,
+                &pr.html_url,
+                &mut lines,
+            ) {
+                lines.push(format!("{prefix}pr_supersede_scan_failed: {err:#}"));
+            }
             if let Some(principal_workdir) = target.principal_workdir {
                 lines.extend(repo::best_effort_sync_principal(
                     &args.db_path,
@@ -592,6 +689,17 @@ fn evaluate_landing_target(
                         "{prefix}pr_merge: ff-only #{} ({})",
                         pr.number, pr.html_url
                     ));
+                    if let Err(err) = reconcile_superseded_open_prs(
+                        &api,
+                        &cfg,
+                        &repo_ref,
+                        &args.issue_ref,
+                        pr.number,
+                        &pr.html_url,
+                        &mut lines,
+                    ) {
+                        lines.push(format!("{prefix}pr_supersede_scan_failed: {err:#}"));
+                    }
                     if let Some(principal_workdir) = target.principal_workdir {
                         lines.extend(repo::best_effort_sync_principal(
                             &args.db_path,
@@ -1019,10 +1127,38 @@ mod tests {
     use std::path::PathBuf;
 
     use super::classify_persistent_merge_block;
+    use super::issue_identity_matches_pr;
     use super::merge_endpoint_reports_try_again_later;
+    use super::superseded_pr_candidates;
     use super::work_state_transition_target;
     use forgejo_agent::api::ApiHttpError;
     use forgejo_agent::orchd_dispatch_core::DispatchState;
+    use forgejo_agent::types::{ApiPrBranchInfo, ApiPullRequest, IssueRef};
+
+    fn fake_pr(
+        number: u64,
+        state: &str,
+        title: &str,
+        head_ref: &str,
+        merged: bool,
+    ) -> ApiPullRequest {
+        ApiPullRequest {
+            number,
+            state: state.to_string(),
+            title: title.to_string(),
+            html_url: format!("http://127.0.0.1:3000/o/r/pulls/{number}"),
+            merged,
+            mergeable: None,
+            head: ApiPrBranchInfo {
+                ref_name: head_ref.to_string(),
+                sha: format!("head-{number}"),
+            },
+            base: ApiPrBranchInfo {
+                ref_name: "main".to_string(),
+                sha: "base".to_string(),
+            },
+        }
+    }
 
     #[test]
     fn merge_endpoint_transient_405_is_detected() {
@@ -1111,5 +1247,102 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn issue_identity_match_accepts_title_or_branch_token() {
+        let issue_ref = IssueRef::parse("main/forgejo-agent#139").expect("issue ref parses");
+
+        let by_title = fake_pr(
+            10,
+            "open",
+            "main/forgejo-agent#139: title",
+            "orchd/d10/rmain-forgejo-agent-i999-impl",
+            false,
+        );
+        assert!(issue_identity_matches_pr(&by_title, &issue_ref));
+
+        let by_branch_token = fake_pr(
+            11,
+            "open",
+            "unrelated title",
+            "orchd/d11/rmain-forgejo-agent-i139-impl",
+            false,
+        );
+        assert!(issue_identity_matches_pr(&by_branch_token, &issue_ref));
+
+        let no_match = fake_pr(
+            12,
+            "open",
+            "main/forgejo-agent#140: title",
+            "orchd/d12/rmain-forgejo-agent-i140-impl",
+            false,
+        );
+        assert!(!issue_identity_matches_pr(&no_match, &issue_ref));
+    }
+
+    #[test]
+    fn superseded_candidates_are_conservative_and_stable() {
+        let issue_ref = IssueRef::parse("main/forgejo-agent#139").expect("issue ref parses");
+        let candidates = superseded_pr_candidates(
+            vec![
+                fake_pr(
+                    130,
+                    "open",
+                    "main/forgejo-agent#139: landed",
+                    "orchd/d213/rmain-forgejo-agent-i139-impl",
+                    false,
+                ),
+                fake_pr(
+                    126,
+                    "open",
+                    "main/forgejo-agent#139: stale",
+                    "orchd/d204/rmain-forgejo-agent-i139-impl",
+                    false,
+                ),
+                fake_pr(
+                    120,
+                    "open",
+                    "main/forgejo-agent#120: other issue",
+                    "orchd/d190/rmain-forgejo-agent-i120-impl",
+                    false,
+                ),
+                fake_pr(
+                    125,
+                    "closed",
+                    "main/forgejo-agent#139: closed",
+                    "orchd/d1/rmain-forgejo-agent-i139-impl",
+                    false,
+                ),
+                fake_pr(
+                    127,
+                    "open",
+                    "main/forgejo-agent#139: merged",
+                    "orchd/d205/rmain-forgejo-agent-i139-impl",
+                    true,
+                ),
+                fake_pr(
+                    128,
+                    "open",
+                    "main/forgejo-agent#139: not orchd branch",
+                    "feature/i139-manual",
+                    false,
+                ),
+                fake_pr(
+                    129,
+                    "open",
+                    "unrelated",
+                    "orchd/d206/rmain-forgejo-agent-i139-impl",
+                    false,
+                ),
+            ],
+            &issue_ref,
+            130,
+        );
+        let numbers = candidates
+            .into_iter()
+            .map(|pr| pr.number)
+            .collect::<Vec<_>>();
+        assert_eq!(numbers, vec![126, 129]);
     }
 }
