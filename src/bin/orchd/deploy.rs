@@ -1,10 +1,11 @@
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
+use rusqlite::{Connection, OptionalExtension};
 use serde_json::json;
 
 use forgejo_agent::api::ForgejoClient;
@@ -23,6 +24,10 @@ const DEPLOY_REPO_OWNER: &str = "main";
 const DEPLOY_REPO_NAME: &str = "forgejo-agent";
 const DEPLOY_SERVICE_FILE: &str = "/home/main/.config/systemd/user/orchd.service";
 const DEPLOY_MANAGED_REPO_ENV: &str = "ORCHD_DEPLOY_MANAGED_REPO";
+const DEPLOY_SKIP_ORCHD_RESTART_ENV: &str = "ORCHD_DEPLOY_SKIP_ORCHD_RESTART";
+const DEPLOY_SKIP_TIMER_RESTART_ENV: &str = "ORCHD_DEPLOY_SKIP_TIMER_RESTART";
+const MIGRATIONS_PATH_SUFFIX: &str = "src/bin/orchd/migrations.rs";
+const SCHEMA_VERSION_MARKER: &str = "const LATEST_SCHEMA_VERSION: i64 =";
 
 #[derive(Debug)]
 struct DeploySuccess {
@@ -194,6 +199,8 @@ fn run_deploy_script(checkout: &Path, log_path: &Path) -> Result<()> {
     let output = Command::new("bash")
         .arg(script_path.as_os_str())
         .env("ORCHD_SERVICE_FILE", DEPLOY_SERVICE_FILE)
+        .env(DEPLOY_SKIP_ORCHD_RESTART_ENV, "1")
+        .env(DEPLOY_SKIP_TIMER_RESTART_ENV, "1")
         .current_dir(checkout)
         .output()
         .with_context(|| format!("failed spawning deploy script from {}", checkout.display()))?;
@@ -218,6 +225,78 @@ fn run_deploy_script(checkout: &Path, log_path: &Path) -> Result<()> {
             output.status.code()
         ))
     }
+}
+
+fn parse_source_schema_version(checkout: &Path) -> Result<i64> {
+    let migrations_path = checkout.join(MIGRATIONS_PATH_SUFFIX);
+    let raw = fs::read_to_string(&migrations_path)
+        .with_context(|| format!("failed reading {}", migrations_path.display()))?;
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if let Some(tail) = trimmed.strip_prefix(SCHEMA_VERSION_MARKER) {
+            let token = tail.trim().trim_end_matches(';').trim();
+            let parsed = token.parse::<i64>().with_context(|| {
+                format!(
+                    "invalid schema version literal `{token}` in {}",
+                    migrations_path.display()
+                )
+            })?;
+            return Ok(parsed);
+        }
+    }
+    Err(anyhow!(
+        "schema version marker `{SCHEMA_VERSION_MARKER}` missing in {}",
+        migrations_path.display()
+    ))
+}
+
+fn current_db_schema_version(db_path: &Path) -> Result<i64> {
+    let conn = Connection::open(db_path)
+        .with_context(|| format!("failed opening {}", db_path.display()))?;
+    let table_exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations' LIMIT 1",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !table_exists {
+        return Ok(0);
+    }
+    let value = conn
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get::<_, Option<i64>>(0)
+        })
+        .optional()?
+        .flatten()
+        .unwrap_or(0);
+    Ok(value)
+}
+
+fn enforce_schema_downgrade_guard(db_path: &Path, checkout: &Path) -> Result<(i64, i64)> {
+    let db_schema = current_db_schema_version(db_path)?;
+    let source_schema = parse_source_schema_version(checkout)?;
+    if source_schema < db_schema {
+        return Err(anyhow!(
+            "schema downgrade blocked: source schema {source_schema} < db schema {db_schema}"
+        ));
+    }
+    Ok((source_schema, db_schema))
+}
+
+fn request_orchd_restart() -> Result<()> {
+    let mut command = Command::new("sh");
+    command
+        .arg("-lc")
+        .arg("sleep 1; systemctl --user restart orchd.service >/dev/null 2>&1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let _ = command
+        .spawn()
+        .context("failed spawning orchd restart request")?;
+    Ok(())
 }
 
 fn detect_rollback_status() -> String {
@@ -502,6 +581,15 @@ fn execute_deploy_job(
             });
         }
     };
+    if let Err(err) = enforce_schema_downgrade_guard(&state.db_path, &checkout_path) {
+        return Err(DeployFailure {
+            reason_code: "deploy_schema_downgrade_blocked".to_string(),
+            error_text: format!("{err:#}"),
+            checkout_path: Some(checkout_path),
+            log_path: None,
+            rollback_status: "not_attempted".to_string(),
+        });
+    }
 
     let log_path = match deploy_log_path(&state.db_path, job.id) {
         Ok(path) => path,
@@ -563,6 +651,17 @@ pub(super) async fn run_worker_once(state: &AppState) -> Result<()> {
                         "log_path": success.log_path.to_string_lossy(),
                     }),
                 );
+                if let Err(err) = request_orchd_restart() {
+                    log_line(
+                        "deploy_restart_request_failed",
+                        json!({
+                            "deploy_job_id": job.id,
+                            "repo": job.repo_full_name,
+                            "target_sha": job.target_sha,
+                            "error": format!("{err:#}"),
+                        }),
+                    );
+                }
             }
             Err(failure) => {
                 let incident_issue_number = open_deploy_failure_issue(
@@ -615,7 +714,15 @@ pub(super) async fn run_worker_once(state: &AppState) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_push_target, managed_repo_from_override};
+    use std::fs;
+
+    use rusqlite::Connection;
+    use tempfile::tempdir;
+
+    use super::{
+        current_db_schema_version, enforce_schema_downgrade_guard, extract_push_target,
+        managed_repo_from_override, parse_source_schema_version,
+    };
     use crate::orchd::state::WebhookPayload;
 
     #[test]
@@ -664,5 +771,59 @@ mod tests {
         let fallback = managed_repo_from_override(Some("not-a-repo-ref"));
         assert_eq!(fallback.owner, "main");
         assert_eq!(fallback.repo, "forgejo-agent");
+    }
+
+    #[test]
+    fn parse_source_schema_version_reads_marker() {
+        let temp = tempdir().expect("tempdir");
+        let checkout = temp.path();
+        let migrations_path = checkout.join("src/bin/orchd");
+        fs::create_dir_all(&migrations_path).expect("create migrations directory");
+        fs::write(
+            migrations_path.join("migrations.rs"),
+            "const LATEST_SCHEMA_VERSION: i64 = 42;\n",
+        )
+        .expect("write migrations");
+        let parsed = parse_source_schema_version(checkout).expect("parse schema");
+        assert_eq!(parsed, 42);
+    }
+
+    #[test]
+    fn enforce_schema_downgrade_guard_rejects_older_source_schema() {
+        let temp = tempdir().expect("tempdir");
+        let db_path = temp.path().join("orchd.sqlite");
+        let conn = Connection::open(&db_path).expect("open db");
+        conn.execute_batch(
+            r"
+            CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, name TEXT, applied_at TEXT);
+            INSERT INTO schema_migrations(version, name, applied_at) VALUES (12, 'v12', '2026-01-01T00:00:00Z');
+            ",
+        )
+        .expect("seed schema version");
+        drop(conn);
+
+        let checkout = temp.path().join("checkout");
+        let migrations_dir = checkout.join("src/bin/orchd");
+        fs::create_dir_all(&migrations_dir).expect("create migrations dir");
+        fs::write(
+            migrations_dir.join("migrations.rs"),
+            "const LATEST_SCHEMA_VERSION: i64 = 11;\n",
+        )
+        .expect("write source migrations");
+
+        let err = enforce_schema_downgrade_guard(&db_path, &checkout)
+            .expect_err("downgrade should be rejected");
+        assert!(
+            err.to_string()
+                .contains("schema downgrade blocked: source schema 11 < db schema 12")
+        );
+    }
+
+    #[test]
+    fn current_db_schema_version_defaults_to_zero_without_table() {
+        let temp = tempdir().expect("tempdir");
+        let db_path = temp.path().join("orchd.sqlite");
+        let version = current_db_schema_version(&db_path).expect("query schema");
+        assert_eq!(version, 0);
     }
 }

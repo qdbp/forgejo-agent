@@ -13,6 +13,8 @@ ORCHD_BIN="${ORCHD_BIN:-$HOME/.local/bin/orchd}"
 ORCHD_SERVICE_TEMPLATE="${ORCHD_SERVICE_TEMPLATE:-$ROOT_DIR/templates/orchd.service}"
 SCHEDULE_SERVICE_TEMPLATE="${ORCHD_SCHEDULE_SERVICE_TEMPLATE:-$ROOT_DIR/templates/orchd-schedule-tick.service}"
 SCHEDULE_TIMER_TEMPLATE="${ORCHD_SCHEDULE_TIMER_TEMPLATE:-$ROOT_DIR/templates/orchd-schedule-tick.timer}"
+SKIP_ORCHD_RESTART="${ORCHD_DEPLOY_SKIP_ORCHD_RESTART:-0}"
+SKIP_TIMER_RESTART="${ORCHD_DEPLOY_SKIP_TIMER_RESTART:-0}"
 
 snapshot_dir=""
 rollback_needed=0
@@ -122,11 +124,19 @@ if [[ -f "$SERVICE_FILE" ]]; then
   install_orchd_units
   systemctl --user daemon-reload
   systemctl --user enable --now orchd.service
-  echo "[deploy-local] restarting orchd.service"
-  restart_orchd_service
-  echo "[deploy-local] restarting orchd-schedule-tick.timer"
-  restart_schedule_timer
-  echo "[deploy-local] orchd.service is active"
+  if [[ "$SKIP_ORCHD_RESTART" == "1" ]]; then
+    echo "[deploy-local] skipping orchd.service restart (ORCHD_DEPLOY_SKIP_ORCHD_RESTART=1)"
+  else
+    echo "[deploy-local] restarting orchd.service"
+    restart_orchd_service
+    echo "[deploy-local] orchd.service is active"
+  fi
+  if [[ "$SKIP_TIMER_RESTART" == "1" ]]; then
+    echo "[deploy-local] skipping orchd-schedule-tick.timer restart (ORCHD_DEPLOY_SKIP_TIMER_RESTART=1)"
+  else
+    echo "[deploy-local] restarting orchd-schedule-tick.timer"
+    restart_schedule_timer
+  fi
 else
   echo "[deploy-local] skip orchd restart (missing service file: $SERVICE_FILE)"
 fi
