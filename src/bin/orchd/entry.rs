@@ -1,7 +1,10 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use super::cli::{Cli, IssueCommand, OrchdCommand, PromptCommand, RoleCommand, ScheduleCommand};
+use super::cli::{
+    Cli, IssueCommand, ObsCommand, OrchdCommand, PromptCommand, RoleCommand, ScheduleCommand,
+    TimerCommand,
+};
 use super::finalize;
 use super::issue;
 use super::prompt;
@@ -10,6 +13,7 @@ use super::run_dispatch;
 use super::schedule;
 use super::server;
 use super::telemetry::init_telemetry;
+use super::timer;
 
 pub(super) fn run_entry() -> Result<()> {
     init_telemetry();
@@ -30,10 +34,17 @@ fn run_command(cli: &Cli, command: OrchdCommand) -> Result<()> {
     match command {
         OrchdCommand::FinalizeDispatch(args) => finalize::finalize_dispatch_command(*args),
         OrchdCommand::RunDispatch(args) => run_dispatch::run_dispatch_command(args),
-        OrchdCommand::Prompt(command) => run_prompt_command(cli, command),
-        OrchdCommand::Issue(command) => run_issue_command(cli, command),
+        OrchdCommand::Obs(command) => run_obs_command(cli, command),
         OrchdCommand::Role(command) => run_role_command(cli, command),
         OrchdCommand::Schedule(command) => run_schedule_command(cli, command),
+    }
+}
+
+fn run_obs_command(cli: &Cli, command: ObsCommand) -> Result<()> {
+    match command {
+        ObsCommand::Prompt(command) => run_prompt_command(cli, command),
+        ObsCommand::Issue(command) => run_issue_command(cli, command),
+        ObsCommand::Timer(command) => run_timer_command(cli, command),
     }
 }
 
@@ -47,6 +58,12 @@ fn run_issue_command(cli: &Cli, command: IssueCommand) -> Result<()> {
     match command {
         IssueCommand::Sessions(args) => issue::issue_sessions_command(&cli.db_path, args),
         IssueCommand::Resume(args) => issue::issue_resume_command(&cli.db_path, args),
+    }
+}
+
+fn run_timer_command(cli: &Cli, command: TimerCommand) -> Result<()> {
+    match command {
+        TimerCommand::Resume(args) => timer::timer_resume_command(&cli.db_path, args),
     }
 }
 

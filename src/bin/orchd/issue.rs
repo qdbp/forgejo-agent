@@ -35,7 +35,7 @@ fn codex_role_arg(target_role: &str) -> &str {
     target_role.strip_prefix("codex-").unwrap_or(target_role)
 }
 
-fn normalized_role_filter(role: Option<&str>) -> Result<Option<String>> {
+pub(super) fn normalized_role_filter(role: Option<&str>) -> Result<Option<String>> {
     role.map(|raw| {
         let role = raw.trim().to_ascii_lowercase();
         if role.is_empty() {
@@ -81,7 +81,7 @@ struct IssueSessionSummary {
     codex_session_id: String,
 }
 
-fn issue_session_summaries(rows: &[db::IssueResumeDispatch]) -> Vec<IssueSessionSummary> {
+fn issue_session_summaries(rows: &[db::ResumeDispatch]) -> Vec<IssueSessionSummary> {
     rows.iter()
         .map(|row| IssueSessionSummary {
             dispatch_id: row.id,
@@ -124,7 +124,11 @@ pub(super) fn issue_sessions_command(db_path_raw: &str, args: IssueSessionsArgs)
     Ok(())
 }
 
-fn run_codex_resume(target_role: &str, session_id: &str, trailing_args: &[String]) -> Result<()> {
+pub(super) fn run_codex_resume(
+    target_role: &str,
+    session_id: &str,
+    trailing_args: &[String],
+) -> Result<()> {
     let codex_role_bin = codex_role_bin();
     let role_arg = codex_role_arg(target_role);
     let mut command = Command::new(&codex_role_bin);
@@ -196,7 +200,7 @@ pub(super) fn issue_resume_command(db_path_raw: &str, args: IssueResumeArgs) -> 
             if unique_roles.len() > 1 {
                 let roles = unique_roles.into_iter().collect::<Vec<_>>().join(", ");
                 bail!(
-                    "issue {} has sessions for multiple roles ({}); re-run with --role <role> or --dispatch-id <id> (hint: orchd issue sessions {} {})",
+                    "issue {} has sessions for multiple roles ({}); re-run with --role <role> or --dispatch-id <id> (hint: orchd obs issue sessions {} {})",
                     issue_ref,
                     roles,
                     repo,

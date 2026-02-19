@@ -44,13 +44,21 @@ pub(super) enum OrchdCommand {
     FinalizeDispatch(Box<FinalizeDispatchArgs>),
     RunDispatch(RunDispatchArgs),
     #[command(subcommand)]
-    Prompt(PromptCommand),
-    #[command(subcommand)]
-    Issue(IssueCommand),
+    Obs(ObsCommand),
     #[command(subcommand)]
     Role(RoleCommand),
     #[command(subcommand)]
     Schedule(ScheduleCommand),
+}
+
+#[derive(Subcommand, Debug)]
+pub(super) enum ObsCommand {
+    #[command(subcommand)]
+    Prompt(PromptCommand),
+    #[command(subcommand)]
+    Issue(IssueCommand),
+    #[command(subcommand)]
+    Timer(TimerCommand),
 }
 
 #[derive(Subcommand, Debug)]
@@ -62,6 +70,11 @@ pub(super) enum PromptCommand {
 pub(super) enum IssueCommand {
     Sessions(IssueSessionsArgs),
     Resume(IssueResumeArgs),
+}
+
+#[derive(Subcommand, Debug)]
+pub(super) enum TimerCommand {
+    Resume(TimerResumeArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -96,6 +109,17 @@ pub(super) struct IssueSessionsArgs {
 pub(super) struct IssueResumeArgs {
     pub(super) repo: String,
     pub(super) issue_number: u64,
+    #[arg(long)]
+    pub(super) role: Option<String>,
+    #[arg(long = "dispatch-id")]
+    pub(super) dispatch_id: Option<i64>,
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub(super) codex_resume_args: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub(super) struct TimerResumeArgs {
+    pub(super) timer_id: String,
     #[arg(long)]
     pub(super) role: Option<String>,
     #[arg(long = "dispatch-id")]

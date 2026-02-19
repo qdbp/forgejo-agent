@@ -171,7 +171,7 @@ Core behavior:
 - impl remains repo-serialized by the dispatch gate, so a blocked impl head holds that issue queue until the repo lane clears
 - issue+role-scoped codex session reuse (`codex exec resume`) from latest `codex_session_id`
 - periodic heartbeat + reconcile scan logs
-- postmortem issue session inspection/resume via `orchd issue sessions` and `orchd issue resume`
+- postmortem observability via `orchd obs issue sessions|resume`, `orchd obs timer resume`, and `orchd obs prompt preview`
 
 Role launch wrapper:
 
@@ -247,18 +247,26 @@ cargo run --bin orchd -- \
   --dispatch-mode dry-run
 ```
 
-Postmortem resume by issue (owner is fixed to `main`):
+Postmortem observability (owner is fixed to `main` for issue commands):
 
 ```bash
-cargo run --bin orchd -- issue sessions forgejo-agent 20
-cargo run --bin orchd -- issue resume forgejo-agent 20 --role codex-lead -- --no-alt-screen
-cargo run --bin orchd -- issue resume forgejo-agent 20 --dispatch-id 123 -- --no-alt-screen
+cargo run --bin orchd -- obs issue sessions forgejo-agent 20
+cargo run --bin orchd -- obs issue resume forgejo-agent 20 --role codex-lead -- --no-alt-screen
+cargo run --bin orchd -- obs issue resume forgejo-agent 20 --dispatch-id 123 -- --no-alt-screen
+cargo run --bin orchd -- obs timer resume doc-scrub --role codex-lead -- --no-alt-screen
+cargo run --bin orchd -- obs prompt preview main/foo#123 --role codex-dev --directive impl
 ```
 
-`issue resume` fails fast when:
+`obs issue resume` fails fast when:
 
 - the issue has any non-terminal dispatch (`queued|launching|starting|running`)
 - no `codex_session_id` has been recorded for the issue
+- multiple role sessions exist and neither `--role` nor `--dispatch-id` is supplied
+
+`obs timer resume` fails fast when:
+
+- the timer has any non-terminal dispatch (`queued|launching|starting|running`)
+- no `codex_session_id` has been recorded for the timer
 - multiple role sessions exist and neither `--role` nor `--dispatch-id` is supplied
 
 Health check:

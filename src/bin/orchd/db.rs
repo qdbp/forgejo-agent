@@ -45,7 +45,13 @@ pub(super) struct ActiveIssueDispatch {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct IssueResumeDispatch {
+pub(super) struct ActiveTimerDispatch {
+    pub(super) id: i64,
+    pub(super) status: DispatchState,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ResumeDispatch {
     pub(super) id: i64,
     pub(super) status: DispatchState,
     pub(super) target_role: String,
@@ -1504,6 +1510,42 @@ pub(super) fn latest_issue_active_dispatch(
     Ok(dispatch)
 }
 
+pub(super) fn latest_timer_active_dispatch(
+    db_path: &Path,
+    timer_id: &str,
+) -> Result<Option<ActiveTimerDispatch>> {
+    let conn = open_db(db_path)?;
+    let dispatch = conn
+        .query_row(
+            r"
+            SELECT x.id, x.status
+            FROM decisions d
+            JOIN dispatches x ON x.decision_id = d.id
+            WHERE d.schedule_timer_id = ?1
+              AND x.status IN (?2, ?3, ?4, ?5)
+            ORDER BY x.id DESC
+            LIMIT 1
+            ",
+            params![
+                timer_id,
+                DispatchState::Queued.as_db_str(),
+                DispatchState::Launching.as_db_str(),
+                DispatchState::Starting.as_db_str(),
+                DispatchState::Running.as_db_str(),
+            ],
+            |row| {
+                let status_raw: String = row.get(1)?;
+                let status = parse_dispatch_state_literal(&status_raw, 1)?;
+                Ok(ActiveTimerDispatch {
+                    id: row.get(0)?,
+                    status,
+                })
+            },
+        )
+        .optional()?;
+    Ok(dispatch)
+}
+
 pub(super) fn latest_issue_dispatch_id(
     db_path: &Path,
     repo_full_name: &str,
@@ -1531,7 +1573,7 @@ pub(super) fn list_issue_resume_dispatches(
     repo_full_name: &str,
     issue_number: u64,
     target_role: Option<&str>,
-) -> Result<Vec<IssueResumeDispatch>> {
+) -> Result<Vec<ResumeDispatch>> {
     let conn = open_db(db_path)?;
     let role_filter = target_role.map(str::to_ascii_lowercase);
     let mut stmt = conn.prepare(
@@ -1552,7 +1594,7 @@ pub(super) fn list_issue_resume_dispatches(
             |row| {
                 let status_raw: String = row.get(1)?;
                 let status = parse_dispatch_state_literal(&status_raw, 1)?;
-                Ok(IssueResumeDispatch {
+                Ok(ResumeDispatch {
                     id: row.get(0)?,
                     status,
                     target_role: row.get(2)?,
@@ -1560,6 +1602,40 @@ pub(super) fn list_issue_resume_dispatches(
                 })
             },
         )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+pub(super) fn list_timer_resume_dispatches(
+    db_path: &Path,
+    timer_id: &str,
+    target_role: Option<&str>,
+) -> Result<Vec<ResumeDispatch>> {
+    let conn = open_db(db_path)?;
+    let role_filter = target_role.map(str::to_ascii_lowercase);
+    let mut stmt = conn.prepare(
+        r"
+        SELECT x.id, x.status, x.target_role, x.codex_session_id
+        FROM decisions d
+        JOIN dispatches x ON x.decision_id = d.id
+        WHERE d.schedule_timer_id = ?1
+          AND x.codex_session_id IS NOT NULL
+          AND x.codex_session_id != ''
+          AND (?2 IS NULL OR lower(x.target_role) = ?2)
+        ORDER BY x.id DESC
+        ",
+    )?;
+    let rows = stmt
+        .query_map(params![timer_id, role_filter], |row| {
+            let status_raw: String = row.get(1)?;
+            let status = parse_dispatch_state_literal(&status_raw, 1)?;
+            Ok(ResumeDispatch {
+                id: row.get(0)?,
+                status,
+                target_role: row.get(2)?,
+                codex_session_id: row.get(3)?,
+            })
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
@@ -2163,6 +2239,51 @@ mod tests {
         conn.last_insert_rowid()
     }
 
+    fn seed_timer_decision_id(db_path: &Path, timer_id: &str) -> i64 {
+        let conn = super::open_db(db_path).expect("open db");
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            r"
+            INSERT INTO events (delivery_id, event_type, repo_full_name, issue_number, action, actor_login, raw_json, received_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            ",
+            params![
+                format!("timer-delivery-{}", Utc::now().timestamp_nanos_opt().unwrap_or(0)),
+                EVENT_ISSUES,
+                "main/orchd-debug",
+                19_i64,
+                "opened",
+                "main",
+                "{}",
+                now
+            ],
+        )
+        .expect("insert timer event");
+        let event_id = conn.last_insert_rowid();
+        conn.execute(
+            r"
+            INSERT INTO decisions
+            (event_id, repo_full_name, issue_number, actor_login, schedule_timer_id, directive, target_role, decision, reason_code, would_dispatch, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            ",
+            params![
+                event_id,
+                "main/orchd-debug",
+                19_i64,
+                "main",
+                timer_id,
+                DIRECTIVE_REPLY,
+                "codex-orch",
+                DECISION_ACCEPTED,
+                format!("scheduled:{timer_id}"),
+                1_i64,
+                Utc::now().to_rfc3339(),
+            ],
+        )
+        .expect("insert timer decision");
+        conn.last_insert_rowid()
+    }
+
     fn insert_dispatchable_decision(
         db_path: &Path,
         repo_full_name: &str,
@@ -2723,6 +2844,39 @@ mod tests {
     }
 
     #[test]
+    fn latest_timer_active_dispatch_finds_non_terminal_row() {
+        let db_path = temp_db_path("timer-active");
+        super::init_db(&db_path).expect("db init");
+        let timer_id = "doc-scrub";
+        let completed_decision_id = seed_timer_decision_id(&db_path, timer_id);
+        let active_decision_id = seed_timer_decision_id(&db_path, timer_id);
+        let _completed = insert_dispatch_row(
+            &db_path,
+            completed_decision_id,
+            31,
+            DispatchState::Completed,
+            "codex-orch",
+            Some("session-old"),
+        );
+        let active_id = insert_dispatch_row(
+            &db_path,
+            active_decision_id,
+            31,
+            DispatchState::Running,
+            "codex-orch",
+            Some("session-new"),
+        );
+
+        let active = super::latest_timer_active_dispatch(&db_path, timer_id)
+            .expect("query active timer dispatch")
+            .expect("active timer dispatch present");
+        assert_eq!(active.id, active_id);
+        assert_eq!(active.status, DispatchState::Running);
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
     fn list_issue_resume_dispatches_returns_latest_session_row() {
         let db_path = temp_db_path("issue-resume-row");
         super::init_db(&db_path).expect("db init");
@@ -2754,6 +2908,47 @@ mod tests {
         assert_eq!(latest.status, DispatchState::Completed);
         assert_eq!(latest.target_role, "codex-orch");
         assert_eq!(latest.codex_session_id.as_deref(), Some("session-old"));
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn list_timer_resume_dispatches_returns_latest_session_row() {
+        let db_path = temp_db_path("timer-resume-row");
+        super::init_db(&db_path).expect("db init");
+        let timer_id = "doc-scrub";
+        let first_decision_id = seed_timer_decision_id(&db_path, timer_id);
+        let second_decision_id = seed_timer_decision_id(&db_path, timer_id);
+        let first_id = insert_dispatch_row(
+            &db_path,
+            first_decision_id,
+            41,
+            DispatchState::Completed,
+            "codex-orch",
+            Some("timer-session-old"),
+        );
+        let second_id = insert_dispatch_row(
+            &db_path,
+            second_decision_id,
+            41,
+            DispatchState::FailedRuntime,
+            "codex-orch",
+            None,
+        );
+
+        let latest = super::list_timer_resume_dispatches(&db_path, timer_id, None)
+            .expect("query latest timer dispatches")
+            .into_iter()
+            .next()
+            .expect("latest timer dispatch present");
+        assert_eq!(second_id, first_id + 1);
+        assert_eq!(latest.id, first_id);
+        assert_eq!(latest.status, DispatchState::Completed);
+        assert_eq!(latest.target_role, "codex-orch");
+        assert_eq!(
+            latest.codex_session_id.as_deref(),
+            Some("timer-session-old")
+        );
 
         let _ = fs::remove_file(db_path);
     }
@@ -2810,6 +3005,57 @@ mod tests {
         assert_eq!(
             latest_orch.codex_session_id.as_deref(),
             Some("session-orch")
+        );
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn list_timer_resume_dispatches_honors_role_filter() {
+        let db_path = temp_db_path("timer-resume-role-filter");
+        super::init_db(&db_path).expect("db init");
+        let timer_id = "doc-scrub";
+        let orch_decision_id = seed_timer_decision_id(&db_path, timer_id);
+        let lead_decision_id = seed_timer_decision_id(&db_path, timer_id);
+        let orch_id = insert_dispatch_row(
+            &db_path,
+            orch_decision_id,
+            51,
+            DispatchState::Completed,
+            "codex-orch",
+            Some("timer-session-orch"),
+        );
+        let lead_id = insert_dispatch_row(
+            &db_path,
+            lead_decision_id,
+            51,
+            DispatchState::Completed,
+            "codex-lead",
+            Some("timer-session-lead"),
+        );
+
+        let latest_lead =
+            super::list_timer_resume_dispatches(&db_path, timer_id, Some("codex-lead"))
+                .expect("query lead timer dispatch")
+                .into_iter()
+                .next()
+                .expect("lead timer dispatch present");
+        assert_eq!(latest_lead.id, lead_id);
+        assert_eq!(
+            latest_lead.codex_session_id.as_deref(),
+            Some("timer-session-lead")
+        );
+
+        let latest_orch =
+            super::list_timer_resume_dispatches(&db_path, timer_id, Some("codex-orch"))
+                .expect("query orch timer dispatch")
+                .into_iter()
+                .next()
+                .expect("orch timer dispatch present");
+        assert_eq!(latest_orch.id, orch_id);
+        assert_eq!(
+            latest_orch.codex_session_id.as_deref(),
+            Some("timer-session-orch")
         );
 
         let _ = fs::remove_file(db_path);

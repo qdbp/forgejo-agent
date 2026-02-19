@@ -64,7 +64,7 @@ mod finalize;
 // Typed dispatch runner used by backends (replaces generated run.sh). Read when changing codex execution/finalize boundary.
 mod run_dispatch;
 
-// Operator-facing issue subcommands (postmortem session resume). Read when extending orchd obs/issue CLI surface.
+// Observability issue subcommands (`orchd obs issue ...`). Read when extending issue-level session inspection/resume.
 mod issue;
 
 // Role inventory/check/add subcommands for dispatch identity hygiene. Read when onboarding roles or debugging role drift.
@@ -75,6 +75,9 @@ mod schedule;
 
 // Prompt inspection utilities (preview rendered prompt + DocPlan). Read when debugging prompt composition.
 mod prompt;
+
+// Timer-session observability (`orchd obs timer resume`). Read when changing timer-level resume interlocks.
+mod timer;
 
 // Logging + tracing initialization. Read when debugging orchd logs or adding new observability.
 mod telemetry;
