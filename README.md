@@ -372,7 +372,7 @@ Installed hooks:
 
 - `pre-commit`: runs `scripts/check.py`
 - `pre-push`: runs `scripts/check.py`
-- `post-commit`: runs `scripts/deploy-local.sh` (builds + installs `forgejoctl` + `orchd`, restarts orchd when service file exists)
+- `post-commit`: runs `scripts/deploy-local.sh` (builds + installs `forgejoctl` + `orchd`; when `orchd.service` exists, syncs user units and restarts both `orchd.service` and `orchd-schedule-tick.timer`)
 - `post-merge`: runs `scripts/deploy-local.sh` (keeps artifacts deployed after pulls/merges; failures are no longer silently ignored)
 
 `check.py` includes a skill/API sync enforcement hook:

@@ -5,8 +5,14 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 SERVICE_FILE="${ORCHD_SERVICE_FILE:-$HOME/.config/systemd/user/orchd.service}"
+SERVICE_DIR="${ORCHD_SERVICE_DIR:-$(dirname "$SERVICE_FILE")}"
+SCHEDULE_SERVICE_FILE="${ORCHD_SCHEDULE_SERVICE_FILE:-$SERVICE_DIR/orchd-schedule-tick.service}"
+SCHEDULE_TIMER_FILE="${ORCHD_SCHEDULE_TIMER_FILE:-$SERVICE_DIR/orchd-schedule-tick.timer}"
 FORGEJOCTL_BIN="${FORGEJOCTL_BIN:-$HOME/.local/bin/forgejoctl}"
 ORCHD_BIN="${ORCHD_BIN:-$HOME/.local/bin/orchd}"
+ORCHD_SERVICE_TEMPLATE="${ORCHD_SERVICE_TEMPLATE:-$ROOT_DIR/templates/orchd.service}"
+SCHEDULE_SERVICE_TEMPLATE="${ORCHD_SCHEDULE_SERVICE_TEMPLATE:-$ROOT_DIR/templates/orchd-schedule-tick.service}"
+SCHEDULE_TIMER_TEMPLATE="${ORCHD_SCHEDULE_TIMER_TEMPLATE:-$ROOT_DIR/templates/orchd-schedule-tick.timer}"
 
 snapshot_dir=""
 rollback_needed=0
@@ -57,9 +63,21 @@ ensure_systemd_user_env() {
 }
 
 restart_orchd_service() {
-  systemctl --user daemon-reload
   systemctl --user restart orchd.service
   systemctl --user --quiet is-active orchd.service
+}
+
+install_orchd_units() {
+  mkdir -p "$SERVICE_DIR"
+  install -m 0644 "$ORCHD_SERVICE_TEMPLATE" "$SERVICE_FILE"
+  install -m 0644 "$SCHEDULE_SERVICE_TEMPLATE" "$SCHEDULE_SERVICE_FILE"
+  install -m 0644 "$SCHEDULE_TIMER_TEMPLATE" "$SCHEDULE_TIMER_FILE"
+}
+
+restart_schedule_timer() {
+  systemctl --user enable --now orchd-schedule-tick.timer
+  systemctl --user restart orchd-schedule-tick.timer
+  systemctl --user --quiet is-active orchd-schedule-tick.timer
 }
 
 rollback_install() {
@@ -101,8 +119,13 @@ echo "[deploy-local] building + installing binaries"
 
 if [[ -f "$SERVICE_FILE" ]]; then
   ensure_systemd_user_env
+  install_orchd_units
+  systemctl --user daemon-reload
+  systemctl --user enable --now orchd.service
   echo "[deploy-local] restarting orchd.service"
   restart_orchd_service
+  echo "[deploy-local] restarting orchd-schedule-tick.timer"
+  restart_schedule_timer
   echo "[deploy-local] orchd.service is active"
 else
   echo "[deploy-local] skip orchd restart (missing service file: $SERVICE_FILE)"
