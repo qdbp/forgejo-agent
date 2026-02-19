@@ -103,6 +103,8 @@ pub(super) struct ScheduleListArgs {
 pub(super) struct ScheduleTickArgs {
     #[arg(long)]
     pub(super) timer: Option<String>,
+    #[arg(long)]
+    pub(super) manual: bool,
 }
 
 #[derive(Args, Debug)]

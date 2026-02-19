@@ -233,6 +233,16 @@ The installer enables both `orchd.service` and a metronome
 `/home/main/swarm/config/orchd-dispatch.toml` instead of per-timer systemd
 units.
 
+If you already have `orchd.service` installed and only need to install/enable
+the scheduler timer as a user unit:
+
+```bash
+cp /home/main/forgejo-agent/templates/orchd-schedule-tick.service ~/.config/systemd/user/
+cp /home/main/forgejo-agent/templates/orchd-schedule-tick.timer ~/.config/systemd/user/
+XDG_RUNTIME_DIR=/run/user/$(id -u) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus systemctl --user daemon-reload
+XDG_RUNTIME_DIR=/run/user/$(id -u) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus systemctl --user enable --now orchd-schedule-tick.timer
+```
+
 Then:
 
 ```bash
@@ -261,6 +271,7 @@ Postmortem observability (owner is fixed to `main` for issue commands):
 
 ```bash
 cargo run --bin orchd -- schedule list
+cargo run --bin orchd -- schedule tick --timer doc-scrub-forgejo-agent --manual
 cargo run --bin orchd -- obs issue sessions forgejo-agent 20
 cargo run --bin orchd -- obs issue list forgejo-agent 20
 cargo run --bin orchd -- obs issue resume forgejo-agent 20 --role codex-lead -- --no-alt-screen
@@ -270,6 +281,10 @@ cargo run --bin orchd -- obs timer list doc-scrub
 cargo run --bin orchd -- obs timer resume doc-scrub --role codex-lead -- --no-alt-screen
 cargo run --bin orchd -- obs prompt preview main/foo#123 --role codex-dev --directive impl
 ```
+
+`schedule tick --manual` forces an immediate run for the selected timer and
+injects this one-liner into the generated issue body:
+`this is a manual invocation outside the usual schedule`.
 
 `obs issue resume` fails fast when:
 

@@ -28,6 +28,12 @@ struct DueSlot {
     scheduled_for: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimerRunOrigin {
+    Scheduled,
+    Manual,
+}
+
 #[derive(Debug, Clone)]
 struct CreatedIssue {
     number: u64,
@@ -142,6 +148,14 @@ pub(super) fn schedule_tick_command(cli: &Cli, args: ScheduleTickArgs) -> Result
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_ascii_lowercase);
+    let run_origin = if args.manual {
+        TimerRunOrigin::Manual
+    } else {
+        TimerRunOrigin::Scheduled
+    };
+    if run_origin == TimerRunOrigin::Manual && timer_filter.is_none() {
+        return Err(anyhow!("--manual requires --timer <timer_id>"));
+    }
 
     let mut matched_filter = timer_filter.is_none();
     for timer in &dispatch_config.timers {
@@ -161,6 +175,7 @@ pub(super) fn schedule_tick_command(cli: &Cli, args: ScheduleTickArgs) -> Result
             control_token,
             swarm_root.as_path(),
             timer,
+            run_origin,
         )?;
     }
 
@@ -180,6 +195,7 @@ fn tick_timer(
     control_token: &Path,
     swarm_root: &Path,
     timer: &DispatchTimerConfig,
+    run_origin: TimerRunOrigin,
 ) -> Result<()> {
     if db::timer_active_dispatch_count(db_path, timer.id.as_str())?
         >= u64::from(timer.schedule.max_inflight)
@@ -188,8 +204,17 @@ fn tick_timer(
     }
 
     let now = Utc::now();
-    let Some(due) = next_due_slot(db_path, timer, now)? else {
-        return Ok(());
+    let due = match run_origin {
+        TimerRunOrigin::Scheduled => {
+            let Some(due) = next_due_slot(db_path, timer, now)? else {
+                return Ok(());
+            };
+            due
+        }
+        TimerRunOrigin::Manual => DueSlot {
+            index: manual_slot_index(now),
+            scheduled_for: now,
+        },
     };
     if !db::claim_schedule_slot(
         db_path,
@@ -224,7 +249,7 @@ fn tick_timer(
         .with_context(|| format!("failed ensuring timer target repo {}", timer.target.repo))?;
 
         let title = render_run_issue_title(timer, due.scheduled_for);
-        let body = render_run_issue_body(timer, due.scheduled_for)?;
+        let body = render_run_issue_body(timer, due.scheduled_for, run_origin)?;
         let issue = create_run_issue(
             dispatch_config,
             config_override,
@@ -242,12 +267,22 @@ fn tick_timer(
             issue_number: Some(issue.number),
             source_issue_id: None,
             source_issue_anchor_at: None,
-            action: Some("tick".to_string()),
+            action: Some(
+                match run_origin {
+                    TimerRunOrigin::Scheduled => "tick",
+                    TimerRunOrigin::Manual => "manual_tick",
+                }
+                .to_string(),
+            ),
             actor_login: Some("orchd".to_string()),
-            event_text: Some(format!(
-                "scheduled timer run {} slot {}",
-                timer.id, due.index
-            )),
+            event_text: Some(match run_origin {
+                TimerRunOrigin::Scheduled => {
+                    format!("scheduled timer run {} slot {}", timer.id, due.index)
+                }
+                TimerRunOrigin::Manual => {
+                    format!("manual timer run {} slot {}", timer.id, due.index)
+                }
+            }),
             source_comment_id: None,
             source_created_at: Some(now.to_rfc3339()),
             raw_json: serde_json::to_string(&json!({
@@ -256,6 +291,10 @@ fn tick_timer(
                 "scheduled_for": due.scheduled_for.to_rfc3339(),
                 "issue_number": issue.number,
                 "context_key": timer.context.key,
+                "run_origin": match run_origin {
+                    TimerRunOrigin::Scheduled => "scheduled",
+                    TimerRunOrigin::Manual => "manual",
+                },
             }))?,
         };
         let event_id = db::insert_event(db_path, &event)?.ok_or_else(|| {
@@ -266,7 +305,10 @@ fn tick_timer(
         })?;
         let decision = DecisionRecord {
             decision: DECISION_ACCEPTED.to_string(),
-            reason_code: format!("scheduled:{}", timer.id),
+            reason_code: match run_origin {
+                TimerRunOrigin::Scheduled => format!("scheduled:{}", timer.id),
+                TimerRunOrigin::Manual => format!("manual:{}", timer.id),
+            },
             directive: Some(timer.dispatch.directive.clone()),
             target_role: Some(timer.dispatch.target_role.clone()),
             principal_login: Some(timer.dispatch.principal.clone()),
@@ -274,7 +316,11 @@ fn tick_timer(
             timer_context_key: Some(timer.context.key.clone()),
             resume_session_id,
             would_dispatch: true,
-            decision_source: "scheduled_timer".to_string(),
+            decision_source: match run_origin {
+                TimerRunOrigin::Scheduled => "scheduled_timer",
+                TimerRunOrigin::Manual => "manual_timer",
+            }
+            .to_string(),
             trigger_id: None,
             trigger_dedupe_key: None,
             trigger_apply_guardrails: false,
@@ -378,6 +424,7 @@ fn render_run_issue_title(timer: &DispatchTimerConfig, scheduled_for: DateTime<U
 fn render_run_issue_body(
     timer: &DispatchTimerConfig,
     scheduled_for: DateTime<Utc>,
+    run_origin: TimerRunOrigin,
 ) -> Result<String> {
     let standing_order = fs::read_to_string(&timer.run_issue.body_file).with_context(|| {
         format!(
@@ -386,13 +433,25 @@ fn render_run_issue_body(
         )
     })?;
     let mut body = String::new();
-    body.push_str("scheduled timer run\n\n");
+    body.push_str(match run_origin {
+        TimerRunOrigin::Scheduled => "scheduled timer run\n\n",
+        TimerRunOrigin::Manual => "manual timer run\n\n",
+    });
     body.push_str(format!("- timer_id: {}\n", timer.id).as_str());
     body.push_str(format!("- scheduled_for: {}\n", scheduled_for.to_rfc3339()).as_str());
     body.push_str(format!("- context_key: {}\n", timer.context.key).as_str());
+    if run_origin == TimerRunOrigin::Manual {
+        body.push_str("- note: this is a manual invocation outside the usual schedule\n");
+    }
     body.push_str(format!("- role: {}\n\n", timer.dispatch.target_role).as_str());
     body.push_str(standing_order.as_str());
     Ok(body)
+}
+
+fn manual_slot_index(now: DateTime<Utc>) -> i64 {
+    now.timestamp_nanos_opt()
+        .and_then(i64::checked_neg)
+        .unwrap_or(i64::MIN + 1)
 }
 
 fn swarm_root_for_dispatch_config(dispatch_config_path: &Path) -> PathBuf {
@@ -563,6 +622,8 @@ fn slot_due_at(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use chrono::TimeZone;
 
     use super::*;
@@ -619,6 +680,24 @@ mod tests {
             .expect("time");
         let title = render_run_issue_title(&timer, scheduled_for);
         assert_eq!(title, "doc scrub 2026-02-19");
+    }
+
+    #[test]
+    fn manual_run_body_includes_manual_invocation_note() {
+        let mut timer = sample_timer(DispatchTimerCatchUp::Coalesce);
+        let temp = tempfile::tempdir().expect("tmp");
+        let body_file = temp.path().join("doc.md");
+        fs::write(&body_file, "standing order body\n").expect("write");
+        timer.run_issue.body_file = body_file;
+
+        let scheduled_for = Utc
+            .with_ymd_and_hms(2026, 2, 19, 3, 0, 0)
+            .single()
+            .expect("time");
+        let body = render_run_issue_body(&timer, scheduled_for, TimerRunOrigin::Manual)
+            .expect("render body");
+        assert!(body.contains("manual timer run"));
+        assert!(body.contains("this is a manual invocation outside the usual schedule"));
     }
 
     #[test]
