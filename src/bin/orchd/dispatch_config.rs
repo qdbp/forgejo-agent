@@ -882,6 +882,10 @@ const fn default_timer_fallback_prompt_bytes() -> u64 {
     2_000_000
 }
 
+const fn default_timer_dispatch_principal() -> &'static str {
+    "orchd"
+}
+
 const fn default_legacy_triggers() -> bool {
     true
 }
@@ -2118,7 +2122,7 @@ fn compile_timer_config(
     let principal = timer
         .dispatch
         .principal
-        .unwrap_or_else(|| "codex-orch".to_string())
+        .unwrap_or_else(|| default_timer_dispatch_principal().to_string())
         .trim()
         .to_ascii_lowercase();
     if principal.is_empty() {
@@ -3126,6 +3130,100 @@ min_context_pct = 40
         assert_eq!(timer.target.repo.to_string(), "main/forgejo-agent");
         assert_eq!(timer.run_issue.workflow, "ready");
         assert_eq!(timer.run_issue.labels, vec!["pri/low"]);
+        Ok(())
+    }
+
+    #[test]
+    fn load_dispatch_config_timer_defaults_principal_to_orchd() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path();
+        let config_path = root.join("dispatch.toml");
+        let prompts_dir = root.join("prompts");
+        let orders_dir = prompts_dir.join("orders");
+        let standing_orders_dir = prompts_dir.join("standing_orders");
+        let roles_dir = prompts_dir.join("roles");
+        fs::create_dir_all(&orders_dir)?;
+        fs::create_dir_all(&standing_orders_dir)?;
+        fs::create_dir_all(&roles_dir)?;
+        fs::write(
+            roles_dir.join("codex-orch.md"),
+            "# codex-orch role card\n\n- OF-8\n",
+        )?;
+        fs::write(
+            roles_dir.join("codex-lead.md"),
+            "# codex-lead role card\n\n- OF-6\n",
+        )?;
+        fs::write(roles_dir.join("orchd.md"), "# orchd role card\n\n- OF-9\n")?;
+        fs::write(roles_dir.join("main.md"), "# main role card\n\n- OF-10\n")?;
+        fs::write(prompts_dir.join("orchd-preamble.md"), "preamble\n")?;
+        fs::write(
+            prompts_dir.join("orchd-envelope-fresh.md"),
+            "{{preamble_md}}\n",
+        )?;
+        fs::write(
+            prompts_dir.join("orchd-envelope-followup.md"),
+            "{{dispatch_md}}\n",
+        )?;
+        fs::write(orders_dir.join("orchd-investigate.md"), "investigate\n")?;
+        fs::write(standing_orders_dir.join("doc-scrub.md"), "doc scrub\n")?;
+        fs::write(root.join("orch.token"), "orch\n")?;
+        fs::write(root.join("lead.token"), "lead\n")?;
+
+        let config_toml = format!(
+            r#"version = 1
+allowed_actors = ["main", "orchd"]
+legacy_triggers = false
+
+[prompt_envelopes]
+preamble_file = "{preamble}"
+fresh_envelope = "{fresh}"
+followup_envelope = "{followup}"
+
+[roles.codex-orch]
+token_file = "{orch_token}"
+
+[roles.codex-lead]
+token_file = "{lead_token}"
+
+[directives.investigate]
+role = "codex-orch"
+prompt_file = "{investigate_prompt}"
+
+[rank_acl.ranks."OF-9"]
+own_directives = ["design", "investigate", "impl", "reply", "audit", "audit-failure"]
+delegation_directives = ["design", "investigate", "impl", "reply", "audit", "audit-failure"]
+
+[[timers]]
+id = "doc_scrub"
+
+[timers.schedule]
+interval_sec = 3600
+start_at = "2026-02-18T00:00:00Z"
+
+[timers.target]
+repo = "main/forgejo-agent"
+
+[timers.run_issue]
+title_template = "doc scrub {{date}}"
+body_file = "{doc_scrub_body}"
+
+[timers.dispatch]
+directive = "investigate"
+target_role = "codex-lead"
+"#,
+            preamble = prompts_dir.join("orchd-preamble.md").display(),
+            fresh = prompts_dir.join("orchd-envelope-fresh.md").display(),
+            followup = prompts_dir.join("orchd-envelope-followup.md").display(),
+            orch_token = root.join("orch.token").display(),
+            lead_token = root.join("lead.token").display(),
+            investigate_prompt = orders_dir.join("orchd-investigate.md").display(),
+            doc_scrub_body = standing_orders_dir.join("doc-scrub.md").display(),
+        );
+        fs::write(&config_path, config_toml)?;
+
+        let config = load_dispatch_config(&config_path)?;
+        let timer = &config.timers[0];
+        assert_eq!(timer.dispatch.principal, "orchd");
         Ok(())
     }
 

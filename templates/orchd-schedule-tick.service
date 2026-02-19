@@ -1,0 +1,12 @@
+[Unit]
+Description=Codex orchd schedule tick
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/main/.local/bin/orchd --config /home/main/.config/forgejo-agent/config.env --token-file /home/main/.config/forgejo-agent/creds/orchd.token --db-path /home/main/.local/state/orchd-dev/orchd.sqlite --dispatch-config /home/main/swarm/config/orchd-dispatch.toml schedule tick
+WorkingDirectory=/home/main/forgejo-agent
+Environment=HOME=/home/main
+Environment=XDG_RUNTIME_DIR=%t
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus

@@ -171,6 +171,7 @@ Core behavior:
 - queue scheduling uses a per-issue FIFO head (`MIN(decision.id)` among pending), with same-actor + same-directive + same-target-role pending entries coalesced to the latest
 - impl remains repo-serialized by the dispatch gate, so a blocked impl head holds that issue queue until the repo lane clears
 - issue+role-scoped codex session reuse (`codex exec resume`) from latest `codex_session_id`
+- timer-scoped session lanes (`[[timers]]`) with `timers.dispatch.principal` defaulting to `orchd` when omitted
 - periodic heartbeat + reconcile scan logs
 - postmortem observability via `orchd obs issue sessions|list|resume`, `orchd obs timer sessions|list|resume`, and `orchd obs prompt preview`
 
@@ -227,12 +228,20 @@ Run as user service (recommended for easy restart/visibility):
 /home/main/forgejo-agent/scripts/install-orchd-user-service.sh
 ```
 
+The installer enables both `orchd.service` and a metronome
+`orchd-schedule-tick.timer` (every 60s), so timer schedules stay in
+`/home/main/swarm/config/orchd-dispatch.toml` instead of per-timer systemd
+units.
+
 Then:
 
 ```bash
 XDG_RUNTIME_DIR=/run/user/$(id -u) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus systemctl --user status orchd.service --no-pager
+XDG_RUNTIME_DIR=/run/user/$(id -u) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus systemctl --user status orchd-schedule-tick.timer --no-pager
+XDG_RUNTIME_DIR=/run/user/$(id -u) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus systemctl --user list-timers orchd-schedule-tick.timer --no-pager
 XDG_RUNTIME_DIR=/run/user/$(id -u) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus systemctl --user restart orchd.service
 XDG_RUNTIME_DIR=/run/user/$(id -u) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus journalctl --user -u orchd.service -f
+XDG_RUNTIME_DIR=/run/user/$(id -u) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus journalctl --user -u orchd-schedule-tick.service -f
 ```
 
 Run (`dry-run`):
