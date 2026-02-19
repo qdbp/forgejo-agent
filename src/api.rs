@@ -544,6 +544,35 @@ impl ForgejoClient {
         self.send_json(cfg, &Method::GET, &path, Option::<&()>::None)
     }
 
+    pub fn list_issues_all(
+        &self,
+        cfg: &AgentConfig,
+        repo: &RepoRef,
+        state: &str,
+    ) -> Result<Vec<ApiIssue>> {
+        const PAGE_LIMIT: u32 = 100;
+        const MAX_PAGES: u32 = 200;
+
+        let mut issues = Vec::new();
+        for page in 1..=MAX_PAGES {
+            let path = format!(
+                "/api/v1/repos/{}/{}/issues?state={state}&limit={PAGE_LIMIT}&page={page}",
+                repo.owner, repo.repo
+            );
+            let mut page_issues: Vec<ApiIssue> =
+                self.send_json(cfg, &Method::GET, &path, Option::<&()>::None)?;
+            if page_issues.is_empty() {
+                return Ok(issues);
+            }
+            issues.append(&mut page_issues);
+        }
+        bail!(
+            "issue listing for {}/{} exceeded pagination safety cap ({MAX_PAGES} pages)",
+            repo.owner,
+            repo.repo
+        )
+    }
+
     pub fn get_issue(&self, cfg: &AgentConfig, issue: &IssueRef) -> Result<ApiIssue> {
         let path = format!(
             "/api/v1/repos/{}/{}/issues/{}",

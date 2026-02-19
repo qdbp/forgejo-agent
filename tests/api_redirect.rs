@@ -26,6 +26,13 @@ struct ListLabelsQuery {
     page: Option<u32>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ListIssuesQuery {
+    state: Option<String>,
+    limit: Option<u32>,
+    page: Option<u32>,
+}
+
 #[tokio::test]
 async fn issue_create_follows_repo_rename_redirect_without_switching_to_get() -> Result<()> {
     let post_hits = Arc::new(AtomicUsize::new(0));
@@ -274,5 +281,85 @@ async fn list_labels_paginates_until_empty_page() -> Result<()> {
         label_names,
         vec!["type/blocker", "type/bug", "type/feature", "type/epic"]
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_issues_all_paginates_until_empty_page() -> Result<()> {
+    let app = axum::Router::new().route(
+        "/api/v1/repos/main/forgejo-agent/issues",
+        get(|Query(query): Query<ListIssuesQuery>| async move {
+            if query.state.as_deref() != Some("open") || query.limit != Some(100) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error":"unexpected query"})),
+                )
+                    .into_response();
+            }
+            let issues = match query.page.unwrap_or(1) {
+                1 => json!([
+                    {
+                        "number": 1,
+                        "state": "open",
+                        "title": "issue 1",
+                        "html_url": "http://example.invalid/main/forgejo-agent/issues/1"
+                    },
+                    {
+                        "number": 2,
+                        "state": "open",
+                        "title": "issue 2",
+                        "html_url": "http://example.invalid/main/forgejo-agent/issues/2"
+                    }
+                ]),
+                2 => json!([
+                    {
+                        "number": 3,
+                        "state": "open",
+                        "title": "issue 3",
+                        "html_url": "http://example.invalid/main/forgejo-agent/issues/3"
+                    }
+                ]),
+                _ => json!([]),
+            };
+            Json(issues).into_response()
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+    let addr = listener.local_addr()?;
+    let base_url = Url::parse(&format!("http://{addr}"))?;
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let server_task = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    let cfg = AgentConfig {
+        base_url,
+        default_repo: RepoRef::new("main", "scratch"),
+        agent_name: "test".to_string(),
+        lease_minutes: 90,
+        token: "test-token".to_string(),
+    };
+
+    let issues = tokio::task::spawn_blocking(move || {
+        let api = ForgejoClient::new(&cfg)?;
+        api.list_issues_all(&cfg, &RepoRef::new("main", "forgejo-agent"), "open")
+    })
+    .await??;
+
+    shutdown_tx.send(()).ok();
+    server_task.await.ok();
+
+    let issue_numbers = issues
+        .into_iter()
+        .map(|issue| issue.number)
+        .collect::<Vec<_>>();
+    assert_eq!(issue_numbers, vec![1, 2, 3]);
     Ok(())
 }

@@ -1273,7 +1273,7 @@ async fn reconcile_once(state: &AppState) -> Result<()> {
 
     let reconcile_stats = tokio::task::spawn_blocking(move || -> Result<ReconcileStats> {
         let api = ForgejoClient::new(&cfg)?;
-        let issues = api.list_issues(&cfg, &repo, "open", 100)?;
+        let issues = api.list_issues_all(&cfg, &repo, "open")?;
         let mut loop_stats = ReconcileStats {
             scanned_open: issues.len(),
             ..ReconcileStats::default()
