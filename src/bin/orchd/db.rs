@@ -107,6 +107,70 @@ pub(super) struct TimerContextRow {
     pub(super) updated_at: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DeployJobStatus {
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+}
+
+impl DeployJobStatus {
+    pub(super) const fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct DeployJob {
+    pub(super) id: i64,
+    pub(super) repo_full_name: String,
+    pub(super) target_branch: String,
+    pub(super) target_sha: String,
+    pub(super) source_event_id: Option<i64>,
+    pub(super) source_delivery_id: Option<String>,
+    pub(super) source_actor_login: Option<String>,
+    pub(super) status: DeployJobStatus,
+    pub(super) attempt_count: u64,
+}
+
+type DeployClaimRow = (
+    i64,
+    String,
+    String,
+    String,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+);
+
+#[derive(Debug, Clone)]
+pub(super) struct DeployJobFailureUpdate<'a> {
+    pub(super) reason_code: &'a str,
+    pub(super) error_text: &'a str,
+    pub(super) checkout_path: Option<&'a Path>,
+    pub(super) log_path: Option<&'a Path>,
+    pub(super) incident_issue_number: Option<u64>,
+    pub(super) rollback_status: Option<&'a str>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct DeployJobSuccessUpdate<'a> {
+    pub(super) checkout_path: Option<&'a Path>,
+    pub(super) log_path: Option<&'a Path>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DeployEnqueueOutcome {
+    Inserted,
+    Existing,
+}
+
 pub(super) fn init_db(db_path: &Path) -> Result<()> {
     if let Some(parent) = db_path.parent() {
         fs::create_dir_all(parent)
@@ -262,6 +326,292 @@ pub(super) fn list_known_repo_full_names(db_path: &Path, limit: usize) -> Result
     let rows = stmt.query_map(params![limit_i64], |row| row.get::<_, String>(0))?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .map_err(Into::into)
+}
+
+pub(super) fn enqueue_deploy_job(
+    db_path: &Path,
+    repo_full_name: &str,
+    target_branch: &str,
+    target_sha: &str,
+    source_event_id: Option<i64>,
+    source_delivery_id: Option<&str>,
+    source_actor_login: Option<&str>,
+) -> Result<DeployEnqueueOutcome> {
+    let conn = open_db(db_path)?;
+    let inserted = conn.execute(
+        r"
+        INSERT INTO deploy_jobs (
+            repo_full_name,
+            target_branch,
+            target_sha,
+            source_event_id,
+            source_delivery_id,
+            source_actor_login,
+            status,
+            queued_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        ",
+        params![
+            repo_full_name,
+            target_branch,
+            target_sha,
+            source_event_id,
+            source_delivery_id,
+            source_actor_login,
+            DeployJobStatus::Queued.as_db_str(),
+            Utc::now().to_rfc3339(),
+        ],
+    );
+    match inserted {
+        Ok(_) => Ok(DeployEnqueueOutcome::Inserted),
+        Err(err) => {
+            let duplicate = matches!(
+                err,
+                rusqlite::Error::SqliteFailure(sqlite_err, _)
+                    if matches!(sqlite_err.extended_code, 1555 | 2067)
+            );
+            if duplicate {
+                Ok(DeployEnqueueOutcome::Existing)
+            } else {
+                Err(err.into())
+            }
+        }
+    }
+}
+
+pub(super) fn requeue_running_deploy_jobs(db_path: &Path) -> Result<u64> {
+    let conn = open_db(db_path)?;
+    let count = conn.execute(
+        r"
+        UPDATE deploy_jobs
+        SET status = ?1,
+            reason_code = 'startup_requeue',
+            error_text = NULL,
+            started_at = NULL,
+            ended_at = NULL
+        WHERE status = ?2
+        ",
+        params![
+            DeployJobStatus::Queued.as_db_str(),
+            DeployJobStatus::Running.as_db_str(),
+        ],
+    )?;
+    Ok(u64::try_from(count).unwrap_or(u64::MAX))
+}
+
+pub(super) fn claim_next_deploy_job(db_path: &Path) -> Result<Option<DeployJob>> {
+    let mut conn = open_db(db_path)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let row: Option<DeployClaimRow> = tx
+        .query_row(
+            r"
+            SELECT
+                id,
+                repo_full_name,
+                target_branch,
+                target_sha,
+                source_event_id,
+                source_delivery_id,
+                source_actor_login
+            FROM deploy_jobs
+            WHERE status = ?1
+            ORDER BY id ASC
+            LIMIT 1
+            ",
+            params![DeployJobStatus::Queued.as_db_str()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()?;
+
+    let Some((
+        id,
+        repo_full_name,
+        target_branch,
+        target_sha,
+        source_event_id,
+        source_delivery_id,
+        source_actor_login,
+    )) = row
+    else {
+        tx.commit()?;
+        return Ok(None);
+    };
+
+    tx.execute(
+        r"
+        UPDATE deploy_jobs
+        SET status = ?1,
+            started_at = ?2,
+            ended_at = NULL,
+            attempt_count = attempt_count + 1
+        WHERE id = ?3
+        ",
+        params![
+            DeployJobStatus::Running.as_db_str(),
+            Utc::now().to_rfc3339(),
+            id
+        ],
+    )?;
+
+    let attempt_count: u64 = tx.query_row(
+        "SELECT attempt_count FROM deploy_jobs WHERE id = ?1",
+        params![id],
+        |row| row.get(0),
+    )?;
+
+    tx.commit()?;
+
+    Ok(Some(DeployJob {
+        id,
+        repo_full_name,
+        target_branch,
+        target_sha,
+        source_event_id,
+        source_delivery_id,
+        source_actor_login,
+        status: DeployJobStatus::Running,
+        attempt_count,
+    }))
+}
+
+pub(super) fn complete_deploy_job_success(
+    db_path: &Path,
+    job_id: i64,
+    update: &DeployJobSuccessUpdate<'_>,
+) -> Result<()> {
+    let conn = open_db(db_path)?;
+    conn.execute(
+        r"
+        UPDATE deploy_jobs
+        SET status = ?2,
+            reason_code = 'deployed',
+            error_text = NULL,
+            checkout_path = ?3,
+            log_path = ?4,
+            rollback_status = NULL,
+            ended_at = ?5
+        WHERE id = ?1
+        ",
+        params![
+            job_id,
+            DeployJobStatus::Succeeded.as_db_str(),
+            update
+                .checkout_path
+                .map(|path| path.to_string_lossy().into_owned()),
+            update
+                .log_path
+                .map(|path| path.to_string_lossy().into_owned()),
+            Utc::now().to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+pub(super) fn complete_deploy_job_failure(
+    db_path: &Path,
+    job_id: i64,
+    update: &DeployJobFailureUpdate<'_>,
+) -> Result<()> {
+    let conn = open_db(db_path)?;
+    conn.execute(
+        r"
+        UPDATE deploy_jobs
+        SET status = ?2,
+            reason_code = ?3,
+            error_text = ?4,
+            checkout_path = ?5,
+            log_path = ?6,
+            incident_issue_number = ?7,
+            rollback_status = ?8,
+            ended_at = ?9
+        WHERE id = ?1
+        ",
+        params![
+            job_id,
+            DeployJobStatus::Failed.as_db_str(),
+            update.reason_code,
+            update.error_text,
+            update
+                .checkout_path
+                .map(|path| path.to_string_lossy().into_owned()),
+            update
+                .log_path
+                .map(|path| path.to_string_lossy().into_owned()),
+            update.incident_issue_number,
+            update.rollback_status,
+            Utc::now().to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+pub(super) fn has_active_deploy_for_target(
+    db_path: &Path,
+    repo_full_name: &str,
+    target_branch: &str,
+    target_sha: &str,
+) -> Result<bool> {
+    let conn = open_db(db_path)?;
+    let row: Option<()> = conn
+        .query_row(
+            r"
+            SELECT 1
+            FROM deploy_jobs
+            WHERE repo_full_name = ?1
+              AND target_branch = ?2
+              AND target_sha = ?3
+              AND status IN (?4, ?5)
+            LIMIT 1
+            ",
+            params![
+                repo_full_name,
+                target_branch,
+                target_sha,
+                DeployJobStatus::Queued.as_db_str(),
+                DeployJobStatus::Running.as_db_str(),
+            ],
+            |_| Ok(()),
+        )
+        .optional()?;
+    Ok(row.is_some())
+}
+
+pub(super) fn latest_deployed_sha(
+    db_path: &Path,
+    repo_full_name: &str,
+    target_branch: &str,
+) -> Result<Option<String>> {
+    let conn = open_db(db_path)?;
+    let row: Option<String> = conn
+        .query_row(
+            r"
+            SELECT target_sha
+            FROM deploy_jobs
+            WHERE repo_full_name = ?1
+              AND target_branch = ?2
+              AND status = ?3
+            ORDER BY id DESC
+            LIMIT 1
+            ",
+            params![
+                repo_full_name,
+                target_branch,
+                DeployJobStatus::Succeeded.as_db_str()
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(row)
 }
 
 pub(super) fn insert_event(db_path: &Path, event: &EventRecord) -> Result<Option<i64>> {
@@ -3396,6 +3746,116 @@ mod tests {
         assert_eq!(row.prompt_bytes_total, 12_345);
         assert_eq!(row.last_context_pct, Some(47));
         assert_eq!(row.last_status.as_deref(), Some("completed"));
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn deploy_job_enqueue_dedupes_and_tracks_success_head() {
+        let db_path = temp_db_path("deploy-jobs-success");
+        super::init_db(&db_path).expect("db init");
+
+        let first = super::enqueue_deploy_job(
+            &db_path,
+            "main/forgejo-agent",
+            "main",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            None,
+            Some("delivery-1"),
+            Some("main"),
+        )
+        .expect("enqueue first");
+        let second = super::enqueue_deploy_job(
+            &db_path,
+            "main/forgejo-agent",
+            "main",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            None,
+            Some("delivery-2"),
+            Some("main"),
+        )
+        .expect("enqueue duplicate");
+        assert_eq!(first, super::DeployEnqueueOutcome::Inserted);
+        assert_eq!(second, super::DeployEnqueueOutcome::Existing);
+
+        let claimed = super::claim_next_deploy_job(&db_path)
+            .expect("claim")
+            .expect("queued job");
+        assert_eq!(claimed.repo_full_name, "main/forgejo-agent");
+        assert_eq!(claimed.target_branch, "main");
+        assert_eq!(
+            claimed.target_sha,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(claimed.status, super::DeployJobStatus::Running);
+        assert_eq!(claimed.attempt_count, 1);
+
+        assert!(
+            super::has_active_deploy_for_target(
+                &db_path,
+                "main/forgejo-agent",
+                "main",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            )
+            .expect("active check")
+        );
+
+        super::complete_deploy_job_success(
+            &db_path,
+            claimed.id,
+            &super::DeployJobSuccessUpdate {
+                checkout_path: None,
+                log_path: None,
+            },
+        )
+        .expect("mark success");
+
+        assert_eq!(
+            super::latest_deployed_sha(&db_path, "main/forgejo-agent", "main").expect("latest sha"),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+        );
+        assert!(
+            !super::has_active_deploy_for_target(
+                &db_path,
+                "main/forgejo-agent",
+                "main",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            )
+            .expect("active check")
+        );
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn deploy_job_requeue_resets_running_rows_after_restart() {
+        let db_path = temp_db_path("deploy-jobs-requeue");
+        super::init_db(&db_path).expect("db init");
+
+        super::enqueue_deploy_job(
+            &db_path,
+            "main/forgejo-agent",
+            "main",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            None,
+            Some("delivery-3"),
+            Some("main"),
+        )
+        .expect("enqueue");
+        let first_claim = super::claim_next_deploy_job(&db_path)
+            .expect("claim")
+            .expect("queued job");
+        assert_eq!(first_claim.attempt_count, 1);
+
+        let requeued = super::requeue_running_deploy_jobs(&db_path).expect("requeue running");
+        assert_eq!(requeued, 1);
+
+        let second_claim = super::claim_next_deploy_job(&db_path)
+            .expect("claim second")
+            .expect("requeued job");
+        assert_eq!(second_claim.id, first_claim.id);
+        assert_eq!(second_claim.attempt_count, 2);
+        assert_eq!(second_claim.status, super::DeployJobStatus::Running);
 
         let _ = fs::remove_file(db_path);
     }

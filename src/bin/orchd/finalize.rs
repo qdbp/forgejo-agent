@@ -65,15 +65,10 @@ struct LandingTarget<'a> {
     kind: &'static str,
     repo_ref: RepoRef,
     git_workdir: &'a Path,
-    principal_workdir: Option<&'a Path>,
     git_remote: &'a str,
     git_base: &'a str,
     git_branch: &'a str,
 }
-
-const ORCHD_DEPLOY_REPO_OWNER: &str = "main";
-const ORCHD_DEPLOY_REPO_NAME: &str = "forgejo-agent";
-const ORCHD_SERVICE_FILE: &str = "/home/main/.config/systemd/user/orchd.service";
 
 fn parse_reported_status(status: &str) -> Result<ReportedStatus> {
     match status {
@@ -301,55 +296,6 @@ fn merge_ff_only_with_retry(
     Ok(())
 }
 
-fn requires_merge_finalize_deploy(repo_ref: &RepoRef) -> bool {
-    repo_ref.owner == ORCHD_DEPLOY_REPO_OWNER && repo_ref.repo == ORCHD_DEPLOY_REPO_NAME
-}
-
-fn sync_principal_after_landing(
-    args: &FinalizeDispatchArgs,
-    target: &LandingTarget<'_>,
-    source_remote_url: &str,
-    lines: &mut Vec<String>,
-) -> Result<()> {
-    let Some(principal_workdir) = target.principal_workdir else {
-        if requires_merge_finalize_deploy(&target.repo_ref) {
-            return Err(anyhow!(
-                "principal checkout is required for merge-finalize deploy target {}",
-                target.repo_ref
-            ));
-        }
-        return Ok(());
-    };
-
-    if requires_merge_finalize_deploy(&target.repo_ref) {
-        let report = repo::sync_principal_strict(
-            &args.db_path,
-            &args.token_file,
-            principal_workdir,
-            target.git_base,
-            source_remote_url,
-        )?;
-        lines.extend(report.lines);
-        if report.head_changed {
-            lines.extend(repo::run_strict_post_merge_deploy(
-                principal_workdir,
-                Path::new(ORCHD_SERVICE_FILE),
-            )?);
-        } else {
-            lines.push("post_merge_deploy: skipped (principal already current)".to_string());
-        }
-    } else {
-        lines.extend(repo::best_effort_sync_principal(
-            &args.db_path,
-            &args.token_file,
-            principal_workdir,
-            target.git_base,
-            source_remote_url,
-        ));
-    }
-    Ok(())
-}
-
 fn evaluate_landing_target(
     args: &FinalizeDispatchArgs,
     target: LandingTarget<'_>,
@@ -503,12 +449,6 @@ fn evaluate_landing_target(
         ) {
             lines.push(format!("{prefix}pr_supersede_scan_failed: {err:#}"));
         }
-        if let Err(err) = sync_principal_after_landing(args, &target, &git_url, &mut lines) {
-            return LandingOutcome::Failure {
-                reason_code: "landing_post_merge_deploy_failed".to_string(),
-                lines: vec![format!("{prefix}post-merge deploy failed: {err:#}")],
-            };
-        }
         return LandingOutcome::Success(lines);
     }
 
@@ -580,12 +520,6 @@ fn evaluate_landing_target(
                 &mut lines,
             ) {
                 lines.push(format!("{prefix}pr_supersede_scan_failed: {err:#}"));
-            }
-            if let Err(err) = sync_principal_after_landing(args, &target, &git_url, &mut lines) {
-                return LandingOutcome::Failure {
-                    reason_code: "landing_post_merge_deploy_failed".to_string(),
-                    lines: vec![format!("{prefix}post-merge deploy failed: {err:#}")],
-                };
             }
             LandingOutcome::Success(lines)
         }
@@ -747,14 +681,6 @@ fn evaluate_landing_target(
                     ) {
                         lines.push(format!("{prefix}pr_supersede_scan_failed: {err:#}"));
                     }
-                    if let Err(err) =
-                        sync_principal_after_landing(args, &target, &git_url, &mut lines)
-                    {
-                        return LandingOutcome::Failure {
-                            reason_code: "landing_post_merge_deploy_failed".to_string(),
-                            lines: vec![format!("{prefix}post-merge deploy failed: {err:#}")],
-                        };
-                    }
                     LandingOutcome::Success(lines)
                 }
                 Err(err) => {
@@ -903,13 +829,16 @@ pub(super) fn finalize_dispatch_command(args: FinalizeDispatchArgs) -> Result<()
     let _entered = span.enter();
 
     let reported_status = parse_reported_status(&args.status)?;
+    // Landing no longer syncs principal worktrees directly; keep reading these fields so CLI
+    // wire compatibility remains stable while deploy orchestration moved to the push/deploy lane.
+    let _legacy_principal_workdir = args.principal_workdir.as_deref();
+    let _legacy_sidecar_principal_workdir = args.sidecar_principal_workdir.as_deref();
     let (sidecar_outcome, primary_outcome, landing_outcome) =
         if matches!(reported_status, ReportedStatus::Completed) {
             let primary_target = LandingTarget {
                 kind: "primary",
                 repo_ref: args.issue_ref.repo.clone(),
                 git_workdir: &args.git_workdir,
-                principal_workdir: args.principal_workdir.as_deref(),
                 git_remote: args.git_remote.as_str(),
                 git_base: args.git_base.as_str(),
                 git_branch: args.git_branch.as_str(),
@@ -936,7 +865,6 @@ pub(super) fn finalize_dispatch_command(args: FinalizeDispatchArgs) -> Result<()
                     kind: "sidecar",
                     repo_ref,
                     git_workdir,
-                    principal_workdir: args.sidecar_principal_workdir.as_deref(),
                     git_remote,
                     git_base,
                     git_branch,
@@ -1179,7 +1107,7 @@ mod tests {
     use super::work_state_transition_target;
     use forgejo_agent::api::ApiHttpError;
     use forgejo_agent::orchd_dispatch_core::DispatchState;
-    use forgejo_agent::types::{ApiPrBranchInfo, ApiPullRequest, IssueRef, RepoRef};
+    use forgejo_agent::types::{ApiPrBranchInfo, ApiPullRequest, IssueRef};
 
     fn fake_pr(
         number: u64,
@@ -1293,17 +1221,6 @@ mod tests {
             ),
             None
         );
-    }
-
-    #[test]
-    fn merge_finalize_deploy_scope_is_repo_specific() {
-        assert!(super::requires_merge_finalize_deploy(&RepoRef::new(
-            "main",
-            "forgejo-agent"
-        )));
-        assert!(!super::requires_merge_finalize_deploy(&RepoRef::new(
-            "main", "swarm"
-        )));
     }
 
     #[test]

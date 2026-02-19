@@ -23,12 +23,15 @@ use forgejo_agent::types::{
 
 use super::cli::{Cli, DispatchMode};
 use super::db;
+use super::deploy;
 use super::dispatch;
 use super::dispatch_config::DispatchTriggerGuardrailsConfig;
 use super::dispatch_config_live::{DispatchConfigHandle, run_dispatch_config_reload_loop};
 use super::errors::{DispatchError, runtime_state_for_dispatch_error};
 use super::inquisition::{InquisitionSpec, maybe_spawn_inquisition};
-use super::lexicon::{DIRECTIVE_AUDIT, DIRECTIVE_AUDIT_FAILURE, EVENT_ISSUE_COMMENT, EVENT_ISSUES};
+use super::lexicon::{
+    DIRECTIVE_AUDIT, DIRECTIVE_AUDIT_FAILURE, EVENT_ISSUE_COMMENT, EVENT_ISSUES, EVENT_PUSH,
+};
 use super::notifier;
 use super::paths::{expand_tilde_path, resolve_dispatch_config_path};
 use super::projection;
@@ -304,6 +307,24 @@ pub(super) async fn run_server(cli: Cli) -> Result<()> {
             );
         }
     }
+    match db::requeue_running_deploy_jobs(&state.db_path) {
+        Ok(requeued) => {
+            log_line(
+                "startup_deploy_requeue_complete",
+                json!({
+                    "requeued_jobs": requeued,
+                }),
+            );
+        }
+        Err(err) => {
+            log_line(
+                "startup_deploy_requeue_failed",
+                json!({
+                    "error": err.to_string(),
+                }),
+            );
+        }
+    }
 
     let heartbeat_state = state.clone();
     tokio::spawn(async move {
@@ -326,6 +347,13 @@ pub(super) async fn run_server(cli: Cli) -> Result<()> {
     tokio::spawn(async move {
         run_dispatch_queue_loop(queue_state, cli.heartbeat_sec).await;
     });
+
+    if matches!(state.dispatch_mode, DispatchMode::Exec) {
+        let deploy_state = state.clone();
+        tokio::spawn(async move {
+            run_deploy_loop(deploy_state, cli.heartbeat_sec).await;
+        });
+    }
 
     if let Some(notifications) = state
         .dispatch_config
@@ -457,10 +485,25 @@ fn hook_url(hook: &serde_json::Value) -> Option<&str> {
         .or_else(|| hook.get("url").and_then(serde_json::Value::as_str))
 }
 
+fn hook_id(hook: &serde_json::Value) -> Option<u64> {
+    hook.get("id").and_then(serde_json::Value::as_u64)
+}
+
 fn hook_is_active(hook: &serde_json::Value) -> bool {
     hook.get("active")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(true)
+}
+
+fn hook_has_event(hook: &serde_json::Value, event: &str) -> bool {
+    hook.get("events")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|events| {
+            events
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .any(|item| item == event)
+        })
 }
 
 async fn ensure_repo_webhooks_for_default_owner(state: &AppState) -> Result<()> {
@@ -473,6 +516,7 @@ async fn ensure_repo_webhooks_for_default_owner(state: &AppState) -> Result<()> 
         .map(|bytes| String::from_utf8_lossy(bytes).to_string());
     let webhook_url = state.webhook_url.clone();
     tokio::task::spawn_blocking(move || {
+        let required_events = [EVENT_ISSUES, EVENT_ISSUE_COMMENT, EVENT_PUSH];
         let api = ForgejoClient::new(&cfg)?;
         let repos = api.list_user_repos(&cfg, &owner, 1000)?;
         for repo in repos {
@@ -486,11 +530,24 @@ async fn ensure_repo_webhooks_for_default_owner(state: &AppState) -> Result<()> 
                 continue;
             };
             let hooks = api.list_repo_hooks(&cfg, &repo_ref)?;
-            let exists = hooks.iter().any(|hook| {
+            let existing = hooks.iter().find(|hook| {
                 hook_is_active(hook)
                     && hook_url(hook).is_some_and(|url| url == webhook_url.as_str())
             });
-            if exists {
+            if let Some(hook) = existing {
+                let missing_event = required_events
+                    .iter()
+                    .any(|event| !hook_has_event(hook, event));
+                if missing_event && let Some(hook_id) = hook_id(hook) {
+                    let _ = api.update_repo_hook(
+                        &cfg,
+                        &repo_ref,
+                        hook_id,
+                        &webhook_url,
+                        secret.as_deref(),
+                        &required_events,
+                    )?;
+                }
                 continue;
             }
             let _ = api.create_repo_hook(
@@ -498,7 +555,7 @@ async fn ensure_repo_webhooks_for_default_owner(state: &AppState) -> Result<()> 
                 &repo_ref,
                 &webhook_url,
                 secret.as_deref(),
-                &[EVENT_ISSUES, EVENT_ISSUE_COMMENT],
+                &required_events,
             )?;
         }
         Ok(())
@@ -746,6 +803,10 @@ async fn process_webhook(
         });
     };
     let _ = db::upsert_repo_seen(&state.db_path, &record.repo_full_name);
+    if record.event_type == EVENT_PUSH {
+        deploy::enqueue_push_event(state, &record, &payload, event_id)
+            .context("failed enqueueing deploy push event")?;
+    }
 
     let dispatch_config = state.dispatch_config.snapshot();
 
@@ -1034,6 +1095,29 @@ async fn run_dispatch_queue_loop(state: AppState, interval_sec: u64) {
         if let Err(err) = dispatch_queue_once(&state).await {
             log_line(
                 "dispatch_queue_error",
+                json!({
+                    "error": err.to_string(),
+                }),
+            );
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
+async fn run_deploy_loop(state: AppState, interval_sec: u64) {
+    let interval = StdDuration::from_secs(interval_sec.max(1));
+    loop {
+        if let Err(err) = deploy::reconcile_head_enqueue(&state).await {
+            log_line(
+                "deploy_reconcile_error",
+                json!({
+                    "error": err.to_string(),
+                }),
+            );
+        }
+        if let Err(err) = deploy::run_worker_once(&state).await {
+            log_line(
+                "deploy_worker_error",
                 json!({
                     "error": err.to_string(),
                 }),

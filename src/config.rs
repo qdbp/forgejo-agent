@@ -13,6 +13,7 @@ pub struct AgentConfig {
     pub default_repo: RepoRef,
     pub agent_name: String,
     pub lease_minutes: i64,
+    pub token_file: PathBuf,
     pub token: String,
 }
 
@@ -143,6 +144,7 @@ Use FORGEJO_ALLOW_OWNER_TOKEN=1 only for break-glass recovery.",
             default_repo,
             agent_name,
             lease_minutes,
+            token_file,
             token,
         })
     }

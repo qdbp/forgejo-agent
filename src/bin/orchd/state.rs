@@ -29,6 +29,12 @@ pub(super) struct WebhookPayload {
     pub(super) issue: Option<WebhookIssue>,
     pub(super) comment: Option<WebhookComment>,
     pub(super) sender: Option<WebhookUser>,
+    #[serde(default, rename = "ref")]
+    pub(super) push_ref: Option<String>,
+    #[serde(default)]
+    pub(super) after: Option<String>,
+    #[serde(default)]
+    pub(super) deleted: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]

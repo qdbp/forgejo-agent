@@ -165,7 +165,7 @@ Core behavior:
 - sqlite event/decision/dispatch persistence
 - runtime dispatch status projected to `orchd/state/*` labels (`queued|running|blocked|failed|completed`)
 - successful `impl` completion transitions the issue workflow to `state/done` (dispatch failures do not force `state/blocked`)
-- for `main/forgejo-agent`, merge finalization now performs a strict post-merge deploy (`scripts/deploy-local.sh`) in the principal checkout; deploy failures trigger rollback and mark the dispatch failed
+- for `main/forgejo-agent`, deploy is now push-driven via a dedicated `deploy_jobs` queue and orchd-owned checkout (not the human principal checkout); deploy failures trigger rollback-safe handling and auto-open a self-healing issue pinging `@codex-orch impl`
 - reconcile auto-closes only when the issue is `state/done` and `orchd/state/completed`; `state/review` stays open for explicit human verification
 - one active dispatch per issue (duplicates blocked while running)
 - queue scheduling uses a per-issue FIFO head (`MIN(decision.id)` among pending), with same-actor + same-directive + same-target-role pending entries coalesced to the latest

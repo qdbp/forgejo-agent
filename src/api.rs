@@ -375,6 +375,32 @@ impl ForgejoClient {
         self.send_json(cfg, &Method::POST, &path, Some(&payload))
     }
 
+    pub fn update_repo_hook(
+        &self,
+        cfg: &AgentConfig,
+        repo: &RepoRef,
+        hook_id: u64,
+        url: &str,
+        secret: Option<&str>,
+        events: &[&str],
+    ) -> Result<Value> {
+        let path = format!(
+            "/api/v1/repos/{}/{}/hooks/{}",
+            repo.owner, repo.repo, hook_id
+        );
+        let payload = CreateHookBody {
+            kind: "forgejo",
+            config: HookConfig {
+                url,
+                content_type: "json",
+                secret,
+            },
+            events: events.to_vec(),
+            active: true,
+        };
+        self.send_json(cfg, &Method::PATCH, &path, Some(&payload))
+    }
+
     pub fn create_pull_request(
         &self,
         cfg: &AgentConfig,

@@ -9,7 +9,7 @@ struct Migration {
     apply: fn(&mut Connection) -> Result<()>,
 }
 
-const LATEST_SCHEMA_VERSION: i64 = 11;
+const LATEST_SCHEMA_VERSION: i64 = 12;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -66,6 +66,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 11,
         name: "ensure_timer_schedule_context_tables_compat",
         apply: migration_0011_ensure_timer_schedule_context_tables_compat,
+    },
+    Migration {
+        version: 12,
+        name: "add_deploy_jobs_table",
+        apply: migration_0012_add_deploy_jobs_table,
     },
 ];
 
@@ -549,6 +554,42 @@ fn migration_0011_ensure_timer_schedule_context_tables_compat(conn: &mut Connect
     ensure_timer_schedule_context_schema(conn)
 }
 
+fn migration_0012_add_deploy_jobs_table(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    tx.execute_batch(
+        r"
+        CREATE TABLE IF NOT EXISTS deploy_jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            repo_full_name TEXT NOT NULL,
+            target_branch TEXT NOT NULL,
+            target_sha TEXT NOT NULL,
+            source_event_id INTEGER,
+            source_delivery_id TEXT,
+            source_actor_login TEXT,
+            status TEXT NOT NULL,
+            reason_code TEXT,
+            error_text TEXT,
+            checkout_path TEXT,
+            log_path TEXT,
+            incident_issue_number INTEGER,
+            rollback_status TEXT,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            queued_at TEXT NOT NULL,
+            started_at TEXT,
+            ended_at TEXT,
+            FOREIGN KEY(source_event_id) REFERENCES events(id),
+            UNIQUE(repo_full_name, target_branch, target_sha)
+        );
+        CREATE INDEX IF NOT EXISTS idx_deploy_jobs_status_id
+            ON deploy_jobs (status, id);
+        CREATE INDEX IF NOT EXISTS idx_deploy_jobs_repo_branch_id
+            ON deploy_jobs (repo_full_name, target_branch, id DESC);
+        ",
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn ensure_timer_schedule_context_schema(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     if table_exists(&tx, "decisions")? {
@@ -604,6 +645,7 @@ mod tests {
         assert!(table_exists(&conn, "trigger_dispatch_dedupes").expect("table exists"));
         assert!(table_exists(&conn, "schedule_claims").expect("table exists"));
         assert!(table_exists(&conn, "timer_contexts").expect("table exists"));
+        assert!(table_exists(&conn, "deploy_jobs").expect("table exists"));
         assert!(!table_has_column(&conn, "dispatches", "tmux_session").expect("pragma"));
         assert!(!table_has_column(&conn, "dispatches", "tmux_window").expect("pragma"));
         assert!(table_has_column(&conn, "dispatches", "backend_kind").expect("pragma"));
@@ -690,6 +732,7 @@ mod tests {
         assert!(table_exists(&conn, "trigger_dispatch_dedupes").expect("table exists"));
         assert!(table_exists(&conn, "schedule_claims").expect("table exists"));
         assert!(table_exists(&conn, "timer_contexts").expect("table exists"));
+        assert!(table_exists(&conn, "deploy_jobs").expect("table exists"));
         assert!(!table_has_column(&conn, "dispatches", "tmux_session").expect("pragma"));
         assert!(!table_has_column(&conn, "dispatches", "tmux_window").expect("pragma"));
         assert!(table_has_column(&conn, "trigger_dispatch_dedupes", "dedupe_key").expect("pragma"));
@@ -779,6 +822,7 @@ mod tests {
         assert!(table_has_column(&conn, "decisions", "resume_session_id").expect("pragma"));
         assert!(table_exists(&conn, "schedule_claims").expect("table exists"));
         assert!(table_exists(&conn, "timer_contexts").expect("table exists"));
+        assert!(table_exists(&conn, "deploy_jobs").expect("table exists"));
         assert_eq!(
             current_schema_version(&conn).expect("schema version query"),
             LATEST_SCHEMA_VERSION
@@ -816,6 +860,7 @@ mod tests {
         assert!(table_exists(&conn, "trigger_dispatch_dedupes").expect("table exists"));
         assert!(table_exists(&conn, "schedule_claims").expect("table exists"));
         assert!(table_exists(&conn, "timer_contexts").expect("table exists"));
+        assert!(table_exists(&conn, "deploy_jobs").expect("table exists"));
         assert_eq!(
             current_schema_version(&conn).expect("schema version query"),
             LATEST_SCHEMA_VERSION

@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -84,6 +85,7 @@ async fn issue_create_follows_repo_rename_redirect_without_switching_to_get() ->
         default_repo: RepoRef::new("main", "scratch"),
         agent_name: "test".to_string(),
         lease_minutes: 90,
+        token_file: PathBuf::from("/tmp/test-token"),
         token: "test-token".to_string(),
     };
 
@@ -141,6 +143,7 @@ async fn issue_label_delete_follows_repo_rename_redirect_without_switching_to_ge
         default_repo: RepoRef::new("main", "scratch"),
         agent_name: "test".to_string(),
         lease_minutes: 90,
+        token_file: PathBuf::from("/tmp/test-token"),
         token: "test-token".to_string(),
     };
 
@@ -199,6 +202,7 @@ async fn issue_label_delete_rejects_non_canonical_non_get_redirect() -> Result<(
         default_repo: RepoRef::new("main", "scratch"),
         agent_name: "test".to_string(),
         lease_minutes: 90,
+        token_file: PathBuf::from("/tmp/test-token"),
         token: "test-token".to_string(),
     };
 
@@ -260,6 +264,7 @@ async fn list_labels_paginates_until_empty_page() -> Result<()> {
         default_repo: RepoRef::new("main", "scratch"),
         agent_name: "test".to_string(),
         lease_minutes: 90,
+        token_file: PathBuf::from("/tmp/test-token"),
         token: "test-token".to_string(),
     };
 
@@ -344,6 +349,7 @@ async fn list_issues_all_paginates_until_empty_page() -> Result<()> {
         default_repo: RepoRef::new("main", "scratch"),
         agent_name: "test".to_string(),
         lease_minutes: 90,
+        token_file: PathBuf::from("/tmp/test-token"),
         token: "test-token".to_string(),
     };
 
