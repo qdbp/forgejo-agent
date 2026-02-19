@@ -9,7 +9,7 @@ struct Migration {
     apply: fn(&mut Connection) -> Result<()>,
 }
 
-const LATEST_SCHEMA_VERSION: i64 = 9;
+const LATEST_SCHEMA_VERSION: i64 = 11;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -56,6 +56,16 @@ const MIGRATIONS: &[Migration] = &[
         version: 9,
         name: "add_timer_schedule_context_tables",
         apply: migration_0009_add_timer_schedule_context_tables,
+    },
+    Migration {
+        version: 10,
+        name: "add_prune_support_indexes",
+        apply: migration_0010_add_prune_support_indexes,
+    },
+    Migration {
+        version: 11,
+        name: "ensure_timer_schedule_context_tables_compat",
+        apply: migration_0011_ensure_timer_schedule_context_tables_compat,
     },
 ];
 
@@ -477,6 +487,69 @@ fn migration_0008_add_dispatch_principal_logins(conn: &mut Connection) -> Result
 }
 
 fn migration_0009_add_timer_schedule_context_tables(conn: &mut Connection) -> Result<()> {
+    ensure_timer_schedule_context_schema(conn)
+}
+
+fn migration_0010_add_prune_support_indexes(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if table_exists(&tx, "events")? {
+        ensure_column_exists_tx(&tx, "events", "payload_sha256", "TEXT NOT NULL DEFAULT ''")?;
+        tx.execute_batch(
+            r"
+            CREATE INDEX IF NOT EXISTS idx_events_received_at
+                ON events (received_at);
+            ",
+        )?;
+    }
+    if table_exists(&tx, "decisions")? {
+        tx.execute_batch(
+            r"
+            CREATE INDEX IF NOT EXISTS idx_decisions_event_id
+                ON decisions (event_id);
+            ",
+        )?;
+    }
+    if table_exists(&tx, "dispatches")? {
+        tx.execute_batch(
+            r"
+            CREATE INDEX IF NOT EXISTS idx_dispatches_decision_id
+                ON dispatches (decision_id);
+            ",
+        )?;
+    }
+    if table_exists(&tx, "heartbeats")? {
+        tx.execute_batch(
+            r"
+            CREATE INDEX IF NOT EXISTS idx_heartbeats_recorded_at
+                ON heartbeats (recorded_at);
+            ",
+        )?;
+    }
+    if table_exists(&tx, "reconciles")? {
+        tx.execute_batch(
+            r"
+            CREATE INDEX IF NOT EXISTS idx_reconciles_recorded_at
+                ON reconciles (recorded_at);
+            ",
+        )?;
+    }
+    if table_exists(&tx, "trigger_dispatch_dedupes")? {
+        tx.execute_batch(
+            r"
+            CREATE INDEX IF NOT EXISTS idx_trigger_dispatch_dedupes_event_id
+                ON trigger_dispatch_dedupes (event_id);
+            ",
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn migration_0011_ensure_timer_schedule_context_tables_compat(conn: &mut Connection) -> Result<()> {
+    ensure_timer_schedule_context_schema(conn)
+}
+
+fn ensure_timer_schedule_context_schema(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     if table_exists(&tx, "decisions")? {
         ensure_column_exists_tx(&tx, "decisions", "schedule_timer_id", "TEXT")?;
@@ -638,6 +711,74 @@ mod tests {
         );
         assert_eq!(directive.as_str(), "reply");
         assert_eq!(principal.as_deref(), Some("main"));
+        assert_eq!(
+            current_schema_version(&conn).expect("schema version query"),
+            LATEST_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn migration_compat_heals_timer_schema_when_db_already_has_legacy_v10() {
+        let mut conn = Connection::open_in_memory().expect("open in-memory db");
+        conn.execute_batch(
+            r"
+            CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at TEXT NOT NULL
+            );
+            INSERT INTO schema_migrations(version, name, applied_at) VALUES
+                (1, 'bootstrap_core_tables', '2026-01-01T00:00:00Z'),
+                (2, 'add_late_columns', '2026-01-01T00:00:01Z'),
+                (3, 'drop_legacy_tmux_dispatch_columns', '2026-01-01T00:00:02Z'),
+                (4, 'add_notification_deliveries_table', '2026-01-01T00:00:03Z'),
+                (5, 'ensure_notification_deliveries_table', '2026-01-01T00:00:04Z'),
+                (6, 'ensure_trigger_dispatch_dedupe_table', '2026-01-01T00:00:05Z'),
+                (7, 'canonicalize_poke_directive_to_reply', '2026-01-01T00:00:06Z'),
+                (8, 'add_dispatch_principal_logins', '2026-01-01T00:00:07Z'),
+                (9, 'add_events_payload_sha256', '2026-01-01T00:00:08Z'),
+                (10, 'add_prune_support_indexes', '2026-01-01T00:00:09Z');
+            CREATE TABLE decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id INTEGER NOT NULL,
+                repo_full_name TEXT NOT NULL,
+                issue_number INTEGER,
+                actor_login TEXT,
+                directive TEXT,
+                target_role TEXT,
+                decision TEXT NOT NULL,
+                reason_code TEXT NOT NULL,
+                would_dispatch INTEGER NOT NULL,
+                comment_posted INTEGER NOT NULL DEFAULT 0,
+                comment_error TEXT,
+                created_at TEXT NOT NULL,
+                principal_login TEXT
+            );
+            CREATE TABLE events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                delivery_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                repo_full_name TEXT NOT NULL,
+                issue_number INTEGER,
+                action TEXT,
+                actor_login TEXT,
+                raw_json TEXT NOT NULL,
+                received_at TEXT NOT NULL,
+                event_text TEXT,
+                source_comment_id INTEGER,
+                source_created_at TEXT,
+                payload_sha256 TEXT NOT NULL DEFAULT ''
+            );
+            ",
+        )
+        .expect("seed legacy v10 schema");
+
+        apply_all(&mut conn).expect("apply all migrations");
+        assert!(table_has_column(&conn, "decisions", "schedule_timer_id").expect("pragma"));
+        assert!(table_has_column(&conn, "decisions", "timer_context_key").expect("pragma"));
+        assert!(table_has_column(&conn, "decisions", "resume_session_id").expect("pragma"));
+        assert!(table_exists(&conn, "schedule_claims").expect("table exists"));
+        assert!(table_exists(&conn, "timer_contexts").expect("table exists"));
         assert_eq!(
             current_schema_version(&conn).expect("schema version query"),
             LATEST_SCHEMA_VERSION
