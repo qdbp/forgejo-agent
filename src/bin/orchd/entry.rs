@@ -63,6 +63,7 @@ fn run_issue_command(cli: &Cli, command: IssueCommand) -> Result<()> {
 
 fn run_timer_command(cli: &Cli, command: TimerCommand) -> Result<()> {
     match command {
+        TimerCommand::Sessions(args) => timer::timer_sessions_command(&cli.db_path, args),
         TimerCommand::Resume(args) => timer::timer_resume_command(&cli.db_path, args),
     }
 }
@@ -77,6 +78,7 @@ fn run_role_command(cli: &Cli, command: RoleCommand) -> Result<()> {
 
 fn run_schedule_command(cli: &Cli, command: ScheduleCommand) -> Result<()> {
     match command {
+        ScheduleCommand::List(args) => schedule::schedule_list_command(cli, args),
         ScheduleCommand::Tick(args) => schedule::schedule_tick_command(cli, args),
     }
 }

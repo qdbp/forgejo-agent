@@ -68,12 +68,15 @@ pub(super) enum PromptCommand {
 
 #[derive(Subcommand, Debug)]
 pub(super) enum IssueCommand {
+    #[command(visible_alias = "list")]
     Sessions(IssueSessionsArgs),
     Resume(IssueResumeArgs),
 }
 
 #[derive(Subcommand, Debug)]
 pub(super) enum TimerCommand {
+    #[command(visible_alias = "list")]
+    Sessions(TimerSessionsArgs),
     Resume(TimerResumeArgs),
 }
 
@@ -86,7 +89,14 @@ pub(super) enum RoleCommand {
 
 #[derive(Subcommand, Debug)]
 pub(super) enum ScheduleCommand {
+    List(ScheduleListArgs),
     Tick(ScheduleTickArgs),
+}
+
+#[derive(Args, Debug)]
+pub(super) struct ScheduleListArgs {
+    #[arg(long)]
+    pub(super) json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -126,6 +136,15 @@ pub(super) struct TimerResumeArgs {
     pub(super) dispatch_id: Option<i64>,
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub(super) codex_resume_args: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub(super) struct TimerSessionsArgs {
+    pub(super) timer_id: String,
+    #[arg(long)]
+    pub(super) role: Option<String>,
+    #[arg(long)]
+    pub(super) json: bool,
 }
 
 #[derive(Args, Debug)]

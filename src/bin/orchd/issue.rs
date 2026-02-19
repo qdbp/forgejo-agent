@@ -77,6 +77,7 @@ fn ensure_repo_known(db_path: &Path, repo: &str, repo_full_name: &str) -> Result
 struct IssueSessionSummary {
     dispatch_id: i64,
     status: String,
+    resumable: bool,
     target_role: String,
     codex_session_id: String,
 }
@@ -86,6 +87,7 @@ fn issue_session_summaries(rows: &[db::ResumeDispatch]) -> Vec<IssueSessionSumma
         .map(|row| IssueSessionSummary {
             dispatch_id: row.id,
             status: row.status.as_db_str().to_string(),
+            resumable: row.status.is_terminal(),
             target_role: row.target_role.clone(),
             codex_session_id: row.codex_session_id.clone().unwrap_or_default(),
         })
@@ -112,13 +114,13 @@ pub(super) fn issue_sessions_command(db_path_raw: &str, args: IssueSessionsArgs)
     }
 
     println!(
-        "{:<12} {:<16} {:<18} {}",
-        "dispatch_id", "status", "role", "session_id"
+        "{:<12} {:<16} {:<10} {:<18} {}",
+        "dispatch_id", "status", "resumable", "role", "session_id"
     );
     for row in summaries {
         println!(
-            "{:<12} {:<16} {:<18} {}",
-            row.dispatch_id, row.status, row.target_role, row.codex_session_id
+            "{:<12} {:<16} {:<10} {:<18} {}",
+            row.dispatch_id, row.status, row.resumable, row.target_role, row.codex_session_id
         );
     }
     Ok(())
@@ -235,4 +237,33 @@ pub(super) fn issue_resume_command(db_path_raw: &str, args: IssueResumeArgs) -> 
         .to_string();
 
     run_codex_resume(&latest.target_role, &session_id, &args.codex_resume_args)
+}
+
+#[cfg(test)]
+mod tests {
+    use forgejo_agent::orchd_dispatch_core::DispatchState;
+
+    use super::db;
+
+    #[test]
+    fn issue_session_summary_marks_resumable_states() {
+        let rows = vec![
+            db::ResumeDispatch {
+                id: 41,
+                status: DispatchState::Completed,
+                target_role: "codex-orch".to_string(),
+                codex_session_id: Some("session-completed".to_string()),
+            },
+            db::ResumeDispatch {
+                id: 42,
+                status: DispatchState::Running,
+                target_role: "codex-lead".to_string(),
+                codex_session_id: Some("session-running".to_string()),
+            },
+        ];
+        let summaries = super::issue_session_summaries(&rows);
+        assert_eq!(summaries.len(), 2);
+        assert!(summaries[0].resumable);
+        assert!(!summaries[1].resumable);
+    }
 }

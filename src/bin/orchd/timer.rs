@@ -1,8 +1,9 @@
 use std::collections::BTreeSet;
 
 use anyhow::{Result, anyhow, bail};
+use serde::Serialize;
 
-use super::cli::TimerResumeArgs;
+use super::cli::{TimerResumeArgs, TimerSessionsArgs};
 use super::db;
 use super::issue::{normalized_role_filter, run_codex_resume};
 use super::paths::expand_tilde_path;
@@ -16,6 +17,52 @@ fn normalize_timer_id(timer_id: &str) -> Result<String> {
         bail!("timer id must not contain whitespace");
     }
     Ok(normalized)
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TimerSessionSummary {
+    dispatch_id: i64,
+    status: String,
+    resumable: bool,
+    target_role: String,
+    codex_session_id: String,
+}
+
+fn timer_session_summaries(rows: &[db::ResumeDispatch]) -> Vec<TimerSessionSummary> {
+    rows.iter()
+        .map(|row| TimerSessionSummary {
+            dispatch_id: row.id,
+            status: row.status.as_db_str().to_string(),
+            resumable: row.status.is_terminal(),
+            target_role: row.target_role.clone(),
+            codex_session_id: row.codex_session_id.clone().unwrap_or_default(),
+        })
+        .collect()
+}
+
+pub(super) fn timer_sessions_command(db_path_raw: &str, args: TimerSessionsArgs) -> Result<()> {
+    let timer_id = normalize_timer_id(&args.timer_id)?;
+    let db_path = expand_tilde_path(db_path_raw)?;
+    let role_filter = normalized_role_filter(args.role.as_deref())?;
+    let rows = db::list_timer_resume_dispatches(&db_path, &timer_id, role_filter.as_deref())?;
+    let summaries = timer_session_summaries(&rows);
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&summaries)?);
+        return Ok(());
+    }
+
+    println!(
+        "{:<12} {:<16} {:<10} {:<18} {}",
+        "dispatch_id", "status", "resumable", "role", "session_id"
+    );
+    for row in summaries {
+        println!(
+            "{:<12} {:<16} {:<10} {:<18} {}",
+            row.dispatch_id, row.status, row.resumable, row.target_role, row.codex_session_id
+        );
+    }
+    Ok(())
 }
 
 pub(super) fn timer_resume_command(db_path_raw: &str, args: TimerResumeArgs) -> Result<()> {
@@ -55,9 +102,10 @@ pub(super) fn timer_resume_command(db_path_raw: &str, args: TimerResumeArgs) -> 
             if unique_roles.len() > 1 {
                 let roles = unique_roles.into_iter().collect::<Vec<_>>().join(", ");
                 bail!(
-                    "timer {} has sessions for multiple roles ({}); re-run with --role <role> or --dispatch-id <id>",
+                    "timer {} has sessions for multiple roles ({}); re-run with --role <role> or --dispatch-id <id> (hint: orchd obs timer sessions {})",
                     timer_id,
-                    roles
+                    roles,
+                    timer_id
                 );
             }
         }
@@ -240,5 +288,27 @@ mod tests {
         assert!(rendered.contains("multiple roles"));
 
         let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn timer_session_summary_marks_resumable_states() {
+        let rows = vec![
+            db::ResumeDispatch {
+                id: 11,
+                status: DispatchState::Completed,
+                target_role: "codex-orch".to_string(),
+                codex_session_id: Some("session-completed".to_string()),
+            },
+            db::ResumeDispatch {
+                id: 12,
+                status: DispatchState::Running,
+                target_role: "codex-lead".to_string(),
+                codex_session_id: Some("session-running".to_string()),
+            },
+        ];
+        let summaries = super::timer_session_summaries(&rows);
+        assert_eq!(summaries.len(), 2);
+        assert!(summaries[0].resumable);
+        assert!(!summaries[1].resumable);
     }
 }

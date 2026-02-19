@@ -6,11 +6,12 @@ use std::process::Command;
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, TimeDelta, Utc};
+use serde::Serialize;
 use serde_json::json;
 
 use forgejo_agent::config::AgentConfig;
 
-use super::cli::{Cli, ScheduleTickArgs};
+use super::cli::{Cli, ScheduleListArgs, ScheduleTickArgs};
 use super::db;
 use super::dispatch_config::{
     DispatchConfig, DispatchTimerCatchUp, DispatchTimerConfig, DispatchTimerContextMode,
@@ -30,6 +31,94 @@ struct DueSlot {
 #[derive(Debug, Clone)]
 struct CreatedIssue {
     number: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ScheduleTimerRow {
+    timer_id: String,
+    enabled: bool,
+    repo: String,
+    role: String,
+    directive: String,
+    principal: String,
+    workflow: String,
+    interval_sec: u64,
+    start_at: String,
+    jitter_sec: u64,
+    catch_up: String,
+    max_inflight: u32,
+    context_mode: String,
+    context_key: String,
+}
+
+const fn catch_up_label(catch_up: &DispatchTimerCatchUp) -> &'static str {
+    match catch_up {
+        DispatchTimerCatchUp::Coalesce => "coalesce",
+        DispatchTimerCatchUp::Skip => "skip",
+    }
+}
+
+const fn context_mode_label(mode: &DispatchTimerContextMode) -> &'static str {
+    match mode {
+        DispatchTimerContextMode::Fresh => "fresh",
+        DispatchTimerContextMode::Reuse => "reuse",
+    }
+}
+
+fn schedule_timer_rows(timers: &[DispatchTimerConfig]) -> Vec<ScheduleTimerRow> {
+    timers
+        .iter()
+        .map(|timer| ScheduleTimerRow {
+            timer_id: timer.id.clone(),
+            enabled: timer.enabled,
+            repo: timer.target.repo.to_string(),
+            role: timer.dispatch.target_role.clone(),
+            directive: timer.dispatch.directive.clone(),
+            principal: timer.dispatch.principal.clone(),
+            workflow: timer.run_issue.workflow.clone(),
+            interval_sec: timer.schedule.interval_sec,
+            start_at: timer.schedule.start_at.clone(),
+            jitter_sec: timer.schedule.jitter_sec,
+            catch_up: catch_up_label(&timer.schedule.catch_up).to_string(),
+            max_inflight: timer.schedule.max_inflight,
+            context_mode: context_mode_label(&timer.context.mode).to_string(),
+            context_key: timer.context.key.clone(),
+        })
+        .collect()
+}
+
+pub(super) fn schedule_list_command(cli: &Cli, args: ScheduleListArgs) -> Result<()> {
+    let dispatch_config_path = resolve_dispatch_config_path(&cli.dispatch_config)?;
+    let dispatch_config = load_dispatch_config(&dispatch_config_path)?;
+    let rows = schedule_timer_rows(dispatch_config.timers.as_slice());
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+    if rows.is_empty() {
+        println!("(no timers configured)");
+        return Ok(());
+    }
+
+    println!(
+        "{:<16} {:<8} {:<24} {:<12} {:<12} {:<11} {:<9} {}",
+        "timer_id", "enabled", "repo", "role", "directive", "interval_s", "catch_up", "start_at"
+    );
+    for row in rows {
+        println!(
+            "{:<16} {:<8} {:<24} {:<12} {:<12} {:<11} {:<9} {}",
+            row.timer_id,
+            row.enabled,
+            row.repo,
+            row.role,
+            row.directive,
+            row.interval_sec,
+            row.catch_up,
+            row.start_at
+        );
+    }
+    Ok(())
 }
 
 pub(super) fn schedule_tick_command(cli: &Cli, args: ScheduleTickArgs) -> Result<()> {
@@ -562,5 +651,27 @@ mod tests {
             .expect("due")
             .expect("slot");
         assert_eq!(due.index, 5);
+    }
+
+    #[test]
+    fn schedule_list_rows_include_timer_config_shape() {
+        let timer = sample_timer(DispatchTimerCatchUp::Coalesce);
+        let rows = schedule_timer_rows(std::slice::from_ref(&timer));
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.timer_id, timer.id);
+        assert!(row.enabled);
+        assert_eq!(row.repo, "main/forgejo-agent");
+        assert_eq!(row.role, "codex-lead");
+        assert_eq!(row.directive, "investigate");
+        assert_eq!(row.principal, "codex-orch");
+        assert_eq!(row.workflow, "ready");
+        assert_eq!(row.interval_sec, 3600);
+        assert_eq!(row.start_at, "2026-02-18T00:00:00Z");
+        assert_eq!(row.jitter_sec, 0);
+        assert_eq!(row.catch_up, "coalesce");
+        assert_eq!(row.max_inflight, 1);
+        assert_eq!(row.context_mode, "reuse");
+        assert_eq!(row.context_key, "shared");
     }
 }

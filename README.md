@@ -172,7 +172,7 @@ Core behavior:
 - impl remains repo-serialized by the dispatch gate, so a blocked impl head holds that issue queue until the repo lane clears
 - issue+role-scoped codex session reuse (`codex exec resume`) from latest `codex_session_id`
 - periodic heartbeat + reconcile scan logs
-- postmortem observability via `orchd obs issue sessions|resume`, `orchd obs timer resume`, and `orchd obs prompt preview`
+- postmortem observability via `orchd obs issue sessions|list|resume`, `orchd obs timer sessions|list|resume`, and `orchd obs prompt preview`
 
 Role launch wrapper:
 
@@ -251,9 +251,13 @@ cargo run --bin orchd -- \
 Postmortem observability (owner is fixed to `main` for issue commands):
 
 ```bash
+cargo run --bin orchd -- schedule list
 cargo run --bin orchd -- obs issue sessions forgejo-agent 20
+cargo run --bin orchd -- obs issue list forgejo-agent 20
 cargo run --bin orchd -- obs issue resume forgejo-agent 20 --role codex-lead -- --no-alt-screen
 cargo run --bin orchd -- obs issue resume forgejo-agent 20 --dispatch-id 123 -- --no-alt-screen
+cargo run --bin orchd -- obs timer sessions doc-scrub
+cargo run --bin orchd -- obs timer list doc-scrub
 cargo run --bin orchd -- obs timer resume doc-scrub --role codex-lead -- --no-alt-screen
 cargo run --bin orchd -- obs prompt preview main/foo#123 --role codex-dev --directive impl
 ```
